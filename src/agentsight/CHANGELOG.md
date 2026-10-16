@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.14.2
+
+### Fixes
+- Surface body-less calls when the agent exits.
+- Close the #7271 review follow-ups.
+
 ## 0.14.1
 
 ### Features
