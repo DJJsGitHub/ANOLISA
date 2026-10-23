@@ -2,22 +2,31 @@
 
 ## 一、功能概述
 
-PostTool 压缩由 Runtime 内部的 `PostToolPipeline` 编排，并按内容类型与内容来源静态派发给六个领域之一：JSON、Build Log、Tabular、Search Results 路径共享与 HTML 页面转写默认启用；Diff 上下文裁剪需要通过 `TOKENLESS_DIFF_COMPRESSION_ENABLED` 显式开启。JSON 压缩器只解析一次输入，先生成不截断数据的 Compact JSON/TOON 候选；该候选同时减少字符与估算 Token 且 Token 节省率达到 15% 时直接采用。否则再生成包含 Record Reduction 或既有截断规则的 Bounded 候选，并选择更小的合法表示。Build Log 压缩器只处理成功的 `command_output`，先清理终端控制输出，再对已识别构建与测试日志中的重复常规进度进行可恢复缩减。Tabular 压缩器生成保留单元格或可恢复选取整行的 CSV/TSV 视图；Search Results 压缩器在连续行之间共享重复路径，不丢弃任何命中；Diff 裁剪只删减未修改的上下文行，元信息与改动行原样保留；HTML 转写选取 `<main>`、`role=main` 或唯一的最外层 `<article>` 作为主内容根（都不存在时为 `<body>`），只渲染该根并移除其中可枚举的非内容元素，根外节点计数后省略。这两个领域都把原文写入 Stash，只有恢复路径可用时才会执行，结果可通过 Retrieve 找回。Tool Error 保留原始输出并只追加环境诊断；`file_content` 来源与其他内容类型透传。
+PostTool 压缩由 Runtime 内部的 `PostToolPipeline` 编排，并按内容类型与内容来源静态派发给六个领域之一：JSON、Build Log、Tabular、Search Results 路径共享与 HTML 页面转写默认启用；Diff 上下文裁剪需要通过 `TOKENLESS_DIFF_COMPRESSION_ENABLED` 显式开启。JSON 压缩器只解析一次输入，先生成保留全部字段、空值和数组元素的 Compact JSON/TOON 候选；该候选同时减少字符与估算 Token 且 Token 节省率达到 15% 时直接采用。否则再生成包含 Record Reduction 或既有截断规则的 Bounded 候选，并选择更小的合法表示。Build Log 压缩器只处理成功的 `command_output`，先清理终端控制输出，再对已识别构建与测试日志中的重复常规进度进行可恢复缩减。Tabular 压缩器生成保留单元格或可恢复选取整行的 CSV/TSV 视图；Search Results 压缩器在连续行之间共享重复路径，不丢弃任何命中；Diff 裁剪只删减未修改的上下文行，元信息与改动行原样保留；HTML 转写选取 `<main>`、`role=main` 或唯一的最外层 `<article>` 作为主内容根（都不存在时为 `<body>`），只渲染该根并移除其中可枚举的非内容元素，根外节点计数后省略。这两个领域都把原文写入 Stash，只有恢复路径可用时才会执行，结果可通过 Retrieve 找回。Tool Error 保留原始输出并只追加环境诊断；`file_content` 来源与其他内容类型透传。
 
-## 二、8 条压缩规则
+## 二、压缩规则与保留约定
 
 | # | 规则 | 判断条件 | 处理方式 | 默认阈值 |
 |---|------|---------|---------|---------|
 | R1 | **字符串截断** | Unicode 字符数 > 4096 | 在 Unicode 字符边界截断，追加截断标记 | 4096 字符 |
 | R2 | **Record Reduction** | 数组至少有 33 项，且每项都是 JSON Object | 保留首尾、错误、结构异常和数值异常记录；普通记录去重后稳定等距采样；完整数组写入 Stash | 32 条普通预算；关键记录可突破预算 |
 | R3 | **普通数组截断** | 非 Record Array 的元素数超过配置预算 | 保留前 32 个 + 末尾 8 个（`array_tail_preserve`），head 与 tail 之间插入截断标记；head+tail 覆盖全部元素时不截断 | 32 + 8 个 |
-| R4 | **字段删除** | key 匹配黑名单 | 整个字段移除（不递归进入） | 7 个字段 |
-| R5 | **null 移除** | 值为 `null` | 从对象/数组中删除 | 启用 |
-| R6 | **空值移除** | 值为 `""` / `[]` / `{}` | 从对象/数组中删除 | 启用 |
 | R7 | **深度截断** | 嵌套深度 > 8 | 替换为 `<{type} truncated at depth {N}>` | 8 层 |
-| R8 | **原始类型保留** | bool / number | 直接保留，不做处理 | — |
+| R8 | **原始类型保留** | null / bool / number | 直接保留，不做处理 | — |
 
-**R4 默认黑名单字段**：`debug`, `trace`, `traces`, `stack`, `stacktrace`, `logs`, `logging`
+**保留约定**：所有字段名均按普通业务字段处理，包括 `debug`、`trace`、`traces`、`stack`、`stacktrace`、`logs`、`logging`。`null`、`""`、`[]`、`{}` 在对象和数组中均保留；数组空项保留原来的位置与顺序。只有下述显式 Record Reduction 和截断规则会省略内容，Compact JSON 与通过校验的 TOON 仅改变表示。规则编号沿用原编号，R4–R6 删除规则已移除。
+
+**R8 数值字面量保真**：JSON 领域按扫描到的源字面量保留每个数字，Record Reduction、
+深度截断、Compact 序列化与 Stash Payload 都不会重新序列化它。因此 `serde_json::Value`
+无法精确表示的数字（`18446744073709551617`、`-9223372036854775809`、
+`1.234567890123456789`、`1e-400`）同样参与压缩，输出保持原拼写与 JSON 数字类型，不会变成
+字符串或四舍五入近似值。等价拼写不做归一化：`1.2500` 仍写作 `1.2500`，`-0` 保留负号。
+Record 去重按数值而非拼写比较，`1.2500` 与 `1.25` 视为同一条记录，被保留的那条输出自己的
+拼写；数值离群点只使用 `f64` 近似值排序，近似值不进入输出，没有有限近似值的数字所在的
+记录直接保留。TOON 候选必须解码回与原文档一致的结构、字符串、数值类型和精确十进制值才会
+被采用，允许等价拼写归一化（`1.2500` 可写作 `1.25`），不接受精度损失、整数与浮点类型互换
+或负零丢符号；校验失败时保留已压缩的精确 JSON 候选。`serde_json` 无法读回的数字（例如超出
+有限 `f64` 范围的 `1e400`）沿用既有失败保护：整个响应原样透传，不写入 Stash。
 
 Record Reduction 固定保留前 4 条和后 4 条；保留非空 `error/errors/exception/failure`
 字段，以及 `status/state/level/severity` 中带错误信号的记录；还会保留字段集合不同于众数
@@ -40,12 +49,9 @@ compress_value(value, depth)
  │   │   ├─ Record Array → 保留关键记录并稳定采样（R2）
  │   │   ├─ 其他 Array → 截取 head/tail（R3）
  │   │   ├─ 逐项递归 compress_value(item, depth+1)
- │   │   ├─ 过滤 null（R5）和空值（R6）
  │   │   └─ 追加截断标记
  │   └─ object → compress_object()
- │       ├─ 跳过黑名单字段（R4）
- │       ├─ 逐值递归 compress_value(val, depth+1)
- │       └─ 过滤 null（R5）和空值（R6）
+ │       └─ 保留所有字段，逐值递归 compress_value(val, depth+1)
 ```
 
 ### Build Log 领域
@@ -79,12 +85,12 @@ Cleanup。Runtime 最后仍只执行一次全局字符/Token 仲裁和一次 Sta
 
 ## 四、集成路径
 
-### 路径 1：OpenClaw 插件（`tool_result_persist` hook）
+### 路径 1：OpenClaw 插件（实时工具结果 middleware）
 
 ```
 工具执行完成
    ↓
-OpenClaw 触发 tool_result_persist 事件
+OpenClaw 在模型消费前调用已声明的 agentToolResultMiddleware
    ↓
 Plugin 按 Tool Call ID 消费 PreTool 输出优化状态
    ↓
@@ -94,7 +100,7 @@ execFileSync("tokenless", ["compress"], { input: Request, timeout: 8s })
    ↓
 Core 执行状态路由、内容域 Pipeline、TOON 与最终仲裁
    ↓
-Plugin 只重建宿主允许替换的 Tool Result Slot
+Plugin 通过 { result } 替换单文本 Tool Result，保留其余元数据
 ```
 
 OpenClaw 的 PreTool 同样调用一次 `tokenless compress`，并把 Core 返回的
@@ -104,9 +110,17 @@ OpenClaw 的 PreTool 同样调用一次 `tokenless compress`，并把 Core 返�
 
 OpenClaw 不提供 Marker 授权恢复路径，因此需要恢复的 Lossy Candidate 以
 `recoverability_unavailable` 透传。本地 `tokenless retrieve` 是受信运维入口，不能替代 Agent
-授权。`tool_result_persist` 只同步改写 OpenClaw 自己持久化的 transcript；它不替换同一轮模型
-已经收到的实时结果。Plugin 只处理 String、结构化 Slot 或单个 Text Block，并保留 Tool Result
-Envelope；Media 和多个 Block 原样透传。
+授权。插件要求 OpenClaw 2026.6.6 或更高版本，Manifest 必须声明
+`contracts.agentToolResultMiddleware: ["openclaw"]`，且插件须显式启用。
+`registerAgentToolResultMiddleware` 返回的结果直接进入同轮模型请求，并由宿主持久化；
+插件不再注册 `tool_result_persist`，避免重复压缩与统计。仅单个 Text Block 可以替换，
+其余 Tool Result 元数据保留；结构化、Media 和多个 Block 原样透传。
+安装器拒绝旧版和无法识别的版本。运行时 API 缺失或注册失败时，PostTool 明确关闭，
+PreTool 可以继续；Core 失败、超时或响应非法时，Adapter 不返回替换内容，保留宿主
+交付的结果。2026.8.2 等旧版宿主会在 middleware 回调前裁剪到 100,000 个 UTF-16
+Code Unit；Fail-open 无法恢复被宿主丢弃的内容或元数据。它们仍在此限制内受支持，
+建议使用包含上游提交 `2f620b970a04` 的构建，详见
+[OpenClaw 兼容说明](../../../docs/user-guide/zh/tokenless/framework-integration.md#openclaw)。
 
 ### 路径 2：共享 PostTool Hook（Protocol v2）
 
@@ -131,24 +145,37 @@ Hook 校验版本与 Operation，并按宿主 Capability 应用 v2 Result
 ```
 
 **流水线说明**：`PostToolPipeline` 位于 Runtime 内部。工具错误、`file_content` 来源和
-低于 `min_input_chars` 的输入在入口直接透传。来源由 adapter 按工具分类；共享 PostTool Hook
-与 Hermes 插件还把只打印本地文件的 shell 命令（`cat`、`head`、`tail`、`nl`、`less`、`more`、
-`bat`、打印范围的 `sed -n`，可带 `cd … &&` 前缀，不含管道、重定向或其他命令）报告为
-`file_read`：其中的数据照常压缩，打印出的 HTML 页面视为可编辑源码而保持原样；`Grep` 工具输出只允许进入无损的 Search Results
-路径共享。通过入口后按下表静态派发，每个领域各调用一次：
+低于 `min_input_chars` 的输入在入口直接透传。来源由 adapter 按工具分类，shell 工具随请求附带
+`command` 字段；Core（`post_tool/file_read.rs`）把只打印本地文件的命令（`cat`、`head`、`tail`、
+`nl`、`less`、`more`、`bat`、打印范围的 `sed -n`，可带 `cd … &&` 前缀，不含管道、重定向或其他命令）
+改判为 `file_read`：其中的数据照常压缩，打印出的 HTML 页面视为可编辑源码而保持原样，
+且跳过新增的纯路径列表策略。`Grep` 工具输出只允许进入无损的 Search Results 路径共享。
+纯路径列表按内容识别，允许非文件来源的命令或 API 结果，不依赖 `find` 或特定工具名。
+通过入口后按下表静态派发，每个领域各调用一次：
 
 | ContentType | 前提 | 领域处理 | 默认 |
 |------|------|------|------|
-| `json`（含宿主强制 JSON 与包裹的结构化 JSON） | 无 | `JsonCompressor`：清理、Record Reduction、截断、Structured Slot 恢复、Compact JSON 与可选 TOON | 启用 |
+| `json`（含宿主强制 JSON 与包裹的结构化 JSON） | 无 | `JsonCompressor`：Record Reduction、截断、Compact JSON 与可选 TOON | 启用 |
 | `build_log` | 来源为 `command_output` 或 `file_read` | `BuildLogCompressor`：Terminal Cleanup、方言分类、Stack Trace 保护、可恢复 Progress Reduction | 启用 |
-| `tabular` | 宿主支持文本替换 | `TabularCompressor`：CSV/TSV 视图，保留单元格或可恢复选取整行 | 启用 |
-| `search_results` | 来源为 `api_response`，宿主支持文本替换 | `SearchResultsCompressor`：连续行共享重复路径，无损 | 启用，`TOKENLESS_SEARCH_PATH_SHARING_ENABLED=false` 关闭 |
+| `tabular` | 宿主支持文本替换 | `TabularCompressor`：保留全部单元格的 CSV/TSV 压紧，无收益时原样返回，不写 Stash | 启用 |
+| `search_results` | 宿主支持文本替换；带行号记录要求 `api_response`，纯路径列表允许 `api_response` 或 `command_output` | `SearchResultsCompressor`：连续记录共享完整路径，或全部路径共享目录前缀，无损且无需 Stash | 启用，`TOKENLESS_SEARCH_PATH_SHARING_ENABLED=false` 关闭 |
 | `diff` | 来源为 `command_output` 或 `file_read`，宿主支持文本替换，Stash 与恢复路径可用 | Runtime `post_tool/diff.rs`：按代价裁剪未修改上下文，元信息与改动行原样保留 | 关闭，`TOKENLESS_DIFF_COMPRESSION_ENABLED=true` 开启 |
 | `html` | 来源不是 `file_read`，宿主支持文本替换，Stash 与恢复路径可用 | `HtmlExtractor`：只渲染主内容根（`<main>`、`role=main`、唯一的最外层 `<article>` 或 body），移除可枚举非内容元素（含表单控件、媒体嵌入、dialog）后转写为 Markdown，根外节点计数省略，嵌套超过 512 层不解析 | 启用，`TOKENLESS_HTML_EXTRACTION_ENABLED=false` 关闭 |
 
 Diff 与 HTML 领域要求至少节省 16 个 Token 才采用结果，其他领域至少 1 个。Diff 与 HTML
 没有可用 Stash 或宿主未声明恢复能力（例如裸 `tokenless` 不在 Shell `PATH` 中）时，即使已开启
 环境变量也原文透传。
+纯路径列表至少包含三条 POSIX 路径，统一使用 LF 或 CRLF。固定英文说明后接紧凑 JSON，
+字段为 `base`、`paths`、`line_ending`、`trailing_newline`；将 `base` 与每个解码后的路径项
+拼接，按 `line_ending` 连接，仅当 `trailing_newline` 为 true 时追加该行尾，即可逐字节还原。
+全部路径、顺序、重复项均保留。空行、混合输出、NUL 分隔或歧义格式透传；完整视图的字节数
+和估算 Token 均减少才采用。检测器只采样完整行，压缩器仍验证全部输入。
+
+PreTool 让包含已识别原生 `find` 调用的整条命令跳过 RTK，包括复合命令及 RTK 内置透明前缀：
+`env`、`command`、`exec`、`noglob`、`nocorrect`、`builtin`、`timeout`、`time`、`nice`、`nohup`
+和 `uv run`；支持嵌套及反斜杠换行续行，进程 Wrapper 的未知参数会停止识别。
+不读取自定义 `hooks.transparent_prefixes`，这些前缀中的 `find` 仍可能被 RTK 改写。
+关闭搜索路径共享只停止后置压缩，仍保留原生 `find` 的完整输出；混合或不支持的输出因此可能不压缩。
 其余 ContentType（如 `stack_trace`、`plain_text`）透传。
 Claude Code 2.1.121 及以上版本、Qoder CLI、OpenCode 和 Cosh-NG 能替换实时结果；同时裸
 `tokenless` 可从 Shell `PATH` 解析时，其 PostTool 请求才声明恢复可用。缩减或截断结果中的
@@ -236,7 +263,10 @@ curl -s https://api.example.com/data | tokenless compress-response
 
 ## 五、压缩前后示例
 
-### 示例 1 — 字段删除 + null 移除 + 空值移除（R4 + R5 + R6）
+以下 JSON 以便于阅读的格式展示。截断示例说明未配置 Stash 时的 Bounded 候选；
+最终是否采用还取决于完整候选的收益和调用路径的恢复要求。
+
+### 示例 1 — 格式压紧，保留全部字段与空值
 
 输入：
 ```json
@@ -253,13 +283,10 @@ curl -s https://api.example.com/data | tokenless compress-response
 
 输出：
 ```json
-{
-  "status": "success",
-  "data": { "name": "test", "count": 42 }
-}
+{"status":"success","data":{"name":"test","count":42},"debug":{"request_id":"abc123","timing":0.05},"trace":"GET /api/data 200 OK","metadata":null,"tags":[],"extra":""}
 ```
 
-被删除的内容：`debug`（R4 黑名单）、`trace`（R4 黑名单）、`metadata`（R5 null）、`tags`（R6 空数组）、`extra`（R6 空字符串）。
+`debug`、`trace`、`metadata`、`tags`、`extra` 均保留；省去的是 JSON 的缩进和分隔空白。
 
 ### 示例 2 — 字符串截断（R1）
 
@@ -320,7 +347,7 @@ curl -s https://api.example.com/data | tokenless compress-response
 
 默认阈值 8 层。
 
-### 示例 5 — 递归组合压缩（R1 + R4 + R5 同时生效）
+### 示例 5 — 递归字符串截断，保留相邻空值（R1）
 
 输入（`truncate_strings_at = 10` 为例）：
 ```json
@@ -340,14 +367,15 @@ curl -s https://api.example.com/data | tokenless compress-response
 {
   "outer": {
     "inner": {
-      "long_text": "This is a … (truncated)",
+      "long_text": "This is a ",
+      "null_field": null,
       "number": 42
     }
   }
 }
 ```
 
-### 示例 6 — 小型数组内对象的复合压缩（R3 + R4 + R5）
+### 示例 6 — 小型数组保留全部字段（R3）
 
 输入（`truncate_arrays_at = 2`、`array_tail_preserve = 0` 为例）：
 ```json
@@ -359,16 +387,16 @@ curl -s https://api.example.com/data | tokenless compress-response
 ]
 ```
 
-输出：
+未配置 Stash 时生成的 Bounded 候选为：
 ```json
 [
-  {"id": 1},
+  {"id": 1, "debug": "remove me", "value": null},
   {"id": 2},
   "<... 2 more items truncated, not stashed>"
 ]
 ```
 
-第一个对象的 `debug`（R4）和 `value: null`（R5）被移除，数组在第 2 个元素后截断（R3）。少于 33 项，因此该数组不是 Record Array。
+首个对象的 `debug` 和 `value: null` 保留。该候选比保留全部四项的 Compact JSON 更长，因此最终选择完整的 Compact JSON。少于 33 项，该数组不使用 Record Reduction。
 
 ### 示例 7 — Record Reduction（R2）
 
@@ -394,16 +422,20 @@ Schema、字符串、深度、普通数组和 BuildLog 的省略提示使用同�
 | `truncate_strings_at` | 4096 | 最大 Unicode 字符数 |
 | `truncate_arrays_at` | 32 | 保留的 head 元素数 |
 | `array_tail_preserve` | 8 | 保留的 tail 元素数；0 表示仅保留 head |
-| `drop_nulls` | true | 移除 null 值 |
-| `drop_empty_fields` | true | 移除空字符串、数组和对象 |
 | `max_depth` | 8 | 最大递归深度 |
 | `add_truncation_marker` | true | 为截断内容生成有界标记 |
+
+Rust 调用方应移除 `JsonCompressionConfig.drop_nulls`、`drop_empty_fields` 和
+`JsonCompressionContext.preserve_top_level_shape` 的初始化项；这些字段已删除。
+字段与空值保留适用于所有输出槽位，不再需要顶层恢复步骤。`json_cleanup` 操作标识继续保留，
+表示紧凑序列化，也包括对封装对象或数组的 JSON 字符串信封解包一次。解包会改变顶层
+类型，但保留内部 Payload 的值；该操作不代表删除字段。
 
 ## 七、Fail-Open 设计
 
 所有集成路径均采用 fail-open 策略：
 
-- **OpenClaw 插件**：Protocol v2 进程失败、非法响应或不能安全重建 Slot 时，Hook 不返回值 → 原始结果透传
+- **OpenClaw 插件**：Protocol v2 进程失败、非法响应或不能安全重建 Slot 时，Hook 不返回值 → 宿主交付的结果透传（不恢复宿主此前的截断）
 - **copilot-shell hook**：任何失败点（依赖缺失、压缩失败、输出为空）均 `exit 0` 且不输出 stdout → 原始结果透传
 - **CLI**：错误输出到 stderr，调用方可检查退出码决定是否回退
 
@@ -506,13 +538,13 @@ tokenless stats summary
 
 统计启用条件：`TOKENLESS_STATS_ENABLED` 环境变量未设为 `0`/`false`，或通过 `tokenless stats enable` 启用。
 
-> **SLS 日志记录（JSONL）**：除 SQLite 统计外，tokenless 默认还会将每次压缩以 SLS JSONL 记录写入 `/var/log/anolisa/sls/ops/tokenless.jsonl`（默认开启）。该文件由 **anolisa SLS 组件统一管理**，tokenless 不创建/删除，仅在文件存在时追加，不存在则跳过。开关字段 `~/.tokenless/config.json` 的 `sls_enabled`（默认 `true`），环境变量 `TOKENLESS_SLS_ENABLED` 优先；输出路径可用 `TOKENLESS_SLS_PATH` 覆盖（须位于 `/var/log/` 或 `/tmp/` 下）。仅记录度量，不含原文/敏感数据。详见 [Tokenless 效果度量 · SLS JSONL](../../../docs/user-guide/zh/token-saving/tokenless/measuring-savings.md#sls-jsonl)。
+> **SLS 日志记录（JSONL）**：除 SQLite 统计外，tokenless 默认还会将每次压缩以 SLS JSONL 记录写入 `/var/log/anolisa/sls/ops/tokenless.jsonl`（默认开启）。该文件由 **anolisa SLS 组件统一管理**，tokenless 不创建/删除，仅在文件存在时追加，不存在则跳过。开关字段 `~/.tokenless/config.json` 的 `sls_enabled`（默认 `true`），环境变量 `TOKENLESS_SLS_ENABLED` 优先；输出路径可用 `TOKENLESS_SLS_PATH` 覆盖（须位于 `/var/log/` 或 `/tmp/` 下）。仅记录度量，不含原文/敏感数据。详见 [Tokenless 效果度量 · SLS JSONL](../../../docs/user-guide/zh/tokenless/measuring-savings.md#sls-jsonl)。
 
 ### 9.3 压缩效果说明
 
 | 数据类型 | 响应压缩 | 响应压缩+TOON | 说明 |
 |---------|---------|--------------|------|
-| 仓库 JSON 参考 Fixture | 36.3%（无损） | 50.6% | 无损清理超过 15% 门槛，因此保留全部 Record |
+| 完整 JSON | 取决于格式空白 | 取决于所选表示 | 保留全部字段和空值；完整候选节省达到 15% 时直接采用 |
 | 可恢复的 Record Array | 取决于记录数和重复度 | 取决于所选表示 | 未达到无损门槛时才缩减；关键记录可突破 32 条基础预算 |
 | 简单扁平对象 | 可能无收益 | 取决于字段和值长度 | 两种表示都没有同时减少字符和估算 Token 时透传 |
 

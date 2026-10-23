@@ -95,6 +95,20 @@ SkillFS 是一个混合文件系统：虚拟目录视图 + 物理写透传。
 
 ## 快速开始
 
+### 预编译包
+
+Release CI 构建 Linux x86_64 和 aarch64 预编译包，glibc 基线为 2.28。
+每个架构产出 `skillfs-{version}-linux-{arch}.tar.gz` 及其 `.sha256`、
+CycloneDX `.tar.gz.cdx.json` SBOM 及 SBOM 的 `.sha256`。
+压缩包包含 `bin/skillfs`、系统安装契约、内置 Skill 和许可证。
+目标系统需要 FUSE 3（包含共享库）；挂载还需要访问 `/dev/fuse`。
+
+发布前，在 GitHub Actions 中运行 **Release / Preview**，选择分支和 `skillfs`，
+填写 `Cargo.toml` 中的版本号（不带 `v` 前缀）。校验成功后下载两种架构的
+`skillfs-prebuilt-{version}-linux-{arch}` artifact。Preview 产物保留 14 天，
+不会创建 GitHub Release。正式发布使用 `skillfs/v{version}` tag，沿用现有
+release environment 审批流程。
+
 ### 构建
 
 ```bash
@@ -128,7 +142,7 @@ cargo run -p skillfs -- stop /path/to/mountpoint
 使用 `skillfs mount --config /path/to/skillfs-mount.toml`，通过 `mountpoint` 和
 有序 `sources` 数组聚合目录。同名 skill 整体选用较早的来源，多源挂载只读。
 路径必须为绝对路径。TOML 示例、支持的参数和 OpenClaw 接入限制见
-[配置参考](../../docs/user-guide/zh/runtime/skillfs.md#挂载配置)。
+[配置参考](../../docs/user-guide/zh/skillfs/index.md#挂载配置)。
 
 ### Managed Mount 模式
 
@@ -184,7 +198,8 @@ skills = ["apple-notes", "blogwatcher"]
 
 挂载后：
 
-- `/skills` 显示 default view 中的 skills。
+- `/skills` 显示 default view 中的 skills，以及尚未分配到任何 view 的 skills。
+- 挂载不改写 `skillfs-views.toml`；需持久化分配时显式编辑配置，修改视图配置后重挂载生效。
 - `skill-discover/SKILL.md` 列出 secondary views 中的 skills 及其
   可读 `source_path`。
 
@@ -224,7 +239,9 @@ FUSE 读取 `SKILL.md` 时，SkillFS 会执行 `compiler::compile`，支持：
 
 没有条件块时，SkillFS 也会执行少量启发式命令归一化，例如：
 
-- `pip install` -> `uv pip install`
+- 独立调用的 `pip install` / `pip3 install` -> `uv pip install`；保留指定解释器的
+  `python -m pip` 调用。独立调用使用保守的命令位置启发式判断，
+  不是完整的 shell 语法解析。
 - `python -m venv` -> `uv venv`
 - `npm install` -> `pnpm install` / `yarn install`
 
@@ -417,8 +434,8 @@ sed "s|skillfs-sidecar:dev|$IMAGE|g" deploy/kubernetes/20-pod.yaml |
 ```
 
 部署、`skill-discover` 验证、故障排查和清理见
-[Kubernetes Sidecar 用户指南](../../docs/user-guide/zh/runtime/skillfs-kubernetes-sidecar.md)
-（[English](../../docs/user-guide/en/runtime/skillfs-kubernetes-sidecar.md)）。
+[Kubernetes Sidecar 用户指南](../../docs/user-guide/zh/skillfs/kubernetes-sidecar.md)
+（[English](../../docs/user-guide/en/skillfs/kubernetes-sidecar.md)）。
 
 ## 测试覆盖
 
@@ -534,7 +551,7 @@ SkillFS 不在文件系统核心中执行扫描、签名校验或风险判断。
 
 ## 文档
 
-- [Kubernetes Sidecar 部署指南](../../docs/user-guide/zh/runtime/skillfs-kubernetes-sidecar.md) -
+- [Kubernetes Sidecar 部署指南](../../docs/user-guide/zh/skillfs/kubernetes-sidecar.md) -
   在 Kubernetes 中构建、部署、验证和清理 SkillFS。
 - [docs/specs/skillfs-spec.md](docs/specs/skillfs-spec.md) - 架构、运行时一致性边界和部署场景。
 - [docs/specs/core-spec.md](docs/specs/core-spec.md) - `skillfs-core` 实现。

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import csv
+import io
 import json
 import re
 import tempfile
@@ -141,14 +143,18 @@ class TokenlessSdkTests(unittest.IsolatedAsyncioTestCase):
         )
         default_sdk = self.sdk(rtk_enabled=False)
         disabled_sdk = self.sdk(rtk_enabled=False, html_extraction_enabled=False)
-        for sdk, origin, applied in (
-            (disabled_sdk, ContentOrigin.COMMAND_OUTPUT, False),
-            (default_sdk, ContentOrigin.COMMAND_OUTPUT, True),
-            (default_sdk, ContentOrigin.API_RESPONSE, True),
-            (default_sdk, ContentOrigin.FILE_CONTENT, False),
-            (default_sdk, ContentOrigin.FILE_READ, False),
+        for sdk, origin, command, applied in (
+            (disabled_sdk, ContentOrigin.COMMAND_OUTPUT, None, False),
+            (default_sdk, ContentOrigin.COMMAND_OUTPUT, None, True),
+            (default_sdk, ContentOrigin.COMMAND_OUTPUT, "cat page.html", False),
+            (default_sdk, ContentOrigin.COMMAND_OUTPUT, "cat page.html | head -c 9000", True),
+            (default_sdk, ContentOrigin.API_RESPONSE, "cat page.html", True),
+            (default_sdk, ContentOrigin.FILE_CONTENT, None, False),
+            (default_sdk, ContentOrigin.FILE_READ, None, False),
         ):
-            with self.subTest(enabled=sdk.config.html_extraction_enabled, origin=origin):
+            with self.subTest(
+                enabled=sdk.config.html_extraction_enabled, origin=origin, command=command
+            ):
                 attribution = Attribution("sdk-agent", "sdk-session", "html-1")
                 result = await sdk.post_tool(
                     PostToolRequest(
@@ -162,6 +168,7 @@ class TokenlessSdkTests(unittest.IsolatedAsyncioTestCase):
                             True, RecoveryMethod.tool("tokenless_retrieve"), True
                         ),
                         attribution=attribution,
+                        command=command,
                     )
                 )
                 self.assertEqual(result.content_type, ContentType.HTML)
@@ -467,7 +474,7 @@ class TokenlessSdkTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(stats, sdk.stats)
         self.assertEqual(stats.status.data_dir, sdk.runtime.data_dir)
 
-    async def test_tabular_pipeline_preserves_raw_recovery_and_bypasses_retrieved_output(self) -> None:
+    async def test_tabular_pipeline_preserves_all_cells_without_recovery(self) -> None:
         sdk = self.sdk(rtk_enabled=False)
         for delimiter in (",", "\t"):
             with self.subTest(delimiter=delimiter):
@@ -492,14 +499,15 @@ class TokenlessSdkTests(unittest.IsolatedAsyncioTestCase):
                         attribution=Attribution("sdk-agent", "table-session", "table-call"),
                     )
                 )
-                self.assertEqual(result.applied_operations, (AppliedOperation.TABULAR_ROW_REDUCTION,))
+                self.assertEqual(result.applied_operations, (AppliedOperation.TABULAR_COMPACTION,))
                 self.assertEqual(result.content_type.value, "tabular")
-                self.assertEqual(result.recoverability.value, "retrievable")
-                self.assertIn("Incomplete table", result.output)
-                restored = await sdk.retrieve(
-                    RetrieveRequest(result.stash_keys[0], frozenset(result.stash_keys), self.attribution)
+                self.assertEqual(result.recoverability.value, "lossless")
+                self.assertEqual(result.stash_keys, ())
+                self.assertNotIn("Incomplete table", result.output)
+                self.assertEqual(
+                    list(csv.reader(io.StringIO(result.output), delimiter=delimiter)),
+                    list(csv.reader(io.StringIO(original), delimiter=delimiter)),
                 )
-                self.assertEqual(restored.payload.encode(), original.encode())
                 for kind, optimization in (
                     (ResultKind.RETRIEVE, OutputOptimization.NONE),
                     (ResultKind.TOOL, OutputOptimization.RTK),
@@ -508,7 +516,7 @@ class TokenlessSdkTests(unittest.IsolatedAsyncioTestCase):
                         PostToolRequest(
                             result_kind=kind,
                             tool_name="tokenless_retrieve",
-                            content=restored.payload,
+                            content=original,
                             status=ToolResultStatus.SUCCESS,
                             content_origin=ContentOrigin.API_RESPONSE,
                             output_optimization=optimization,

@@ -1,0 +1,641 @@
+{
+  "version": 1,
+  "agents": {
+    "agentscope": {
+      "owner": "@kongche-jbw",
+      "python": "3.12.3",
+      "mode": "automated",
+      "versions": {
+        "agentscope": "2.0.6"
+      },
+      "requirements": [
+        "agentscope==2.0.6"
+      ],
+      "boundary": "Public Agent.reply, middleware, arguments, cancellation and AW/Tokenless lifecycle; deterministic tools, no hosted model.",
+      "cases": [
+        {
+          "name": "middleware",
+          "argv": [
+            "{python}",
+            "crates/aw-cli/tests/fixtures/agentscope/middleware.py"
+          ],
+          "timeout_seconds": 120,
+          "report": "unittest",
+          "tests": 26
+        },
+        {
+          "name": "native",
+          "argv": [
+            "{python}",
+            "crates/aw-cli/tests/agentscope_native.py",
+            "--aw",
+            "{bin}/aw",
+            "--output",
+            "{output}/native"
+          ],
+          "timeout_seconds": 600,
+          "report": "json",
+          "results": [
+            {
+              "file": "fixtures/native/result.json",
+              "values": {
+                "sdk_version": "2.0.6",
+                "callbacks": 632,
+                "native_callbacks": 320,
+                "executed": 24,
+                "status/bindings": 0,
+                "status/events": 0
+              }
+            }
+          ]
+        },
+        {
+          "name": "cancellation",
+          "argv": [
+            "{python}",
+            "crates/aw-cli/tests/agentscope_cancellation.py",
+            "--aw",
+            "{bin}/aw",
+            "--output",
+            "{output}/cancellation"
+          ],
+          "timeout_seconds": 900,
+          "report": "json",
+          "results": [
+            {
+              "file": "fixtures/cancellation/result.json",
+              "values": {
+                "cancelled": 136,
+                "prespawn_cancelled": 68,
+                "finalizer_cancelled": 34,
+                "spawn_failures": 36,
+                "rpc_failures": 36,
+                "approval_failures": 48,
+                "deep_directives": 3,
+                "status/events": 0
+              }
+            }
+          ]
+        },
+        {
+          "name": "arguments",
+          "argv": [
+            "{python}",
+            "crates/aw-cli/tests/agentscope_arguments.py",
+            "--aw",
+            "{bin}/aw",
+            "--output",
+            "{output}/arguments"
+          ],
+          "timeout_seconds": 600,
+          "report": "json",
+          "results": [
+            {
+              "file": "fixtures/arguments/result-report.json",
+              "values": {
+                "cases": 15,
+                "status/bindings": 0,
+                "status/events": 0
+              }
+            },
+            {
+              "file": "fixtures/arguments/result-block.json",
+              "values": {
+                "cases": 15,
+                "status/bindings": 0,
+                "status/events": 0
+              }
+            }
+          ]
+        },
+        {
+          "name": "lifecycle",
+          "argv": [
+            "{python}",
+            "crates/aw-cli/tests/agentscope_lifecycle.py",
+            "--aw",
+            "{bin}/aw",
+            "--tokenless",
+            "{bin}/tokenless",
+            "--tokenless-provider",
+            "{bin}/aw-provider-tokenless",
+            "--sec-core-provider",
+            "{bin}/aw-provider-sec-core",
+            "--output",
+            "{output}/lifecycle"
+          ],
+          "timeout_seconds": 300,
+          "report": "json",
+          "results": [
+            {
+              "file": "fixtures/lifecycle/result.json",
+              "values": {
+                "sdk": "2.0.6",
+                "executed": 5,
+                "permissions": 8,
+                "scans": 3,
+                "after": 7,
+                "status/bindings": 0,
+                "status/events": 0
+              }
+            }
+          ]
+        }
+      ]
+    },
+    "claude-sdk": {
+      "owner": "@kongche-jbw",
+      "python": "3.12.3",
+      "mode": "automated",
+      "versions": {
+        "claude-agent-sdk": "0.2.88",
+        "mcp": "1.26.0"
+      },
+      "requirements": [
+        "claude-agent-sdk==0.2.88",
+        "mcp==1.26.0"
+      ],
+      "boundary": "SDK and bundled CLI 2.1.161 with a deterministic local HTTP model, permissions, native hooks and real Tokenless; no hosted model.",
+      "cases": [
+        {
+          "name": "sdk-cli",
+          "argv": [
+            "{python}",
+            "tests/test_claude_sdk_native.py",
+            "--aw",
+            "{bin}/aw",
+            "--tokenless",
+            "{bin}/tokenless",
+            "--tokenless-provider",
+            "{bin}/aw-provider-tokenless",
+            "--output",
+            "{output}/sdk"
+          ],
+          "timeout_seconds": 1200,
+          "report": "json",
+          "results": [
+            {
+              "file": "fixtures/sdk/results.json",
+              "cases": {
+                "at": "",
+                "key": "mode",
+                "names": [
+                  "allow",
+                  "deny",
+                  "hook-failure",
+                  "before-report-failure",
+                  "after-report-failure",
+                  "failure",
+                  "bash-failure",
+                  "native-deny",
+                  "rewrite",
+                  "native-allow-aw-deny",
+                  "native-hook-deny",
+                  "native-hook-deny-no-reason",
+                  "native-hook-deny-exit2",
+                  "native-hook-deny-rewrite",
+                  "native-hook-neutral",
+                  "native-hook-rewrite",
+                  "native-hook-invalid-chain",
+                  "permission-rewrite",
+                  "permission-hook-rewrite",
+                  "permission-prompt",
+                  "many-denials",
+                  "parallel",
+                  "multi-turn",
+                  "strict-mcp-config",
+                  "unready",
+                  "settings",
+                  "cli-path",
+                  "plugins",
+                  "extra-args",
+                  "bash-compress",
+                  "bash-compress-observer-failure",
+                  "bash-compress-native-rewrite",
+                  "bash-compress-failure",
+                  "bash-compress-tool-failure",
+                  "bash-pretool",
+                  "bash-pretool-deny",
+                  "mcp-error-compress"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    "hermes": {
+      "owner": "@kongche-jbw",
+      "python": "3.14.0",
+      "mode": "automated",
+      "versions": {},
+      "source": {
+        "url": "https://github.com/NousResearch/hermes-agent.git",
+        "revision": "952c941e741e922a9be8fc403c8944c6e96318bb"
+      },
+      "boundary": "Pinned official dispatcher and chat CLI, reload, denial and cleanup with a deterministic local model; no hosted model.",
+      "cases": [
+        {
+          "name": "dispatcher",
+          "argv": [
+            "{python}",
+            "crates/aw-cli/tests/fixtures/hermes/native_contract.py",
+            "--source",
+            "{source}",
+            "--plugin",
+            "{aw_root}/crates/aw-adapter/native/hermes"
+          ],
+          "timeout_seconds": 180,
+          "report": "unittest",
+          "tests": 23
+        },
+        {
+          "name": "chat",
+          "argv": [
+            "{python}",
+            "crates/aw-cli/tests/fixtures/hermes/live_cli.py",
+            "--aw",
+            "{bin}/aw",
+            "--provider",
+            "{bin}/policy",
+            "--hermes",
+            "{source}/.venv/bin/hermes",
+            "--source",
+            "{source}",
+            "--output",
+            "{output}/chat"
+          ],
+          "timeout_seconds": 1200,
+          "report": "json",
+          "results": [
+            {
+              "file": "fixtures/chat/result.json",
+              "cases": {
+                "at": "results",
+                "key": "case",
+                "names": [
+                  "allow",
+                  "block",
+                  "empty",
+                  "profile-safe",
+                  "parent-safe",
+                  "profile-override",
+                  "reload-block",
+                  "rewrite-block"
+                ],
+                "values": {
+                  "instance_released": true,
+                  "launch_directories_removed": true,
+                  "profile_retained": true,
+                  "native_environment_preserved": true
+                }
+              }
+            }
+          ]
+        }
+      ]
+    },
+    "openclaw": {
+      "owner": "@kongche-jbw",
+      "python": "3.12.3",
+      "mode": "automated",
+      "versions": {},
+      "npm_packages": [
+        "openclaw@2026.9.6"
+      ],
+      "boundary": "Official plugin loader/SDK/manifest, runtime-scoped result middleware, native policy aliases, Hook ordering and effect adoption; no Gateway or model turn.",
+      "cases": [
+        {
+          "name": "hooks",
+          "argv": [
+            "node",
+            "--test",
+            "--test-reporter=tap",
+            "crates/aw-cli/tests/openclaw-native.mjs"
+          ],
+          "timeout_seconds": 120,
+          "report": "tap",
+          "tests": 8
+        }
+      ]
+    },
+    "pi": {
+      "owner": "@kongche-jbw",
+      "python": "3.12.3",
+      "mode": "automated",
+      "versions": {},
+      "npm_fixture": "crates/aw-cli/tests/fixtures/pi",
+      "boundary": "Published Coding Agent/Core SDK 0.84.2 public factories and tool loop, including real Tokenless; deterministic model stream and scanner/RTK fixtures.",
+      "cases": [
+        {
+          "name": "public-factory",
+          "argv": [
+            "{python}",
+            "crates/aw-cli/tests/fixtures/pi/public-smoke.py",
+            "--aw",
+            "{bin}/aw",
+            "--root",
+            "{npm}"
+          ],
+          "timeout_seconds": 600,
+          "report": "json",
+          "results": [
+            {
+              "file": "npm/public-smoke-results.json",
+              "cases": {
+                "at": "",
+                "key": "case",
+                "names": [
+                  "late-before-denial",
+                  "late-after-replacement",
+                  "late-before-replacement-session",
+                  "late-after-replacement-session",
+                  "allow",
+                  "deny",
+                  "tool-error",
+                  "native-mutation",
+                  "native-replacement",
+                  "two-sessions-parallel",
+                  "before-error-block",
+                  "after-error-report",
+                  "await-both-hooks",
+                  "factory-new",
+                  "factory-resume",
+                  "factory-fork",
+                  "factory-import",
+                  "block-reason-model",
+                  "aw-replacement-metadata",
+                  "aw-replacement-parallel",
+                  "aw-replacement-error-neutral",
+                  "aw-replacement-multiblock-neutral",
+                  "aw-replacement-image-neutral",
+                  "native-invalid-before",
+                  "native-invalid-after-neutral",
+                  "native-forged-after-neutral",
+                  "native-empty-neutral",
+                  "native-block-reason-model",
+                  "native-after-exception",
+                  "native-error-cleared-replaced",
+                  "native-nullish-success",
+                  "native-nullish-error",
+                  "reused-native-id",
+                  "early-denial-forty",
+                  "early-error-block",
+                  "early-native-invalid-block"
+                ],
+                "values": {
+                  "passed": true
+                }
+              }
+            }
+          ]
+        },
+        {
+          "name": "tokenless",
+          "argv": [
+            "{python}",
+            "crates/aw-cli/tests/fixtures/pi/tokenless-smoke.py",
+            "--aw",
+            "{bin}/aw",
+            "--root",
+            "{npm}",
+            "--tokenless-provider",
+            "{bin}/aw-provider-tokenless",
+            "--tokenless-cli",
+            "{bin}/tokenless",
+            "--sec-core-provider",
+            "{bin}/aw-provider-sec-core"
+          ],
+          "timeout_seconds": 300,
+          "report": "json",
+          "results": [
+            {
+              "file": "npm/tokenless-smoke-results.json",
+              "cases": {
+                "at": "",
+                "key": "case",
+                "names": [
+                  "json-selected-output",
+                  "rtk-retry-rescanned-denied",
+                  "rtk-retry-allowed-post-neutral"
+                ],
+                "values": {
+                  "passed": true
+                }
+              }
+            }
+          ]
+        }
+      ]
+    },
+    "qwenpaw": {
+      "owner": "@kongche-jbw",
+      "python": "3.12.3",
+      "mode": "automated",
+      "versions": {
+        "qwenpaw": "2.2.2b4",
+        "agentscope": "2.0.9"
+      },
+      "requirements": [
+        "qwenpaw==2.2.2b4",
+        "agentscope==2.0.9"
+      ],
+      "boundary": "Pinned stock QwenPaw App/API and AgentScope middleware, with a deterministic local model; native shell allow, scan denial (after exact native approval), backend error and timeout blocking through the candidate sec-core daemon container. No cloud model key. Middleware and real AW RPC suites cover request/tool reload lifetimes, Coordinator consumption, early closure and blocked native cleanup. The App reload suite verifies add/remove/re-add policy switching across real HTTP shell and read_file success/error turns in one process; ERROR and INTERRUPTED chunks remain withheld until native cleanup completes.",
+      "cases": [
+        {
+          "name": "middleware",
+          "argv": [
+            "{python}",
+            "crates/aw-cli/tests/fixtures/qwenpaw/native_middleware.py"
+          ],
+          "timeout_seconds": 180,
+          "report": "unittest",
+          "tests": 20
+        },
+        {
+          "name": "runtime-reload",
+          "argv": [
+            "{python}",
+            "crates/aw-cli/tests/fixtures/qwenpaw/native_reload.py",
+            "--bin",
+            "{bin}"
+          ],
+          "timeout_seconds": 180,
+          "report": "unittest",
+          "tests": 7
+        },
+        {
+          "name": "app-reload",
+          "argv": [
+            "{python}",
+            "crates/aw-cli/tests/fixtures/qwenpaw/native_app_reload.py",
+            "--bin",
+            "{bin}",
+            "--qwenpaw",
+            "{qwenpaw}"
+          ],
+          "timeout_seconds": 180,
+          "report": "unittest",
+          "tests": 1
+        },
+        {
+          "name": "sec-core",
+          "argv": [
+            "{python}",
+            "crates/aw-cli/tests/fixtures/sec_core/native.py",
+            "--agent",
+            "qwenpaw",
+            "--bin",
+            "{bin}",
+            "--agent-bin",
+            "{qwenpaw}",
+            "--image",
+            "ubuntu:24.04@sha256:68ee22004a9109b44973313b02ff7b1de250f1de0f5ecb628d73f579aaff33ac",
+            "--output",
+            "{output}/sec-core"
+          ],
+          "timeout_seconds": 900,
+          "report": "json",
+          "results": [
+            {
+              "file": "fixtures/sec-core/results.json",
+              "values": {
+                "passed": true,
+                "runtime_removed": true
+              },
+              "cases": {
+                "at": "cases",
+                "key": "case",
+                "names": [
+                  "allow",
+                  "scan-deny",
+                  "backend-error",
+                  "timeout-block"
+                ],
+                "values": {
+                  "passed": true
+                }
+              }
+            }
+          ]
+        }
+      ],
+      "container": "ubuntu:24.04@sha256:68ee22004a9109b44973313b02ff7b1de250f1de0f5ecb628d73f579aaff33ac"
+    },
+    "qoder": {
+      "owner": "@kongche-jbw",
+      "python": "3.12.3",
+      "mode": "automated",
+      "versions": {},
+      "requirements": [],
+      "cases": [
+        {
+          "name": "sec-core",
+          "argv": [
+            "{python}",
+            "crates/aw-cli/tests/fixtures/sec_core/native.py",
+            "--agent",
+            "qoder",
+            "--bin",
+            "{bin}",
+            "--agent-bin",
+            "{qoder}",
+            "--image",
+            "ubuntu:24.04@sha256:68ee22004a9109b44973313b02ff7b1de250f1de0f5ecb628d73f579aaff33ac",
+            "--output",
+            "{output}/sec-core"
+          ],
+          "timeout_seconds": 900,
+          "report": "json",
+          "results": [
+            {
+              "file": "fixtures/sec-core/results.json",
+              "values": {
+                "passed": true,
+                "runtime_removed": true
+              },
+              "cases": {
+                "at": "cases",
+                "key": "case",
+                "names": [
+                  "allow",
+                  "scan-deny",
+                  "backend-error",
+                  "timeout-block"
+                ],
+                "values": {
+                  "passed": true
+                }
+              }
+            }
+          ]
+        },
+        {
+          "name": "runtime-reload",
+          "argv": [
+            "{python}",
+            "crates/aw-cli/tests/fixtures/qoder/reload.py",
+            "--bin",
+            "{bin}",
+            "--output",
+            "{output}/runtime-reload"
+          ],
+          "timeout_seconds": 180,
+          "report": "json",
+          "results": [
+            {
+              "file": "fixtures/runtime-reload/results.json",
+              "values": {
+                "passed": true,
+                "native_version": "1.1.73",
+                "same_process": true,
+                "instance_released": true,
+                "runtime_removed": true
+              },
+              "cases": {
+                "at": "cases",
+                "key": "case",
+                "names": [
+                  "prewarm",
+                  "add-hook",
+                  "remove-hook"
+                ],
+                "values": {
+                  "passed": true
+                }
+              }
+            }
+          ]
+        }
+      ],
+      "qoder_cli": {
+        "version": "1.1.64",
+        "downloads": {
+          "x86_64": {
+            "url": "https://qoder-ide.oss-accelerate.aliyuncs.com/qodercli/releases/1.1.64/qodercli-linux-x64.tar.gz",
+            "sha256": "ab66abe6893ecfcd8f0272a45a7aad86eed495d1206eeac6d0b6a6517f1f09d6"
+          },
+          "aarch64": {
+            "url": "https://qoder-ide.oss-accelerate.aliyuncs.com/qodercli/releases/1.1.64/qodercli-linux-arm64.tar.gz",
+            "sha256": "8036b71d8cb89dd5736aea3138b09b52fc1a9207f3e4f6db39e38404668bc1ca"
+          }
+        }
+      },
+      "boundary": "Pinned Qoder 1.1.64 print-mode sec-core allow, scan denial, backend error and timeout blocking with its hosted Performance model and QODER_PERSONAL_ACCESS_TOKEN. A separate checksummed 1.1.73 TUI lane requires a native startup handshake and default/add/remove idle policy activation before dispatch, retaining the same process. Full TUI tool-turn lifecycle/replacement adoption remains a separate acceptance boundary.",
+      "container": "ubuntu:24.04@sha256:68ee22004a9109b44973313b02ff7b1de250f1de0f5ecb628d73f579aaff33ac",
+      "qoder_reload_cli": {
+        "version": "1.1.73",
+        "downloads": {
+          "x86_64": {
+            "url": "https://qoder-ide.oss-accelerate.aliyuncs.com/qodercli/releases/1.1.73/qodercli-linux-x64.tar.gz",
+            "sha256": "b7379fd20904dc7cc01568b93c06dec235b5d67d2b2096f69931c2026cfa1312"
+          },
+          "aarch64": {
+            "url": "https://qoder-ide.oss-accelerate.aliyuncs.com/qodercli/releases/1.1.73/qodercli-linux-arm64.tar.gz",
+            "sha256": "aed01a40653c116bfd9a0bbf10e1c015e7fd7d2697512afe69d501e235aa6402"
+          }
+        }
+      }
+    }
+  }
+}
