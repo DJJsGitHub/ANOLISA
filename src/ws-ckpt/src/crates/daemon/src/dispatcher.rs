@@ -1,5 +1,6 @@
 use crate::state::DaemonState;
 use std::sync::Arc;
+use ws_ckpt_common::backend::{CreateAdmissionRefused, DiffError};
 use ws_ckpt_common::{
     default_auto_cleanup_keep, delete_workspace_policy, load_config_file, save_workspace_policy,
     ConfigReport, DaemonConfig, EffectivePolicy, ErrorCode, FileConfig, GlobalPolicySnapshot,
@@ -314,7 +315,15 @@ pub(crate) async fn dispatch_with_context(
     match result {
         Ok(response) => response,
         Err(e) => Response::Error {
-            code: ErrorCode::InternalError,
+            code: match e.downcast_ref::<DiffError>() {
+                Some(DiffError::UnsupportedWorkspacePath { .. }) => {
+                    ErrorCode::UnsupportedWorkspacePath
+                }
+                None if e.downcast_ref::<CreateAdmissionRefused>().is_some() => {
+                    ErrorCode::DiskSpaceInsufficient
+                }
+                None => ErrorCode::InternalError,
+            },
             message: format!("{:#}", e),
         },
     }

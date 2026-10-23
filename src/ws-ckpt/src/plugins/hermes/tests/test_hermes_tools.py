@@ -380,6 +380,26 @@ class TestHandlers:
         result = json.loads(handle_ws_ckpt_diff({"from": "a", "to": "b"}))
         assert result["success"] is True
 
+    @pytest.mark.parametrize("handler,args", [
+        (handle_ws_ckpt_diff, {"from": "snap1"}),
+        (handle_ws_ckpt_rollback, {"target": "snap1", "preview": True}),
+    ])
+    def test_diff_path_encoding_error_reaches_agent(self, handler, args):
+        diagnostic = (
+            r'Error [UnsupportedWorkspacePath]: mkfile path cannot be represented as UTF-8: '
+            r'"./snap/bad\\377"'
+        )
+        with (
+            patch("hermes.tools._require_workspace", return_value=("/ws", None)),
+            patch("hermes.tools._resolve_workspace", return_value=("/ws", None)),
+            patch("hermes.tools.subprocess.run") as mock_run,
+        ):
+            mock_run.return_value = MagicMock(returncode=1, stdout="", stderr=diagnostic)
+            result = json.loads(handler(args))
+        assert result["success"] is False
+        assert "NOT retryable until the filename is fixed" in result["error"]
+        assert diagnostic in result["error"]
+
     @patch("hermes.tools._run_ws_ckpt_cmd", return_value=(True, "deleted"))
     @patch("hermes.tools._resolve_workspace", return_value=("/ws", None))
     def test_delete_success(self, _ws, _cmd):
@@ -629,6 +649,19 @@ class TestHandleWsCkptConfig:
         result = json.loads(handle_ws_ckpt_config({"action": "update", "key": "workspace", "value": "/new"}))
         assert result["success"] is False
 
+    @patch("hermes.cron.CrontabManager.migrate", return_value=[])
+    @patch("hermes.tools._persist_plugin_yaml", return_value="")
+    @patch("hermes.tools.get_manager")
+    @patch("os.getcwd", return_value="/new/sub")
+    def test_workspace_refuses_when_cwd_inside(self, _cwd, mock_mgr, _persist, mock_migrate):
+        mock_mgr.return_value = MagicMock()
+        result = json.loads(handle_ws_ckpt_config({"action": "update", "key": "workspace", "value": "/new"}))
+        assert result["success"] is False
+        assert "Refused" in result["error"]
+        mock_mgr.return_value.set_workspace.assert_not_called()
+        mock_migrate.assert_not_called()
+        _persist.assert_not_called()
+
     # --- cronSchedules ---
     def test_cronSchedules_no_value(self):
         result = json.loads(handle_ws_ckpt_config({"action": "update", "key": "cronSchedules"}))
@@ -875,3 +908,35 @@ class TestToolsTuple:
             assert isinstance(schema, dict)
             assert callable(handler)
             assert isinstance(emoji, str)
+
+
+class TestWorkspaceLineBreakGuard:
+    """The workspace path is interpolated into crontab lines; a value
+    carrying a line break would install everything after it as an
+    independent cron entry — scheduled code execution as the user."""
+
+    @pytest.mark.parametrize("line_break", ["\n", "\r"])
+    @patch("hermes.cron.CrontabManager.migrate", return_value=[])
+    @patch("hermes.tools._persist_plugin_yaml", return_value=None)
+    @patch("hermes.tools.get_manager")
+    @patch("hermes.tools._require_workspace", return_value=("/old", None))
+    def test_workspace_update_rejects_line_breaks(
+        self, _ws, mock_mgr, _persist, _migrate, line_break
+    ):
+        mgr = MagicMock()
+        mgr.config.workspace = "/old"
+        mgr.config.cron_schedules = []
+        mock_mgr.return_value = mgr
+        result = json.loads(
+            handle_ws_ckpt_config(
+                {
+                    "action": "update",
+                    "key": "workspace",
+                    "value": f"/tmp/legit{line_break}* * * * * touch /tmp/pwned",
+                }
+            )
+        )
+        assert result["success"] is False
+        assert "single-line" in result["error"]
+        mgr.set_workspace.assert_not_called()
+        _migrate.assert_not_called()

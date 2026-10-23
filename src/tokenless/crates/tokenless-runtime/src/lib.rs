@@ -64,7 +64,7 @@ pub struct RuntimeConfig {
     /// Whether compressed output is returned. Disabled mode calculates and
     /// records predicted savings but returns the original input.
     pub compression_enabled: bool,
-    /// Whether API search results share consecutive file paths. Enabled by default.
+    /// Whether search records and non-file path lists share paths. Enabled by default.
     pub search_path_sharing_enabled: bool,
     /// Whether command-output Git diffs may omit context with original recovery. Disabled by default.
     pub diff_compression_enabled: bool,
@@ -598,8 +598,12 @@ impl TokenlessRuntime {
             record = record.with_tool_use_id(tool_use_id.clone());
         }
 
-        if let Some(recorder) = &self.stats_recorder {
-            let _ = recorder.record(&record);
+        if let Some(recorder) = &self.stats_recorder
+            && let Err(e) = recorder.record(&record)
+        {
+            warn_stats(&format!(
+                "[tokenless-stats] WARNING: failed to record stats entry: {e}",
+            ));
         }
         if self.config.sls_enabled {
             SlsWriter::new().write(&record);
@@ -779,6 +783,22 @@ fn validate_input_size(input: &str) -> Result<(), RuntimeError> {
     Ok(())
 }
 
+/// Best-effort stderr warning whose own write failure cannot fail the
+/// command. `eprintln!` panics when writing to stderr fails (a full
+/// filesystem behind redirected logs, a closed descriptor), which would
+/// turn a fail-soft stats-recording warning into a process failure —
+/// the stats layer must stay invisible to the compression and
+/// retrieval results. The write errors are discarded: there is no
+/// fallback channel to report a failed warning on, and failing the
+/// command here is exactly the regression to avoid.
+pub(crate) fn warn_stats(message: &str) {
+    use std::io::Write;
+    let mut stderr = std::io::stderr();
+    let _ = stderr.write_all(message.as_bytes());
+    let _ = stderr.write_all(b"\n");
+    let _ = stderr.flush();
+}
+
 /// Overall budget for one in-process PostTool compression.
 const RESPONSE_PIPELINE_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -808,6 +828,7 @@ pub fn compress_response_with_store(
         content: input.into(),
         status: ToolResultStatus::Success,
         content_origin: ContentOrigin::ApiResponse,
+        command: None,
         output_optimization: OutputOptimization::None,
         capabilities: PostToolCapabilities {
             replace_output: true,
@@ -832,14 +853,12 @@ pub fn compress_response_with_store(
             stash_enabled: options.stash_enabled,
             require_reversibility: options.require_reversible,
             force_json: true,
-            preserve_top_level_shape: false,
             allow_toon: false,
             min_toon_chars: MIN_TOON_CHARS,
             json: json_config(options),
         },
         stash_store,
-    )
-    .map_err(|error| RuntimeError::Pipeline(error.to_string()))?;
+    );
 
     // Legacy measurement channel (see `CompressResult::compressed_output`):
     // the candidate the adapter produced, or the original when none ran.
@@ -938,7 +957,7 @@ pub fn retrieve_recorded(
         let tokenizer_id = payload_tokens
             .is_some()
             .then_some(tokenless_protocol::TOKENIZER_ID);
-        let _ = recorder.record_retrieve_event(
+        if let Err(e) = recorder.record_retrieve_event(
             &hash,
             outcome,
             source,
@@ -947,7 +966,11 @@ pub fn retrieve_recorded(
             None,
             None,
             None,
-        );
+        ) {
+            warn_stats(&format!(
+                "[tokenless-stats] WARNING: failed to record retrieve event: {e}",
+            ));
+        }
     }
     match result {
         Ok(Some(payload)) => Ok(payload),
@@ -1042,25 +1065,36 @@ fn record_entry_stats(
         record = record.with_tool_use_id(tool_use_id.clone());
     }
 
-    if let Some(recorder) = recorder
-        && let Ok(stats_id) = recorder.record(&record)
-        && stats.disposition == Disposition::Applied
-        && !stash_keys.is_empty()
-    {
-        let artifact_kind = if stats
-            .applied_operations
-            .contains(&tokenless_protocol::AppliedOperation::SchemaCompression)
-        {
-            "schema_compression"
-        } else if stats
-            .applied_operations
-            .contains(&tokenless_protocol::AppliedOperation::JsonRecordReduction)
-        {
-            "json_record_reduction"
-        } else {
-            "json_truncation"
-        };
-        let _ = recorder.record_artifacts(stats_id, artifact_kind, stash_keys);
+    if let Some(recorder) = recorder {
+        match recorder.record(&record) {
+            Ok(stats_id) => {
+                if stats.disposition == Disposition::Applied && !stash_keys.is_empty() {
+                    let artifact_kind = if stats
+                        .applied_operations
+                        .contains(&tokenless_protocol::AppliedOperation::SchemaCompression)
+                    {
+                        "schema_compression"
+                    } else if stats
+                        .applied_operations
+                        .contains(&tokenless_protocol::AppliedOperation::JsonRecordReduction)
+                    {
+                        "json_record_reduction"
+                    } else {
+                        "json_truncation"
+                    };
+                    if let Err(e) = recorder.record_artifacts(stats_id, artifact_kind, stash_keys) {
+                        warn_stats(&format!(
+                            "[tokenless-stats] WARNING: failed to record stash artifacts: {e}"
+                        ));
+                    }
+                }
+            }
+            Err(e) => {
+                warn_stats(&format!(
+                    "[tokenless-stats] WARNING: failed to record stats entry: {e}",
+                ));
+            }
+        }
     }
     if sls_enabled {
         SlsWriter::new().write(&record);
@@ -1081,6 +1115,39 @@ fn resolve_runtime_data_dir(explicit: Option<&Path>) -> Result<PathBuf, RuntimeE
 mod tests {
     use super::*;
     use tokenless_ccr::{InMemoryStore, StashError, StashWrite};
+
+    /// P2-1 review regression: a stats-recording warning must not be
+    /// able to fail the command when stderr itself cannot be written
+    /// (a full filesystem behind redirected logs). `eprintln!` panics
+    /// on that shape, turning the fail-soft warning into exit 101 while
+    /// the compression output is fine; `warn_stats` must survive it.
+    /// Redirect fd 2 to /dev/full, call the helper, restore, and assert
+    /// the call returned — a panicking write makes this test fail.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn warn_stats_survives_an_unwritable_stderr() {
+        use std::os::unix::io::AsRawFd;
+
+        let dev_full = std::fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/full")
+            .expect("open /dev/full");
+        let saved = unsafe { libc::dup(2) };
+        assert!(saved >= 0, "dup stderr");
+        unsafe {
+            libc::dup2(dev_full.as_raw_fd(), 2);
+        }
+        // The helper's whole contract: no panic, error discarded.
+        warn_stats("[tokenless-stats] WARNING: simulated stderr failure");
+        // Restore before any assert can print.
+        let restored = unsafe { libc::dup2(saved, 2) };
+        let _ = std::io::Write::flush(&mut std::io::stderr());
+        assert!(restored >= 0, "restore stderr");
+        unsafe {
+            libc::close(saved);
+        }
+        drop(dev_full);
+    }
 
     struct AlwaysFail;
 
@@ -1249,7 +1316,7 @@ mod tests {
     }
 
     #[test]
-    fn explicit_response_api_removes_top_level_nulls() {
+    fn explicit_response_api_preserves_top_level_nulls() {
         let mut value = serde_json::Map::new();
         value.insert(
             "keep".to_owned(),
@@ -1263,10 +1330,10 @@ mod tests {
         let result =
             compress_response_with_store(&input, &CompressOptions::default(), true, None).unwrap();
 
-        assert_eq!(result.disposition, Disposition::Applied);
+        assert_eq!(result.disposition, Disposition::NoSavings);
         assert_eq!(
             serde_json::from_str::<serde_json::Value>(&result.output).unwrap(),
-            serde_json::json!({"keep": "value"})
+            serde_json::Value::Object(value)
         );
     }
 
@@ -1400,13 +1467,8 @@ mod tests {
     }
 
     #[test]
-    fn pure_cleanup_savings_are_lossless_and_pass_required_reversibility() {
-        // Dropped debug fields, nulls, and empties keep the pre-pipeline
-        // judgment that they are cleanup, not content loss: with no
-        // truncation the candidate is lossless and applies even where
-        // reversible output is required and no stash exists. (The
-        // pre-pipeline path rejected exactly this combination.)
-        let input = serde_json::to_string(&serde_json::json!({
+    fn compaction_is_lossless_and_passes_required_reversibility() {
+        let input = serde_json::to_string_pretty(&serde_json::json!({
             "value": 1,
             "noise": null,
             "debug": "x".repeat(200),
@@ -1423,7 +1485,11 @@ mod tests {
         )
         .unwrap();
         assert!(result.applied());
-        assert!(!result.output.contains("debug"));
+        assert_eq!(result.unrecoverable_truncations.unwrap_or(0), 0);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&result.output).unwrap(),
+            serde_json::from_str::<serde_json::Value>(&input).unwrap()
+        );
     }
 
     #[test]
@@ -1550,6 +1616,7 @@ mod tests {
                     content,
                     status: ToolResultStatus::Success,
                     content_origin: ContentOrigin::ApiResponse,
+                    command: None,
                     output_optimization: OutputOptimization::None,
                     capabilities: PostToolCapabilities {
                         replace_output: true,
@@ -1597,6 +1664,7 @@ mod tests {
                     content,
                     status: ToolResultStatus::Success,
                     content_origin: ContentOrigin::CommandOutput,
+                    command: None,
                     output_optimization: OutputOptimization::None,
                     capabilities: PostToolCapabilities {
                         replace_output: true,

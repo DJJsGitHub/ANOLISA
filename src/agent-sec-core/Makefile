@@ -5,7 +5,7 @@
 .PHONY: python-code-pretty
 python-code-pretty: ## Format Python code using black and isort
 	@echo "🎨 Formatting code with black and isort..."
-	@uv run --project agent-sec-cli isort --profile black --line-length 80 --skip-glob "*/backend-skill/templates/*" .
+	@uv run --project agent-sec-cli isort --settings-path ../.. --profile black --line-length 80 --skip-glob "*/backend-skill/templates/*" .
 	@uv run --project agent-sec-cli black --force-exclude "backend-skill/templates/" .
 
 .PHONY: python-lint
@@ -99,6 +99,9 @@ test-e2e-rpm: ## Run E2E tests against RPM-installed agent-sec-cli binary
 # Delete a line as soon as its capability lands in the V2 CLI/daemon; do not
 # collapse the list into a directory-level ignore, or migrated coverage will
 # stay silently disabled.
+PII_HOOK_LAYOUT = installed
+SKILLSEC_HOOK_LAYOUT = installed
+
 .PHONY: test-e2e-rpm-v2
 test-e2e-rpm-v2: ## Run E2E tests against V2 RPM-installed binaries
 	@echo "🧪 Running V2 E2E tests on installed RPM..."
@@ -108,17 +111,13 @@ test-e2e-rpm-v2: ## Run E2E tests against V2 RPM-installed binaries
 	@# The shared code-scanner E2E imports rule metadata before it can decide
 	@# whether source-only inventory assertions apply to this installed V2 RPM.
 	@python3 -c 'import yaml' >/dev/null 2>&1 || pip3 install --quiet pyyaml
-	CODE_SCANNER_E2E_SKIP_TELEMETRY=1 python3 -m pytest tests/e2e/ tests/v2/ \
+	CODE_SCANNER_E2E_SKIP_TELEMETRY=1 PII_E2E_RUNTIME=v2 OBS_E2E_RUNTIME=v2 SEC_EVENTS_E2E_RUNTIME=v2 PII_HOOK_LAYOUT=$(PII_HOOK_LAYOUT) SKILLSEC_HOOK_LAYOUT=$(SKILLSEC_HOOK_LAYOUT) python3 -m pytest tests/e2e/ tests/v2/ \
 		--import-mode=importlib -ra \
-		--ignore=tests/e2e/cli/test_events_e2e.py \
 		--ignore=tests/e2e/cli/test_observability_record_jsonl_e2e.py \
 		--ignore=tests/e2e/cli/test_observability_record_sqlite_e2e.py \
-		--ignore=tests/e2e/cli/test_scan_pii_e2e.py \
-		--ignore=tests/e2e/cli/test_session_report_e2e.py \
 		--ignore=tests/e2e/cli/test_skill_ledger_analyze_e2e.py \
 		--ignore=tests/e2e/codex-hooks/test_codex_hooks_e2e.py \
 		--ignore=tests/e2e/daemon/test_daemon_e2e.py \
-		--ignore=tests/e2e/prompt-scanner/test_prompt_scanner_e2e.py \
 		--ignore=tests/e2e/qoder-hooks/test_qoder_skill_ledger_hook_e2e.py \
 		--ignore=tests/e2e/qwen-code-extension/test_qwen_direct_hook_execution.py \
 		--ignore=tests/e2e/skill-ledger/e2e_test.py \
@@ -126,30 +125,27 @@ test-e2e-rpm-v2: ## Run E2E tests against V2 RPM-installed binaries
 		--ignore=tests/e2e/linux-sandbox \
 		-v --tb=short
 	@# Pending V2 capabilities behind the ignores above:
-	@#   cli/test_events_e2e.py                   -> security event query
-	@#   cli/test_observability_record_*_e2e.py   -> observability record sinks
-	@#   cli/test_scan_pii_e2e.py                 -> PII scanning
-	@#   cli/test_session_report_e2e.py           -> session report
-	@#   cli/test_skill_ledger_analyze_e2e.py     -> skill ledger analyze
-	@#   codex|qoder|qwen hook tests              -> hooks calling the V2 CLI
+	@#   codex|qwen hook tests                    -> mixed V1 prompt/observability fixtures
+	@#   qoder skill hook tests                  -> V1 caller-local audit storage/schema
 	@#   daemon/test_daemon_e2e.py                -> V1 daemon wire protocol
-	@#   prompt-scanner/test_prompt_scanner_e2e.py -> prompt scanning
-	@#   skill-ledger, skill-signing              -> skill ledger and signing
+	@#   skill-ledger, skill-signing              -> retired V1 per-user keys and Agent hooks
+	@# Rust core lifecycle: tests/v2/e2e/test_skillsec_cli_e2e.py.
+	@# Observability ingestion and queries: tests/v2/e2e/test_observability_*_e2e.py.
+	@# V1 event/report tests use isolated V2 daemons from tests/conftest.py.
+	@# V1 record file-absence assertions differ from V2 daemon storage initialization;
+	@# their V2 contracts are covered by test_observability_record_e2e.py.
+	@# Installed SkillSec adapters: tests/v2/e2e/test_skillsec_hook_contracts.py.
 	@#   linux-sandbox                            -> privileged container (same as V1)
 
-VENV_PYTHON ?= $(HOME)/.local/lib/anolisa/sec-core/venv/bin/python
+.PHONY: test-e2e-source-build-v2
+test-e2e-source-build-v2: ## Run V2 E2E tests against source-build-installed binaries
+	@echo "🧪 Running V2 E2E tests on source build..."
+	@command -v agent-sec-cli >/dev/null 2>&1 || { echo "ERROR: agent-sec-cli not found on PATH"; exit 1; }
+	@command -v agent-sec-daemon >/dev/null 2>&1 || { echo "ERROR: agent-sec-daemon not found on PATH"; exit 1; }
+	$(MAKE) test-e2e-rpm-v2
 
 .PHONY: test-e2e-source-build
-test-e2e-source-build: ## Run E2E tests against source-build-installed agent-sec-cli
-	@echo "🧪 Running E2E tests on source build..."
-	@command -v agent-sec-cli >/dev/null 2>&1 || { echo "ERROR: agent-sec-cli not found on PATH"; exit 1; }
-	@$(VENV_PYTHON) -m pytest --version >/dev/null 2>&1 || uv pip install --python $(VENV_PYTHON) --quiet pytest
-	$(VENV_PYTHON) -m pytest tests/e2e/ \
-		--import-mode=importlib \
-		--ignore=tests/e2e/linux-sandbox \
-		-k 'not test_error_event_writes_to_sqlite' \
-		-v --tb=short
-	@# linux-sandbox e2e skipped: requires privileged container
+test-e2e-source-build: test-e2e-source-build-v2 ## Run V2 E2E tests against source-build-installed binaries
 
 .PHONY: test-python-coverage
 test-python-coverage: ## Run Python tests with coverage report
@@ -166,14 +162,19 @@ test-python-coverage: ## Run Python tests with coverage report
 test-rust: ## Run Rust tests (agent-sec-cli + V2; linux-sandbox on Linux only)
 	@echo "🧪 Running agent-sec-cli workspace Rust tests..."
 	cd agent-sec-cli && { $(PYO3_PIN); cargo test --workspace; }
-	@echo "🧪 Running AgentSecCore V2 workspace Rust tests..."
-	cd v2 && cargo test --workspace --locked
+	@$(MAKE) test-rust-v2
 	@echo "🧪 Running linux-sandbox Rust tests (Linux only)..."
 	@if [ "$$(uname -s)" = "Linux" ]; then \
 		cd linux-sandbox && cargo test -- --skip bwrap_seccomp; \
 	else \
 		echo "  (linux-sandbox tests skipped: requires Linux)"; \
 	fi
+
+.PHONY: test-rust-v2
+test-rust-v2: ## Run V2 Rust tests and verify daemon server identity separately
+	@echo "🧪 Running AgentSecCore V2 workspace Rust tests..."
+	cd v2 && AGENT_SEC_TEST_SKIP_SERVER_UID_CHECK=1 cargo test --workspace --locked --features asc-daemon-client/testing -- --skip untrusted_server_is_rejected_before_request_bytes_are_sent
+	cd v2 && cargo test --locked -p asc-daemon-client --test transport untrusted_server_is_rejected_before_request_bytes_are_sent -- --exact
 
 # One report per workspace: cargo-llvm-cov cannot merge across workspaces, and
 # CI unions them via diff-cover.  `-p` skips the untested PyO3 cdylib root.
@@ -216,6 +217,18 @@ test: test-python test-rust test-openclaw-plugin ## Run all tests
 BUILD_DIR ?= target
 CLI_WHEEL_BUILD_DIR ?= agent-sec-cli/target/wheels
 CLI_WHEEL_PATTERN := agent_sec_cli-*.whl
+COMPONENT_CONTRACT ?= .anolisa/component.toml
+
+# The normal targets retain their network-enabled developer workflow. RPM builds
+# select OFFLINE_BUILD through build-all-v2-offline after Source1 supplies every
+# Cargo crate and npm package cache entry.
+OFFLINE_BUILD ?= 0
+CARGO_OFFLINE_FLAGS = $(if $(filter 1,$(OFFLINE_BUILD)),--offline,)
+CARGO_BUILD_ENV = $(if $(filter 1,$(OFFLINE_BUILD)),CARGO_HOME="$(abspath $(BUILD_DIR)/cargo-home)",)
+NPM_INSTALL = $(if $(filter 1,$(OFFLINE_BUILD)),npm ci --offline --include=dev --omit=optional --ignore-scripts --cache .npm-cache --no-audit --no-fund,npm install --include=dev)
+RAW_RUST_BUILDER ?= cargo
+RAW_RUST_TARGET ?=
+RAW_RUST_RELEASE_SUBDIR = $(if $(RAW_RUST_TARGET),$(RAW_RUST_TARGET)/,)release
 
 # Component targets shared by the V1 and V2 aggregates. Only the CLI/daemon
 # build differs between them, so one list prevents the two aggregates from
@@ -234,6 +247,7 @@ RPM_INSTALL_COMMON_TARGETS := install-cosh-hook install-codex-plugin install-qod
 # V2 Rust binaries are collected here by build-cli-v2 and consumed by
 # install-cli-v2, mirroring the build/install split used for linux-sandbox.
 V2_BIN_BUILD_DIR ?= $(BUILD_DIR)/v2/bin
+V2_CARGO_TARGET_DIR ?= $(abspath v2/target)
 
 define require_single_cli_wheel
 set -- "$(1)"/$(CLI_WHEEL_PATTERN); \
@@ -245,9 +259,9 @@ endef
 
 .PHONY: build-sandbox
 build-sandbox: ## Build linux-sandbox binary
-	cd linux-sandbox && cargo build --release
+	cd linux-sandbox && $(CARGO_BUILD_ENV) $(RAW_RUST_BUILDER) build --release --locked $(CARGO_OFFLINE_FLAGS)
 	install -d -m 0755 $(BUILD_DIR)
-	cp -p linux-sandbox/target/release/linux-sandbox $(BUILD_DIR)/
+	cp -p linux-sandbox/target/$(RAW_RUST_RELEASE_SUBDIR)/linux-sandbox $(BUILD_DIR)/
 
 .PHONY: build-cli
 build-cli: ## Build agent-sec-cli wheel with maturin (Rust + Python)
@@ -261,9 +275,11 @@ build-cli: ## Build agent-sec-cli wheel with maturin (Rust + Python)
 
 .PHONY: build-cli-v2
 build-cli-v2: ## Build V2 Rust CLI and daemon binaries
-	cd v2 && cargo build --release --locked --workspace
+	cd v2 && $(CARGO_BUILD_ENV) CARGO_TARGET_DIR="$(abspath $(V2_CARGO_TARGET_DIR))" $(RAW_RUST_BUILDER) build --release --locked $(CARGO_OFFLINE_FLAGS) --workspace
 	install -d -m 0755 $(V2_BIN_BUILD_DIR)
-	cp -p v2/target/release/agent-sec-cli v2/target/release/agent-sec-daemon \
+	cp -p "$(abspath $(V2_CARGO_TARGET_DIR))/$(RAW_RUST_RELEASE_SUBDIR)/agent-sec-cli" \
+		"$(abspath $(V2_CARGO_TARGET_DIR))/$(RAW_RUST_RELEASE_SUBDIR)/agent-sec-daemon" \
+		"$(abspath $(V2_CARGO_TARGET_DIR))/$(RAW_RUST_RELEASE_SUBDIR)/agent-sec-daemon-health" \
 		$(V2_BIN_BUILD_DIR)/
 
 .PHONY: setup
@@ -272,7 +288,7 @@ setup: ## Install all dependencies (including dev), create .venv
 
 .PHONY: build-openclaw-plugin
 build-openclaw-plugin: ## Build openclaw-plugin TypeScript sources
-	cd openclaw-plugin && NODE_ENV=development npm install --include=dev && npm run build
+	cd openclaw-plugin && NODE_ENV=development $(NPM_INSTALL) && npm run build
 	install -d -m 0755 $(BUILD_DIR)/openclaw-plugin/dist
 	install -d -m 0755 $(BUILD_DIR)/openclaw-plugin/scripts
 	cp openclaw-plugin/openclaw.plugin.json $(BUILD_DIR)/openclaw-plugin/
@@ -320,18 +336,31 @@ stage-tools: ## Stage tools (sign-skill.sh) to BUILD_DIR
 	cp -p tools/sign-skill.sh $(BUILD_DIR)/tools/
 
 .PHONY: stage-component-manifest
-stage-component-manifest: ## Stage component.toml into BUILD_DIR
+stage-component-manifest: ## Stage the selected component contract into BUILD_DIR
 	install -d -m 0755 $(BUILD_DIR)/share/anolisa/components/sec-core
-	install -p -m 0644 .anolisa/component.toml \
+	install -p -m 0644 $(COMPONENT_CONTRACT) \
 		$(BUILD_DIR)/share/anolisa/components/sec-core/component.toml
 
+# The default build target matches the default install target: both provide
+# the V2 Rust CLI/daemon. V1 RPM builds select build-all-v1 explicitly.
 .PHONY: build-all
-build-all: $(call component_build_targets,build-cli) ## Build all components
+build-all: build-all-v2 ## Build all components with the V2 Rust CLI/daemon
+
+.PHONY: build-all-v1
+build-all-v1: $(call component_build_targets,build-cli) ## Build all components with the V1 Python CLI
 	@echo "📦 All artifacts collected to $(BUILD_DIR)/"
 
 .PHONY: build-all-v2
 build-all-v2: $(call component_build_targets,build-cli-v2) ## Build all components with the V2 Rust CLI/daemon
 	@echo "📦 All artifacts collected to $(BUILD_DIR)/"
+
+.PHONY: build-all-v2-offline
+build-all-v2-offline: OFFLINE_BUILD := 1
+build-all-v2-offline: $(call component_build_targets,build-cli-v2) ## Build V2 components from vendored dependencies only
+	@echo "📦 Offline V2 artifacts collected to $(BUILD_DIR)/"
+
+.PHONY: build-all-source-v2
+build-all-source-v2: build-all-v2 ## Build the V2 artifacts for source installation
 
 .PHONY: export-requirements
 export-requirements: ## Re-export agent-sec-cli/requirements.txt from uv.lock
@@ -362,37 +391,16 @@ OUTPUT_DIR ?= $(BUILD_DIR)/raw
 TARGET_OS ?= linux
 TARGET_ARCH ?= $(shell uname -m)
 RAW_CONTRACT ?= .anolisa/component.toml
-RAW_PYTHON_VERSION := 3.11.6
-RAW_PYTHON_ENV ?= $(BUILD_DIR)/raw-python-env
 RAW_PYTHON_RUNTIME ?= $(BUILD_DIR)/python-runtime
 RAW_PYTHON_ARCHIVE ?= $(BUILD_DIR)/downloads/cpython-3.11.6+20231002-x86_64-unknown-linux-gnu-install_only.tar.gz
 
 .PHONY: prepare-raw-python
-prepare-raw-python: build-all ## Stage pinned Python and locked production dependencies for raw packaging
-	rm -rf $(CLI_STAGED_SITE) $(RAW_PYTHON_ENV)
+prepare-raw-python: build-all-v2 ## Stage the adapter-only bundled Python runtime
 	./packaging/raw/prepare_python_runtime.sh \
 		"$(abspath $(RAW_PYTHON_RUNTIME))" "$(abspath $(RAW_PYTHON_ARCHIVE))"
-	cd agent-sec-cli && UV_PROJECT_ENVIRONMENT="$(abspath $(RAW_PYTHON_ENV))" \
-		uv sync --python "$(abspath $(RAW_PYTHON_RUNTIME))/bin/python3.11" \
-			--no-managed-python --frozen --no-dev --no-install-project --link-mode copy
-	@set -eu; \
-		python="$(abspath $(RAW_PYTHON_ENV))/bin/python3.11"; \
-		version="$$("$$python" -c 'import platform; print(platform.python_version())')"; \
-		[ "$$version" = "$(RAW_PYTHON_VERSION)" ] || { \
-			echo "ERROR: raw package requires Python $(RAW_PYTHON_VERSION), found $$version" >&2; \
-			exit 1; \
-		}
-	install -d -m 0755 $(CLI_STAGED_SITE)
-	cp -a $(RAW_PYTHON_ENV)/lib/python3.11/site-packages/. $(CLI_STAGED_SITE)/
-	@$(call require_single_cli_wheel,$(BUILD_DIR)/wheels) \
-		uv pip install --python $(RAW_PYTHON_ENV)/bin/python3.11 \
-			--target $(CLI_STAGED_SITE) --no-deps --no-cache --link-mode copy "$$1"
-	rm -rf $(CLI_STAGED_SITE)/bin
-	rm -f $(CLI_STAGED_SITE)/.lock
-	rm -rf $(RAW_PYTHON_ENV)
 
 .PHONY: stage-raw
-stage-raw: ## Stage built raw payload under DESTDIR (build outputs must already exist)
+stage-raw: ## Stage the V2 raw payload under DESTDIR
 	@BUILD_DIR="$(abspath $(BUILD_DIR))" \
 		DESTDIR="$(DESTDIR)" \
 		RAW_CONTRACT="$(abspath $(RAW_CONTRACT))" \
@@ -401,7 +409,7 @@ stage-raw: ## Stage built raw payload under DESTDIR (build outputs must already 
 		./packaging/raw/package.sh stage
 
 .PHONY: package-raw
-package-raw: prepare-raw-python ## Build deterministic raw tar archive in OUTPUT_DIR
+package-raw: prepare-raw-python ## Build the deterministic V2 raw archive
 	@BUILD_DIR="$(abspath $(BUILD_DIR))" \
 		OUTPUT_DIR="$(abspath $(OUTPUT_DIR))" \
 		RAW_CONTRACT="$(abspath $(RAW_CONTRACT))" \
@@ -409,6 +417,10 @@ package-raw: prepare-raw-python ## Build deterministic raw tar archive in OUTPUT
 		TARGET_ARCH="$(TARGET_ARCH)" \
 		SOURCE_DATE_EPOCH="$(SOURCE_DATE_EPOCH)" \
 		./packaging/raw/package.sh package
+
+.PHONY: test-package-raw
+test-package-raw: ## Verify the V2 raw package contract with fixtures
+	./tests/packaging/test-package-raw.sh
 
 # =============================================================================
 # INSTALL
@@ -460,6 +472,7 @@ SYSTEMD_SERVICE_BINDIR ?= /usr/bin
 SYSTEMD_SERVICE_DATADIR ?= /usr/share/anolisa
 SYSTEMD_SYSTEM_UNIT_DIR ?= /usr/lib/systemd/system
 SYSTEMD_SYSTEM_UNIT_TEMPLATE ?= packaging/systemd/agent-sec-core-v2.service.in
+SOURCE_SYSTEMD_SYSTEM_UNIT_DIR ?= /etc/systemd/system
 
 .PHONY: install-sandbox
 install-sandbox: ## Install linux-sandbox binary only
@@ -472,7 +485,8 @@ install-tool: ## Install sign-skill.sh to LIBEXECDIR
 	install -p -m 0755 $(BUILD_DIR)/tools/sign-skill.sh $(DESTDIR)$(LIBEXECDIR)/
 
 .PHONY: install
-install: install-all ## Install all components (alias for install-all)
+install: INSTALL_PROFILE := system
+install: install-all-source-v2 ## Install all V2 source-build artifacts
 
 .PHONY: install-cli
 install-cli: ## Install agent-sec-cli wheel (for dev/debug)
@@ -499,6 +513,18 @@ install-cli-v2: ## RPM: Install V2 Rust CLI and daemon binaries
 		$(DESTDIR)/usr/bin/agent-sec-cli
 	install -p -m 0755 $(V2_BIN_BUILD_DIR)/agent-sec-daemon \
 		$(DESTDIR)/usr/bin/agent-sec-daemon
+	install -p -m 0755 $(V2_BIN_BUILD_DIR)/agent-sec-daemon-health \
+		$(DESTDIR)/usr/bin/agent-sec-daemon-health
+
+.PHONY: install-cli-v2-source
+install-cli-v2-source: ## Install V2 Rust CLI and daemon binaries to BINDIR
+	install -d -m 0755 $(DESTDIR)$(BINDIR)
+	install -p -m 0755 $(V2_BIN_BUILD_DIR)/agent-sec-cli \
+		$(DESTDIR)$(BINDIR)/agent-sec-cli
+	install -p -m 0755 $(V2_BIN_BUILD_DIR)/agent-sec-daemon \
+		$(DESTDIR)$(BINDIR)/agent-sec-daemon
+	install -p -m 0755 $(V2_BIN_BUILD_DIR)/agent-sec-daemon-health \
+		$(DESTDIR)$(BINDIR)/agent-sec-daemon-health
 
 .PHONY: install-cli-venv
 install-cli-venv: ## Create venv, install deps from uv.lock, install wheel, symlink
@@ -575,9 +601,9 @@ install-cosh-hook: ## Install cosh hooks (linux-sandbox + extension)
 	cp -rp $(BUILD_DIR)/cosh-extension/. $(DESTDIR)$(EXTENSIONDIR)/
 
 .PHONY: install-component-manifest
-install-component-manifest: ## Install component.toml to DESTDIR
+install-component-manifest: ## Install the selected component contract to DESTDIR
 	install -d -m 0755 $(DESTDIR)$(COMPONENT_DIR)
-	install -m 0644 .anolisa/component.toml \
+	install -m 0644 $(COMPONENT_CONTRACT) \
 		$(DESTDIR)$(COMPONENT_DIR)/component.toml
 
 .PHONY: install-systemd-user
@@ -590,8 +616,52 @@ install-systemd-user: ## Install agent-sec-core systemd user service
 		> $(DESTDIR)$(SYSTEMD_USER_UNIT_DIR)/agent-sec-core.service
 	chmod 0644 $(DESTDIR)$(SYSTEMD_USER_UNIT_DIR)/agent-sec-core.service
 
+.PHONY: install-core-v2
+install-core-v2: install-cli-v2 install-systemd-system ## Install V2 core binaries and system unit; start explicitly
+
 .PHONY: install-all
 install-all: install-cli-venv install-cosh-hook install-codex-plugin install-qoder-plugin install-openclaw-plugin install-hermes-plugin install-qwen-code-extension install-skills ## Install all (user source build)
+
+.PHONY: require-source-v2-artifacts
+require-source-v2-artifacts: ## Fail unless every V2 source-install artifact has been built
+	@for artifact in \
+		"$(V2_BIN_BUILD_DIR)/agent-sec-cli" \
+		"$(V2_BIN_BUILD_DIR)/agent-sec-daemon" \
+		"$(V2_BIN_BUILD_DIR)/agent-sec-daemon-health" \
+		"$(BUILD_DIR)/linux-sandbox"; do \
+		if [ ! -f "$$artifact" ]; then \
+			echo "ERROR: refusing to remove the V1 source runtime; missing V2 artifact: $$artifact" >&2; \
+			echo "Run 'make build-all' first." >&2; \
+			exit 1; \
+		fi; \
+	done
+
+.PHONY: remove-legacy-source-v1-runtime
+remove-legacy-source-v1-runtime: require-source-v2-artifacts ## Remove the V1 source-build CLI links, venv, and user sandbox
+	@for name in agent-sec-cli agent-sec-daemon; do \
+		path="$(DESTDIR)$(BINDIR)/$$name"; \
+		if [ -L "$$path" ] && [ "$$(readlink "$$path")" = "$(VENV_DIR)/bin/$$name" ]; then \
+			rm -f "$$path"; \
+		fi; \
+	done
+	rm -f $(DESTDIR)$(BINDIR)/linux-sandbox
+	rm -rf $(DESTDIR)$(VENV_DIR)
+
+.PHONY: install-source-v2-host
+install-source-v2-host: ## Install V2 host runtime for source builds
+	@$(MAKE) remove-legacy-source-v1-runtime
+	@$(MAKE) install-cli-v2-source install-sandbox install-systemd-system-source
+
+.PHONY: install-source-v2-cosh-extension
+install-source-v2-cosh-extension: ## Install the cosh extension for a V2 source build
+	install -d -m 0755 $(DESTDIR)$(EXTENSIONDIR)
+	cp -rp $(BUILD_DIR)/cosh-extension/. $(DESTDIR)$(EXTENSIONDIR)/
+
+.PHONY: install-source-v2-assets
+install-source-v2-assets: install-source-v2-cosh-extension install-codex-plugin install-qoder-plugin install-openclaw-plugin install-hermes-plugin install-qwen-code-extension install-skills ## Install source-build integration assets
+
+.PHONY: install-all-source-v2
+install-all-source-v2: install-source-v2-host install-source-v2-assets ## Install all V2 source-build artifacts
 
 .PHONY: install-all-for-rpmbuild
 install-all-for-rpmbuild: OPENCLAW_PLUGIN_DIR := $(RPM_OPENCLAW_PLUGIN_DIR)
@@ -611,17 +681,30 @@ install-all-for-rpmbuild-v2: QODER_PLUGIN_DIR := $(RPM_QODER_PLUGIN_DIR)
 install-all-for-rpmbuild-v2: install-cli-v2 $(RPM_INSTALL_COMMON_TARGETS) install-systemd-system ## Install all (V2 RPM build)
 
 .PHONY: install-systemd-system
-install-systemd-system: ## Stage V2 system unit
+install-systemd-system: ## Stage V2 system unit and preserve existing settings
 	install -d -m 0755 $(DESTDIR)$(SYSTEMD_SYSTEM_UNIT_DIR)
 	sed -e 's|{bindir}|$(SYSTEMD_SERVICE_BINDIR)|g' $(SYSTEMD_SYSTEM_UNIT_TEMPLATE) \
 		> $(DESTDIR)$(SYSTEMD_SYSTEM_UNIT_DIR)/agent-sec-core.service
 	chmod 0644 $(DESTDIR)$(SYSTEMD_SYSTEM_UNIT_DIR)/agent-sec-core.service
+	install -d -m 0755 $(DESTDIR)/etc/agent-sec
+	@if [ ! -e "$(DESTDIR)/etc/agent-sec/skillsec.json" ] && \
+		[ ! -L "$(DESTDIR)/etc/agent-sec/skillsec.json" ]; then \
+		install -m 0600 packaging/systemd/skillsec.json \
+			"$(DESTDIR)/etc/agent-sec/skillsec.json"; \
+	fi
+
+.PHONY: install-systemd-system-source
+install-systemd-system-source: ## Install V2 system unit for source builds
+	install -d -m 0755 $(DESTDIR)$(SOURCE_SYSTEMD_SYSTEM_UNIT_DIR)
+	sed -e 's|{bindir}|$(BINDIR)|g' $(SYSTEMD_SYSTEM_UNIT_TEMPLATE) \
+		> $(DESTDIR)$(SOURCE_SYSTEMD_SYSTEM_UNIT_DIR)/agent-sec-core.service
+	chmod 0644 $(DESTDIR)$(SOURCE_SYSTEMD_SYSTEM_UNIT_DIR)/agent-sec-core.service
 
 # =============================================================================
 # UNINSTALL
 # =============================================================================
-# Mirrors install-all (source build). RPM uninstall is handled by the package
-# manager via the .spec %files manifests, not by `make uninstall`.
+# Mirrors install-all-source-v2 (source build). RPM uninstall is handled by the
+# package manager via the .spec %files manifests, not by `make uninstall`.
 
 .PHONY: uninstall-cli-venv
 uninstall-cli-venv: ## Remove venv and agent-sec-cli symlink
@@ -676,7 +759,35 @@ uninstall-component-manifest: ## Remove component manifest
 	rm -rf $(DESTDIR)$(COMPONENT_DIR)
 
 .PHONY: uninstall
-uninstall: uninstall-cli-venv uninstall-cosh-hook uninstall-codex-plugin uninstall-qoder-plugin uninstall-openclaw-plugin uninstall-hermes-plugin uninstall-qwen-code-extension uninstall-skills ## Uninstall everything install-all installed
+uninstall: INSTALL_PROFILE := system
+uninstall: uninstall-all-source-v2 ## Uninstall all V2 source-build artifacts
+
+.PHONY: uninstall-source-v2-host
+uninstall-source-v2-host: uninstall-cli-v2-source uninstall-source-v2-sandbox uninstall-systemd-system-source ## Remove V2 source-build host runtime
+
+.PHONY: uninstall-source-v2-sandbox
+uninstall-source-v2-sandbox: ## Remove the V2 source-build sandbox binary
+	rm -f $(DESTDIR)$(BINDIR)/linux-sandbox
+
+.PHONY: uninstall-cli-v2-source
+uninstall-cli-v2-source: ## Remove V2 source-build CLI and daemon binaries
+	rm -f $(DESTDIR)$(BINDIR)/agent-sec-cli
+	rm -f $(DESTDIR)$(BINDIR)/agent-sec-daemon
+	rm -f $(DESTDIR)$(BINDIR)/agent-sec-daemon-health
+
+.PHONY: uninstall-systemd-system-source
+uninstall-systemd-system-source: ## Remove V2 source-build system unit
+	rm -f $(DESTDIR)$(SOURCE_SYSTEMD_SYSTEM_UNIT_DIR)/agent-sec-core.service
+
+.PHONY: uninstall-source-v2-cosh-extension
+uninstall-source-v2-cosh-extension: ## Remove the V2 source-build cosh extension
+	rm -rf $(DESTDIR)$(EXTENSIONDIR)
+
+.PHONY: uninstall-source-v2-assets
+uninstall-source-v2-assets: uninstall-source-v2-cosh-extension uninstall-codex-plugin uninstall-qoder-plugin uninstall-openclaw-plugin uninstall-hermes-plugin uninstall-qwen-code-extension uninstall-skills ## Remove source-build integration assets
+
+.PHONY: uninstall-all-source-v2
+uninstall-all-source-v2: uninstall-source-v2-host uninstall-source-v2-assets ## Remove all V2 source-build artifacts
 
 .PHONY: help
 help: ## Show this help message

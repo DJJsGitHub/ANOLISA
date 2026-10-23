@@ -23,14 +23,13 @@ fn bin_path() -> &'static str {
 
 /// True when `path` is a live mountpoint per `/proc/mounts`. Authoritative
 /// even for a dead FUSE endpoint (where `metadata()` would misbehave).
+/// Delegates to the production byte-exact, escape-decoding matcher.
 fn is_mounted(path: &Path) -> bool {
-    let Ok(mounts) = std::fs::read_to_string("/proc/mounts") else {
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(mounts) = std::fs::read("/proc/mounts") else {
         return false;
     };
-    let target = path.to_string_lossy();
-    mounts
-        .lines()
-        .any(|line| line.split_whitespace().nth(1) == Some(&*target))
+    skillfs_fuse::proc_mounts::mounts_contain_target(&mounts, path.as_os_str().as_bytes())
 }
 
 /// Bounded, best-effort force unmount: `fusermount3 -u`, then lazy `-z`, then
@@ -147,6 +146,54 @@ fn fuse_available() -> bool {
             .output()
             .map(|o| o.status.success())
             .unwrap_or(false)
+}
+
+/// The instance id the previous binary derived for a normalized
+/// mountpoint — the sanitization of `instance_id_for` before the
+/// leading-dash fix (map every non-`[a-zA-Z0-9_-]` to `-`, then take 24,
+/// no stripping). Valid ids from that formula — anything not starting
+/// with a dash — are the live upgrade surface: an old supervisor may be
+/// holding exactly these state/pid file names when the binary is
+/// upgraded, so the new derivation must keep them byte-identical.
+fn legacy_instance_id(normalized: &Path) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    normalized.as_os_str().hash(&mut hasher);
+    let hash = hasher.finish();
+    let base: String = normalized
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "root".to_string())
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .take(24)
+        .collect();
+    let base = if base.is_empty() {
+        "root".to_string()
+    } else {
+        base
+    };
+    format!("{base}-{hash:016x}")
+}
+
+/// Comma-separated file names under a runtime dir, for assertion
+/// messages: shows exactly which instance ids the CLI materialized.
+fn list_runtime_files(dir: &Path) -> String {
+    match std::fs::read_dir(dir) {
+        Ok(entries) => entries
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join(", "),
+        Err(_) => "<unreadable>".to_string(),
+    }
 }
 
 /// Path of the running test binary — used as the trusted peer so the
@@ -308,6 +355,236 @@ fn activation_mode_file_with_events_log_fails_startup() {
     assert!(
         combined.contains("not supported with --activation-mode file"),
         "expected events-log-not-supported error, got: {combined}"
+    );
+}
+
+#[test]
+fn events_log_inside_source_fails_startup() {
+    // Sibling of the --audit-log / --activation-events-log gates: a security
+    // event log inside the source tree makes every write observable by the
+    // drift watcher and can overwrite a SKILL.md.
+    let source = empty_source();
+    let mount = tempfile::tempdir().expect("mount tempdir");
+    let inside = source.path().join("events.jsonl");
+    let mut child = Command::new(bin_path())
+        .args([
+            "mount",
+            source.path().to_str().unwrap(),
+            mount.path().to_str().unwrap(),
+            "--security",
+            "--decision-command",
+            "/bin/true",
+            "--events-log",
+            inside.to_str().unwrap(),
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn skillfs");
+
+    // The gate rejects during validation, before the FUSE session starts, so
+    // the child must exit promptly. If it is still alive the guard did not
+    // fire (a regression would leave a live mount behind): tear it down and
+    // fail.
+    let mut status = None;
+    for _ in 0..50 {
+        match child.try_wait() {
+            Ok(Some(s)) => {
+                status = Some(s);
+                break;
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(100)),
+            Err(e) => panic!("wait for skillfs: {e}"),
+        }
+    }
+    let status = match status {
+        Some(s) => s,
+        None => {
+            stop_mount_child(&mut child, mount.path());
+            panic!("mount with an in-source --events-log must not start");
+        }
+    };
+    assert!(
+        !status.success(),
+        "expected non-zero exit for an in-source log"
+    );
+
+    use std::io::Read;
+    let mut stdout = String::new();
+    let mut stderr = String::new();
+    if let Some(mut out) = child.stdout.take() {
+        let _ = out.read_to_string(&mut stdout);
+    }
+    if let Some(mut err) = child.stderr.take() {
+        let _ = err.read_to_string(&mut stderr);
+    }
+    let combined = format!("{stdout}{stderr}");
+    assert!(
+        combined.contains("lies inside the SkillFS source root"),
+        "expected the events-log source-tree rejection, got: {combined}"
+    );
+    assert!(
+        !inside.exists(),
+        "rejected startup must not create the log file"
+    );
+}
+
+#[test]
+fn events_log_dangling_symlink_into_source_fails_startup() {
+    // Sibling of `events_log_inside_source_fails_startup`: an EXTERNAL
+    // symlink whose target does not exist yet must not be validated by its
+    // own (external) location. The later open(O_CREAT) would follow the
+    // link and create the log inside the source tree, so
+    // resolve_events_path follows the dangling link and the inside-source
+    // guard must abort startup before any file is created.
+    let source = empty_source();
+    let mount = tempfile::tempdir().expect("mount tempdir");
+    let link_parent = tempfile::tempdir().expect("link parent tempdir");
+    let link = link_parent.path().join("events-dangling.jsonl");
+    let planted = source.path().join("planted-events.jsonl");
+    std::os::unix::fs::symlink(&planted, &link).expect("create dangling symlink");
+    let mut child = Command::new(bin_path())
+        .args([
+            "mount",
+            source.path().to_str().unwrap(),
+            mount.path().to_str().unwrap(),
+            "--security",
+            "--decision-command",
+            "/bin/true",
+            "--events-log",
+            link.to_str().unwrap(),
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn skillfs");
+
+    // The gate rejects during validation, before the FUSE session starts, so
+    // the child must exit promptly. If it is still alive the guard did not
+    // fire (a regression would leave a live mount behind): tear it down and
+    // fail.
+    let mut status = None;
+    for _ in 0..50 {
+        match child.try_wait() {
+            Ok(Some(s)) => {
+                status = Some(s);
+                break;
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(100)),
+            Err(e) => panic!("wait for skillfs: {e}"),
+        }
+    }
+    let status = match status {
+        Some(s) => s,
+        None => {
+            stop_mount_child(&mut child, mount.path());
+            panic!("mount with a symlinked in-source --events-log must not start");
+        }
+    };
+    assert!(
+        !status.success(),
+        "expected non-zero exit for a dangling symlink into the source"
+    );
+
+    use std::io::Read;
+    let mut stdout = String::new();
+    let mut stderr = String::new();
+    if let Some(mut out) = child.stdout.take() {
+        let _ = out.read_to_string(&mut stdout);
+    }
+    if let Some(mut err) = child.stderr.take() {
+        let _ = err.read_to_string(&mut stderr);
+    }
+    let combined = format!("{stdout}{stderr}");
+    assert!(
+        combined.contains("lies inside the SkillFS source root"),
+        "expected the events-log source-tree rejection for the link target, got: {combined}"
+    );
+    assert!(
+        !planted.exists(),
+        "rejected startup must not create the link's target file"
+    );
+}
+
+#[test]
+fn events_log_hard_link_into_source_fails_startup() {
+    // Hard links are the alias the containment guard cannot see: the external
+    // name canonicalizes outside the source root, yet it is the same inode as
+    // the file inside it, so an append through the external name rewrites the
+    // source file. The writer must refuse the shared inode and abort startup.
+    let source = empty_source();
+    let manifest = source.path().join("SKILL.md");
+    std::fs::write(&manifest, "# trusted manifest\n").expect("write the source file");
+    let mount = tempfile::tempdir().expect("mount tempdir");
+    let link_parent = tempfile::tempdir().expect("link parent tempdir");
+    let link = link_parent.path().join("events.jsonl");
+    std::fs::hard_link(&manifest, &link).expect("create the external hard link");
+
+    let mut child = Command::new(bin_path())
+        .args([
+            "mount",
+            source.path().to_str().unwrap(),
+            mount.path().to_str().unwrap(),
+            "--security",
+            "--decision-command",
+            "/bin/true",
+            "--events-log",
+            link.to_str().unwrap(),
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn skillfs");
+
+    // The gate rejects while the writer is opened, before the FUSE session
+    // starts, so the child must exit promptly. If it is still alive the guard
+    // did not fire (a regression would leave a live mount behind): tear it
+    // down and fail.
+    let mut status = None;
+    for _ in 0..50 {
+        match child.try_wait() {
+            Ok(Some(s)) => {
+                status = Some(s);
+                break;
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(100)),
+            Err(e) => panic!("wait for skillfs: {e}"),
+        }
+    }
+    let status = match status {
+        Some(s) => s,
+        None => {
+            stop_mount_child(&mut child, mount.path());
+            panic!("mount with a hard-linked in-source --events-log must not start");
+        }
+    };
+    assert!(
+        !status.success(),
+        "expected non-zero exit for a hard link into the source"
+    );
+
+    use std::io::Read;
+    let mut stdout = String::new();
+    let mut stderr = String::new();
+    if let Some(mut out) = child.stdout.take() {
+        let _ = out.read_to_string(&mut stdout);
+    }
+    if let Some(mut err) = child.stderr.take() {
+        let _ = err.read_to_string(&mut stderr);
+    }
+    let combined = format!("{stdout}{stderr}");
+    assert!(
+        combined.contains("hard links"),
+        "expected the hard-link refusal, got: {combined}"
+    );
+    assert!(
+        !is_mounted(mount.path()),
+        "the refusal must happen before the FUSE session starts"
+    );
+    assert_eq!(
+        std::fs::read(&manifest).expect("read the source file"),
+        b"# trusted manifest\n",
+        "a refused events log must not append to the source file it aliases"
     );
 }
 
@@ -818,6 +1095,22 @@ fn non_tmp_dir() -> tempfile::TempDir {
         .prefix("skillfs-nontmp-")
         .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
         .expect("non-tmp tempdir")
+}
+
+/// A non-tmp directory short enough to hold a bindable control socket.
+///
+/// `sun_path` caps a socket address at 108 bytes on Linux. `non_tmp_dir()`
+/// lives under `CARGO_TARGET_TMPDIR`, whose length follows the checkout path,
+/// so a checkout nested a few directories deep overruns the cap and the child
+/// exits with "path must be shorter than SUN_LEN". `/dev/shm` is outside the
+/// /tmp and /var/tmp roots the PrivateTmp gate rejects and keeps the socket
+/// address near 45 bytes wherever the repository is checked out. When
+/// `/dev/shm` is missing or not writable it falls back to `non_tmp_dir()`.
+fn non_tmp_socket_dir() -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .prefix("skillfs-nontmp-")
+        .tempdir_in("/dev/shm")
+        .unwrap_or_else(|_| non_tmp_dir())
 }
 
 /// A collision-resistant leaf name (pid + nanosecond timestamp) so tests
@@ -1389,6 +1682,188 @@ fn control_socket_under_tmp_fails_before_mount() {
 
 #[test]
 #[cfg(unix)]
+fn control_socket_relative_path_on_unsafe_cwd_fails_startup() {
+    // A relative --control-socket is served from the cwd: a multi-level
+    // relative path must validate the REAL ancestor chain — the cwd and
+    // everything above it — not just the literal relative components. With
+    // the child's cwd inside a world-writable directory the ancestor
+    // policy rejects the mount; the PrivateTmp gate passes because the cwd
+    // is outside /tmp and /var/tmp.
+    let source = non_tmp_dir();
+    let mount = non_tmp_dir();
+    let unsafe_cwd = non_tmp_dir();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(unsafe_cwd.path(), std::fs::Permissions::from_mode(0o0777))
+        .expect("open up the cwd");
+
+    let out = Command::new(bin_path())
+        .args([
+            "mount",
+            source.path().to_str().unwrap(),
+            mount.path().to_str().unwrap(),
+            "--security",
+            "--activation-mode",
+            "file",
+            "--control-socket",
+            "sub/deeper/control.sock",
+            "--trusted-peer-exe",
+            &test_exe(),
+        ])
+        .current_dir(unsafe_cwd.path())
+        .output()
+        .expect("invoke skillfs");
+    assert!(
+        !out.status.success(),
+        "expected non-zero exit for a multi-level relative socket on an unsafe cwd"
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    assert!(
+        combined.contains("group/other writable"),
+        "expected the ancestor-writability rejection, got: {combined}"
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn control_socket_bare_relative_name_tightens_unsafe_cwd() {
+    // A bare relative socket name (`control.sock`) has no parent component
+    // and lives directly in the cwd, which is therefore the socket parent.
+    // The old code returned Ok for an empty parent, silently skipping every
+    // check. Now the real location participates in the same policy as an
+    // absolute path: a world-writable cwd is either tightened to 0700
+    // (when the ancestor chain above it is acceptable) or the mount is
+    // rejected with the ancestor error. Binding with the cwd still
+    // world-writable is the one forbidden outcome.
+    let source = non_tmp_dir();
+    let mount = non_tmp_dir();
+    let unsafe_cwd = non_tmp_dir();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(unsafe_cwd.path(), std::fs::Permissions::from_mode(0o0777))
+        .expect("open up the cwd");
+
+    let mut child = Command::new(bin_path())
+        .args([
+            "mount",
+            source.path().to_str().unwrap(),
+            mount.path().to_str().unwrap(),
+            "--security",
+            "--activation-mode",
+            "file",
+            "--control-socket",
+            "control.sock",
+            "--trusted-peer-exe",
+            &test_exe(),
+        ])
+        .current_dir(unsafe_cwd.path())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("invoke skillfs");
+
+    // Give the child time to reach the socket setup: gate, tighten-or-
+    // reject, and (if tightened) the bind and FUSE session. Under the full
+    // suite's parallel load the child's own startup can take seconds, so
+    // wait generously before tearing it down; the security outcome is
+    // already decided by the time the mount starts.
+    for _ in 0..200 {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) => std::thread::sleep(Duration::from_millis(100)),
+            Err(e) => panic!("wait for skillfs: {e}"),
+        }
+    }
+    let mut stdout = String::new();
+    let mut stderr = String::new();
+    if child.try_wait().ok().flatten().is_none() {
+        stop_mount_child(&mut child, mount.path());
+    }
+    use std::io::Read;
+    if let Some(mut out) = child.stdout.take() {
+        let _ = out.read_to_string(&mut stdout);
+    }
+    if let Some(mut err) = child.stderr.take() {
+        let _ = err.read_to_string(&mut stderr);
+    }
+    let status = child.wait().expect("wait for skillfs child");
+    let combined = format!("{stdout}{stderr}\n[child status: {status}]");
+
+    let mode = std::fs::metadata(unsafe_cwd.path())
+        .expect("stat the child's cwd")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert!(
+        mode == 0o700 || combined.contains("socket ancestor"),
+        "an unsafe cwd must be tightened (mode 0700) or the bind rejected \
+         with the ancestor error, got mode {mode:o} and output: {combined}"
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn control_socket_parent_created_0700_under_permissive_umask() {
+    // Under umask 0000, create_dir_all builds the missing socket-parent
+    // levels as 0777 and the ancestor validation then rejects the path the
+    // mount itself just created. Every level must come out 0700 instead,
+    // so the mount survives the leakiest umask. The child process carries
+    // the umask (`sh -c 'umask 0000 && exec ...'`) because umask is
+    // process-global.
+    let source = non_tmp_dir();
+    let mount = non_tmp_dir();
+    let socket_root = non_tmp_dir();
+    let socket = socket_root.path().join("a").join("b").join("control.sock");
+
+    let mut child = Command::new("/bin/sh")
+        .arg("-c")
+        .arg(format!(
+            "umask 0000 && exec {} mount {} {} --security --activation-mode file \
+             --control-socket {} --trusted-peer-exe {}",
+            bin_path(),
+            source.path().display(),
+            mount.path().display(),
+            socket.display(),
+            test_exe(),
+        ))
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn skillfs under umask 0000");
+
+    // Give the child time to reach the socket setup. Whatever it does
+    // afterwards (a later gate, a successful mount that keeps running),
+    // the levels it created must already be private.
+    for _ in 0..50 {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) => std::thread::sleep(Duration::from_millis(100)),
+            Err(e) => panic!("wait for skillfs: {e}"),
+        }
+    }
+    if child.try_wait().ok().flatten().is_none() {
+        stop_mount_child(&mut child, mount.path());
+    }
+
+    use std::os::unix::fs::PermissionsExt;
+    for level in ["a", "a/b"] {
+        let path = socket_root.path().join(level);
+        let mode = std::fs::metadata(&path)
+            .unwrap_or_else(|e| panic!("level {level} must exist: {e}"))
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            mode, 0o700,
+            "level {level} must be created 0700 under umask 0000, got {mode:o}"
+        );
+    }
+}
+
+#[test]
+#[cfg(unix)]
 fn control_socket_symlink_to_tmp_fails_before_mount() {
     // A control socket whose parent directory symlinks to a real /tmp
     // directory canonicalizes to a PrivateTmp-invisible path and must be
@@ -1499,7 +1974,7 @@ fn control_plane_cli_socket_with_config_trusted_peer_passes_gate() {
     }
     let source = non_tmp_dir();
     let mount = tempfile::tempdir().expect("mount tempdir");
-    let sock_dir = non_tmp_dir();
+    let sock_dir = non_tmp_socket_dir();
     let sock_path = sock_dir.path().join("skillfs.sock");
     let config_dir = tempfile::tempdir().expect("config dir");
     let config_path = config_dir.path().join("security.toml");
@@ -1575,7 +2050,7 @@ fn control_plane_config_socket_with_cli_trusted_peer_passes_gate() {
     }
     let source = non_tmp_dir();
     let mount = tempfile::tempdir().expect("mount tempdir");
-    let sock_dir = non_tmp_dir();
+    let sock_dir = non_tmp_socket_dir();
     let sock_path = sock_dir.path().join("skillfs.sock");
     let config_dir = tempfile::tempdir().expect("config dir");
     let config_path = config_dir.path().join("security.toml");
@@ -1972,7 +2447,7 @@ fn trusted_peer_key_with_insecure_permissions_fails_startup() {
 
     let source = non_tmp_dir();
     let mount = tempfile::tempdir().expect("mount tempdir");
-    let socket_dir = non_tmp_dir();
+    let socket_dir = non_tmp_socket_dir();
     let socket_path = socket_dir.path().join("control.sock");
     let key_dir = non_tmp_dir();
     let key_path = key_dir.path().join("peer.key");
@@ -2079,7 +2554,7 @@ fn control_socket_trusted_peer_exe_nonexistent_fails() {
     // is the gate that fires — not the PrivateTmp gate on a /tmp fixture.
     let source = non_tmp_dir();
     let mount = tempfile::tempdir().expect("mount tempdir");
-    let sock_dir = non_tmp_dir();
+    let sock_dir = non_tmp_socket_dir();
     let sock_path = sock_dir.path().join("skillfs.sock");
     let out = Command::new(bin_path())
         .args([
@@ -2114,7 +2589,7 @@ fn control_socket_trusted_peer_exe_directory_fails() {
     // is the gate that fires — not the PrivateTmp gate on a /tmp fixture.
     let source = non_tmp_dir();
     let mount = tempfile::tempdir().expect("mount tempdir");
-    let sock_dir = non_tmp_dir();
+    let sock_dir = non_tmp_socket_dir();
     let sock_path = sock_dir.path().join("skillfs.sock");
     let dir = tempfile::tempdir().expect("directory for test");
     let out = Command::new(bin_path())
@@ -2239,6 +2714,410 @@ fn control_socket_with_decision_command_fails_startup() {
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[test]
+fn managed_mount_serves_a_dot_prefixed_mountpoint() {
+    // Every test harness's tempdir is dot-prefixed (`tempfile` uses a
+    // `.tmp*` prefix), and the derived instance id used to sanitize the
+    // leading dot into a leading dash — which the supervisor's `--instance`
+    // argument rejects as an option-looking value. The supervisor then
+    // died before writing its pid file, so the client's liveness check
+    // never fired either: it polled the full readiness budget and failed
+    // with "did not become ready" and an empty worker log tail, pointing
+    // every investigation at the wrong layer.
+    if !fuse_available() {
+        eprintln!("SKIP: FUSE unavailable; cannot bring up a managed mount");
+        return;
+    }
+    let source = empty_source();
+    let mount_parent = tempfile::tempdir().expect("mount parent tempdir");
+    let mount = mount_parent.path().join(".mnt");
+
+    let out = Command::new(bin_path())
+        .args([
+            "mount",
+            source.path().to_str().unwrap(),
+            mount.to_str().unwrap(),
+            "--managed",
+        ])
+        .output()
+        .expect("invoke skillfs");
+
+    // Stop the instance before asserting, so a failure does not leak a
+    // detached supervisor and a live FUSE mount into later tests.
+    let stop = Command::new(bin_path())
+        .args(["stop", mount.to_str().unwrap()])
+        .output()
+        .expect("invoke skillfs stop");
+
+    assert!(
+        out.status.success(),
+        "a dot-prefixed mountpoint must be servable, got: {}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    assert!(
+        combined.contains("managed mount ready"),
+        "expected the ready line, got: {combined}"
+    );
+    assert!(
+        stop.status.success(),
+        "stop must clean up the instance, got: {}{}",
+        String::from_utf8_lossy(&stop.stdout),
+        String::from_utf8_lossy(&stop.stderr),
+    );
+}
+
+#[test]
+fn managed_mount_survives_a_slow_environment_probe() {
+    // The managed worker pays the full mount startup cost before the FUSE
+    // session serves: the 24-command environment probe
+    // (`EnvironmentProfile::detect` spawns one `which` per whitelisted
+    // command) plus store discovery and the session start. On a host with
+    // slow process spawns (WSL, network home directories) that probe alone
+    // costs ~10 s, so a 10 s readiness budget tore down a worker that was
+    // still probing — `skillfs mount --managed` failed on hardware the
+    // blocking mode serves fine. The budget must cover that regime.
+    //
+    // Deterministic on any host: a `which` shim prepended to the PATH
+    // sleeps half a second per probe, so the worker's startup holds at
+    // least 24 x 0.5 s = 12 s of wall clock regardless of machine speed —
+    // comfortably past a 10 s budget, well inside a 30 s one.
+    //
+    // A non-dot mountpoint keeps this test about the budget alone: a
+    // dot-prefixed one would fail for the instance-id reason covered by
+    // `managed_mount_serves_a_dot_prefixed_mountpoint` instead.
+    if !fuse_available() {
+        eprintln!("SKIP: FUSE unavailable; cannot bring up a managed mount");
+        return;
+    }
+    let source = empty_source();
+    let mount_parent = tempfile::tempdir().expect("mount parent tempdir");
+    let mount = mount_parent.path().join("mnt");
+
+    // The shim answers "present" for every probe: claiming the whole
+    // whitelist is harmless for an empty source (nothing compiles against
+    // the profile), and skipping the delegation to the real `which` keeps
+    // the per-probe cost to one shell spawn plus the sleep, so the bounds
+    // hold on slow-spawn hosts (WSL) as well as fast CI runners.
+    let shim_dir = tempfile::tempdir().expect("shim tempdir");
+    let which = shim_dir.path().join("which");
+    std::fs::write(&which, "#!/bin/sh\nsleep 0.5\nexit 0\n").expect("write which shim");
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&which, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod which shim");
+    }
+
+    let path = std::env::var_os("PATH").expect("PATH");
+    let mut prefixed_path = std::ffi::OsString::from(shim_dir.path());
+    prefixed_path.push(":");
+    prefixed_path.push(&path);
+
+    let out = Command::new(bin_path())
+        .args([
+            "mount",
+            source.path().to_str().unwrap(),
+            mount.to_str().unwrap(),
+            "--managed",
+        ])
+        .env("PATH", &prefixed_path)
+        .output()
+        .expect("invoke skillfs");
+
+    // Stop the instance before asserting, so a failure does not leak a
+    // detached supervisor and a live FUSE mount into later tests.
+    let stop = Command::new(bin_path())
+        .args(["stop", mount.to_str().unwrap()])
+        .env("PATH", &prefixed_path)
+        .output()
+        .expect("invoke skillfs stop");
+
+    assert!(
+        out.status.success(),
+        "managed mount must survive a slow environment probe, got: {}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    assert!(
+        combined.contains("managed mount ready"),
+        "expected the ready line, got: {combined}"
+    );
+    assert!(
+        stop.status.success(),
+        "stop must clean up the instance, got: {}{}",
+        String::from_utf8_lossy(&stop.stdout),
+        String::from_utf8_lossy(&stop.stderr),
+    );
+}
+
+#[test]
+fn stop_terminates_a_legacy_underscore_instance() {
+    // Upgrade regression (review): instance ids that never started with a
+    // dash — a mount at `/mnt/_skills` used `_skills-<hash>` — were valid
+    // `--instance` values and runtime file-name prefixes, so a live
+    // supervisor can be sitting on those files when the binary is
+    // upgraded. If the new id derivation renamed the instance, `stop`
+    // would miss the incumbent's state/pid files, print "no managed
+    // mount ... (already stopped)", and leave the old supervisor running
+    // — free to remount after any later unmount. Seed the runtime dir
+    // exactly as the previous binary wrote it and prove the new `stop`
+    // resolves and terminates the incumbent. Needs no FUSE: the incumbent
+    // is a stand-in process and the mountpoint stays unmounted.
+    let source = empty_source();
+    let parent = tempfile::tempdir().expect("parent tempdir");
+    let mount = parent.path().join("_skills");
+    std::fs::create_dir(&mount).expect("create mountpoint");
+    let normalized = mount.canonicalize().expect("canonicalize mountpoint");
+
+    let runtime = tempfile::tempdir().expect("runtime tempdir");
+    let dir = runtime.path().join("skillfs");
+    std::fs::create_dir(&dir).expect("create runtime dir");
+    let legacy_id = legacy_instance_id(&normalized);
+    assert!(
+        legacy_id.starts_with("_skills-"),
+        "the seeded id must keep its underscore prefix, got: {legacy_id}"
+    );
+
+    // A stand-in "old supervisor": alive, holding the legacy pid file and
+    // state record exactly as the previous binary would have left them.
+    let mut incumbent = Command::new("sleep")
+        .arg("300")
+        .spawn()
+        .expect("spawn stand-in supervisor");
+    let incumbent_pid_num = incumbent.id();
+    std::fs::write(
+        dir.join(format!("{legacy_id}.supervisor.pid")),
+        format!("{}\n", incumbent.id()),
+    )
+    .expect("seed supervisor pid");
+    let source_norm = source.path().canonicalize().expect("canonicalize source");
+    let state = format!(
+        "{{\"schema_version\":1,\"instance_id\":\"{legacy_id}\",\
+         \"mountpoint\":\"{mp}\",\"source\":\"{src}\",\
+         \"worker_program\":\"skillfs\",\"worker_args\":[],\
+         \"desired_state\":\"mounted\"}}",
+        mp = normalized.display(),
+        src = source_norm.display(),
+    );
+    std::fs::write(dir.join(format!("{legacy_id}.state.json")), state).expect("seed managed state");
+
+    // Reap the stand-in the moment it exits (a helper thread): a zombie
+    // still answers kill(pid, 0), so the CLI's liveness wait would
+    // otherwise sit out its full stop timeout on an already-dead process.
+    let incumbent_exited = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let reaped = std::sync::Arc::clone(&incumbent_exited);
+    std::thread::spawn(move || {
+        for _ in 0..1200 {
+            match incumbent.try_wait() {
+                Ok(Some(_)) => {
+                    reaped.store(true, std::sync::atomic::Ordering::SeqCst);
+                    return;
+                }
+                Ok(None) => {}
+                Err(_) => return,
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    });
+
+    let out = Command::new(bin_path())
+        .args(["stop", mount.to_str().unwrap()])
+        .env("XDG_RUNTIME_DIR", runtime.path())
+        .output()
+        .expect("invoke skillfs stop");
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+
+    // Give the reaper a bounded window to observe the exit the CLI's stop
+    // signals caused, and capture that observation BEFORE any leak cleanup.
+    // The fallback below exists only so a failing run does not leak the
+    // stand-in; if it could run before the capture it would satisfy the
+    // very contract under test — a stop that reports success while the
+    // incumbent survives (reproduced by LD_PRELOADing a kill() shim that
+    // suppresses the CLI's SIGTERM/SIGKILL).
+    for _ in 0..100 {
+        if incumbent_exited.load(std::sync::atomic::Ordering::SeqCst) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let stop_terminated_incumbent = incumbent_exited.load(std::sync::atomic::Ordering::SeqCst);
+
+    // Leak cleanup only, strictly after the observation is captured: if
+    // the CLI's stop missed the stand-in, terminate it directly so a
+    // failing run leaks nothing; the reaper observes the exit.
+    if !stop_terminated_incumbent {
+        let _ = Command::new("sh")
+            .arg("-c")
+            .arg(format!("kill -TERM {incumbent_pid_num}"))
+            .output();
+        for _ in 0..100 {
+            if incumbent_exited.load(std::sync::atomic::Ordering::SeqCst) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    assert!(out.status.success(), "stop must succeed, got: {combined}");
+    assert!(
+        combined.contains("stopped managed mount"),
+        "stop must resolve the legacy state/pid files, got: {combined}"
+    );
+    assert!(
+        stop_terminated_incumbent,
+        "stop must terminate the incumbent supervisor, not just report success"
+    );
+    assert!(
+        !dir.join(format!("{legacy_id}.state.json")).exists(),
+        "stop must remove the legacy state file"
+    );
+    assert!(
+        !dir.join(format!("{legacy_id}.supervisor.pid")).exists(),
+        "stop must remove the legacy supervisor pid file"
+    );
+}
+
+#[test]
+fn managed_mount_reuses_a_legacy_underscore_instance() {
+    if !fuse_available() {
+        eprintln!("SKIP: FUSE unavailable; cannot bring up a managed mount");
+        return;
+    }
+    // Upgrade regression (review), live half: a real supervisor serving
+    // under the legacy `_skills-<hash>` id must stay the single owner of
+    // its mountpoint. The id derivation must keep the underscore prefix,
+    // so a repeated managed request resolves the incumbent's pid/state
+    // files ("already active") instead of unmounting it and racing a
+    // competing supervisor, and `stop` must tear the incumbent down.
+    let source = empty_source();
+    let parent = tempfile::tempdir().expect("mount parent tempdir");
+    let mount = parent.path().join("_skills");
+    let runtime = tempfile::tempdir().expect("runtime tempdir");
+
+    let first = Command::new(bin_path())
+        .args([
+            "mount",
+            source.path().to_str().unwrap(),
+            mount.to_str().unwrap(),
+            "--managed",
+        ])
+        .env("XDG_RUNTIME_DIR", runtime.path())
+        .output()
+        .expect("invoke skillfs");
+
+    let normalized = mount.canonicalize().expect("canonicalize mountpoint");
+    let legacy_id = legacy_instance_id(&normalized);
+    let supervisor_pid = runtime
+        .path()
+        .join(format!("skillfs/{legacy_id}.supervisor.pid"));
+
+    let second = Command::new(bin_path())
+        .args([
+            "mount",
+            source.path().to_str().unwrap(),
+            mount.to_str().unwrap(),
+            "--managed",
+        ])
+        .env("XDG_RUNTIME_DIR", runtime.path())
+        .output()
+        .expect("invoke skillfs again");
+
+    // Capture the incumbent's pid file before stop removes it.
+    let incumbent_pid = std::fs::read_to_string(&supervisor_pid).ok();
+
+    // Stop before asserting, so a failure does not leak a detached
+    // supervisor and a live FUSE mount into later tests.
+    let stop = Command::new(bin_path())
+        .args(["stop", mount.to_str().unwrap()])
+        .env("XDG_RUNTIME_DIR", runtime.path())
+        .output()
+        .expect("invoke skillfs stop");
+
+    // RED-shape leak guard: if `stop` missed the legacy instance (the
+    // regression this test pins), tear the incumbent down directly.
+    if let Some(raw) = incumbent_pid.as_deref() {
+        if let Ok(pid) = raw.trim().parse::<i32>() {
+            let _ = Command::new("sh")
+                .arg("-c")
+                .arg(format!("kill -TERM {pid}"))
+                .output();
+            for _ in 0..100 {
+                if !is_mounted(&mount) {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+    }
+    force_unmount(&mount);
+
+    let first_out = format!(
+        "{}{}",
+        String::from_utf8_lossy(&first.stdout),
+        String::from_utf8_lossy(&first.stderr),
+    );
+    let second_out = format!(
+        "{}{}",
+        String::from_utf8_lossy(&second.stdout),
+        String::from_utf8_lossy(&second.stderr),
+    );
+    let stop_out = format!(
+        "{}{}",
+        String::from_utf8_lossy(&stop.stdout),
+        String::from_utf8_lossy(&stop.stderr),
+    );
+
+    assert!(
+        first.status.success(),
+        "an underscore-prefixed mountpoint must be servable, got: {first_out}"
+    );
+    assert!(
+        first_out.contains("managed mount ready"),
+        "expected the ready line, got: {first_out}"
+    );
+    assert!(
+        incumbent_pid.is_some(),
+        "the instance must keep its legacy underscore-prefixed id \
+         ({legacy_id}.supervisor.pid), runtime files: {}",
+        list_runtime_files(&runtime.path().join("skillfs")),
+    );
+    assert!(
+        second.status.success(),
+        "a repeated managed request must succeed, got: {second_out}"
+    );
+    assert!(
+        second_out.contains("already active"),
+        "a repeated managed request must reuse the incumbent supervisor \
+         instead of racing a competing one, got: {second_out}"
+    );
+    assert!(
+        stop.status.success(),
+        "stop must clean up the instance, got: {stop_out}"
+    );
+    assert!(
+        stop_out.contains("stopped managed mount"),
+        "stop must resolve the legacy state/pid files, got: {stop_out}"
+    );
+    assert!(
+        !supervisor_pid.exists(),
+        "stop must remove the legacy supervisor pid file"
+    );
+}
+
+#[test]
 fn managed_mount_parses_and_rejects_missing_source() {
     // `--managed` must parse, and the managed client must fail fast with a
     // clear source error before detaching a supervisor — proving the flag is
@@ -2325,7 +3204,7 @@ fn control_socket_created_and_accepts_ping() {
     // PrivateTmp gate rejects a daemon-facing source/socket under /tmp.
     let source = non_tmp_dir();
     let mount = tempfile::tempdir().expect("mount tempdir");
-    let sock_dir = non_tmp_dir();
+    let sock_dir = non_tmp_socket_dir();
     let sock_path = sock_dir.path().join("skillfs.sock");
 
     // Trusted peer = this test binary, so our own probe authenticates and
@@ -2400,7 +3279,7 @@ fn control_socket_preserves_symlink_source_identity() {
     std::os::unix::fs::symlink(physical_source.path(), &identity_root).unwrap();
 
     let mount = tempfile::tempdir().expect("mount tempdir");
-    let sock_dir = non_tmp_dir();
+    let sock_dir = non_tmp_socket_dir();
     let sock_path = sock_dir.path().join("skillfs.sock");
     let mut child = Command::new(bin_path())
         .args([
@@ -2664,7 +3543,7 @@ fn control_socket_in_place_without_backing_root_fails_startup() {
     // Daemon-visible source and socket so the PrivateTmp gate passes and the
     // in-place backing-root gate is the one that fires.
     let source = non_tmp_dir();
-    let sock_dir = non_tmp_dir();
+    let sock_dir = non_tmp_socket_dir();
     let sock_path = sock_dir.path().join("skillfs.sock");
     let out = Command::new(bin_path())
         .args([
@@ -2972,7 +3851,7 @@ fn hermes_control_socket_allowed() {
     // reject the control plane on a /tmp fixture.
     let source = non_tmp_dir();
     let mount = tempfile::tempdir().expect("mount tempdir");
-    let sock_dir = non_tmp_dir();
+    let sock_dir = non_tmp_socket_dir();
     let sock_path = sock_dir.path().join("skillfs.sock");
     let mut child = Command::new(bin_path())
         .args([
@@ -3128,7 +4007,7 @@ fn hermes_config_control_socket_allowed() {
     // reject the control plane on a /tmp fixture.
     let source = non_tmp_dir();
     let mount = tempfile::tempdir().expect("mount tempdir");
-    let sock_dir = non_tmp_dir();
+    let sock_dir = non_tmp_socket_dir();
     let sock_path = sock_dir.path().join("skillfs.sock");
     let config_dir = tempfile::tempdir().expect("config dir");
     let config_path = config_dir.path().join("security.toml");
@@ -3327,7 +4206,12 @@ fn mount_file_aggregates_whole_skills_read_only() {
             .unwrap(),
         mount.clone(),
     );
-    for _ in 0..100 {
+    // 30 s readiness budget (50 ms x 600), the same cap the in-process
+    // polling fixtures use: the spawned CLI runs the environment-profile
+    // probe loop before its FUSE session comes up, which alone can take
+    // seconds on a loaded host - the previous 5 s budget raced it and the
+    // assertion reported the startup log instead of the aggregated view.
+    for _ in 0..600 {
         if is_mounted(&mount) || child.0.try_wait().unwrap().is_some() {
             break;
         }
@@ -3383,4 +4267,249 @@ fn mount_file_aggregates_whole_skills_read_only() {
     );
     drop(child);
     assert!(!is_mounted(&mount));
+}
+
+#[test]
+#[ignore = "requires CAP_SYS_ADMIN and FUSE; run in a disposable Linux container"]
+fn managed_stop_preserves_backing_root_when_fuse_is_busy() {
+    assert!(fuse_available(), "this regression requires FUSE");
+
+    struct ManagedMount {
+        root: tempfile::TempDir,
+        mount: std::path::PathBuf,
+        backing: std::path::PathBuf,
+        replacement_backing: std::path::PathBuf,
+        holder: Option<Child>,
+        stopper: Option<Child>,
+    }
+    impl Drop for ManagedMount {
+        fn drop(&mut self) {
+            if let Some(mut holder) = self.holder.take() {
+                let _ = holder.kill();
+                let _ = holder.wait();
+            }
+            if let Some(mut stopper) = self.stopper.take() {
+                let _ = stopper.kill();
+                let _ = stopper.wait();
+            }
+            let _ = Command::new(bin_path())
+                .arg("stop")
+                .arg(&self.mount)
+                .env("XDG_RUNTIME_DIR", self.root.path().join("runtime"))
+                .output();
+            force_unmount(&self.mount);
+            for backing in [&self.backing, &self.replacement_backing] {
+                if is_mounted(backing) {
+                    let _ = Command::new("umount").arg(backing).output();
+                }
+                assert!(!is_mounted(backing), "test backing bind leaked");
+            }
+            assert!(!is_mounted(&self.mount), "test FUSE mount leaked");
+        }
+    }
+
+    // Delay release past clear_mount's old three-second retry window.
+    for (busy, release_after_failure) in [
+        (false, None),
+        (true, Some(Duration::ZERO)),
+        (true, Some(Duration::from_secs(4))),
+        (true, None),
+    ] {
+        for operation in ["stop", "orphan", "supervisor"] {
+            let root = non_tmp_dir();
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+            let source = root.path().join("source");
+            let mount = root.path().join("mount");
+            let backing = root.path().join("backing");
+            std::fs::create_dir_all(source.join("demo")).unwrap();
+            std::fs::create_dir(root.path().join("runtime")).unwrap();
+            let skill = "---\nname: demo\ndescription: stop probe\n---\nbody\n";
+            std::fs::write(source.join("demo/SKILL.md"), skill).unwrap();
+            let mut instance = ManagedMount {
+                root,
+                mount,
+                backing,
+                replacement_backing: source.parent().unwrap().join("replacement-backing"),
+                holder: None,
+                stopper: None,
+            };
+            let output = Command::new(bin_path())
+                .arg("mount")
+                .arg(&source)
+                .arg("mount")
+                .current_dir(instance.root.path())
+                .args([
+                    "--security",
+                    "--activation-mode",
+                    "file",
+                    "--skill-layout",
+                    "flat",
+                ])
+                .arg("--ledger-backing-root")
+                .arg(&instance.backing)
+                .arg("--managed")
+                .env("XDG_RUNTIME_DIR", instance.root.path().join("runtime"))
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(is_mounted(&instance.mount));
+            assert!(is_mounted(&instance.backing));
+
+            if busy {
+                // Command::spawn returns only after the child's chdir succeeds,
+                // so the mount is already held when stop starts (no timing sleep).
+                instance.holder = Some(
+                    Command::new("sleep")
+                        .arg("60")
+                        .current_dir(instance.mount.join("skills"))
+                        .spawn()
+                        .unwrap(),
+                );
+            }
+            let runtime = instance.root.path().join("runtime/skillfs");
+            let supervisor_file = std::fs::read_dir(&runtime)
+                .unwrap()
+                .map(Result::unwrap)
+                .find(|e| e.file_name().to_string_lossy().ends_with(".supervisor.pid"))
+                .unwrap()
+                .path();
+            let supervisor = std::fs::read_to_string(&supervisor_file).unwrap();
+            if operation == "orphan" {
+                assert!(
+                    Command::new("kill")
+                        .args(["-KILL", supervisor.trim()])
+                        .status()
+                        .unwrap()
+                        .success()
+                );
+                // pid_alive also sees zombies; wait for the container init to
+                // reap this supervisor before requesting orphan replacement.
+                let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                while std::path::Path::new(&format!("/proc/{}", supervisor.trim())).exists() {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "supervisor did not die"
+                    );
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            }
+            let mut command = Command::new(bin_path());
+            if operation == "orphan" {
+                command
+                    .arg("mount")
+                    .arg(&source)
+                    .arg(&instance.mount)
+                    .args([
+                        "--security",
+                        "--activation-mode",
+                        "file",
+                        "--skill-layout",
+                        "flat",
+                    ])
+                    .arg("--ledger-backing-root")
+                    .arg(&instance.replacement_backing)
+                    .arg("--managed");
+            } else if operation == "supervisor" {
+                command = Command::new("kill");
+                command.args(["-TERM", supervisor.trim()]);
+            } else {
+                command.arg("stop").arg(&instance.mount);
+            }
+            let started = std::time::Instant::now();
+            instance.stopper = Some(
+                command
+                    .env("XDG_RUNTIME_DIR", instance.root.path().join("runtime"))
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped())
+                    .spawn()
+                    .unwrap(),
+            );
+            if let Some(delay) = release_after_failure {
+                let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                loop {
+                    let logs: String =
+                        std::fs::read_dir(instance.root.path().join("runtime/skillfs"))
+                            .unwrap()
+                            .filter_map(Result::ok)
+                            .filter(|e| e.file_name().to_string_lossy().ends_with(".worker.log"))
+                            .filter_map(|e| std::fs::read_to_string(e.path()).ok())
+                            .collect();
+                    // The old early-Drop warning and the retained worker's failed
+                    // unmount warning both prove the first unmount was attempted.
+                    if logs.contains("leaving backing root in place: FUSE mount still active")
+                        || logs.contains("signal-triggered FUSE unmount failed")
+                    {
+                        assert!(is_mounted(&instance.mount));
+                        assert!(is_mounted(&instance.backing));
+                        break;
+                    }
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "no failed unmount observed: {logs}"
+                    );
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                if let Some(remaining) = delay.checked_sub(started.elapsed()) {
+                    std::thread::sleep(remaining);
+                }
+                assert!(is_mounted(&instance.mount));
+                assert!(is_mounted(&instance.backing));
+                let mut holder = instance.holder.take().unwrap();
+                holder.kill().unwrap();
+                holder.wait().unwrap();
+            }
+            let output = instance.stopper.take().unwrap().wait_with_output().unwrap();
+            if operation == "supervisor" {
+                let deadline = std::time::Instant::now() + Duration::from_secs(15);
+                while supervisor_file.exists() {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "supervisor shutdown timed out"
+                    );
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            }
+            if busy && release_after_failure.is_none() {
+                if operation != "supervisor" {
+                    assert_eq!(output.status.code(), Some(1));
+                    assert!(String::from_utf8_lossy(&output.stderr).contains("failed to unmount"));
+                }
+                assert!(is_mounted(&instance.mount), "busy FUSE mount must remain");
+                assert!(
+                    is_mounted(&instance.backing),
+                    "live backing alias must remain"
+                );
+                assert_eq!(
+                    std::fs::read_to_string(instance.backing.join("demo/SKILL.md")).unwrap(),
+                    skill
+                );
+            } else {
+                assert!(
+                    output.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                assert_eq!(is_mounted(&instance.mount), operation == "orphan");
+                assert_eq!(
+                    is_mounted(&instance.replacement_backing),
+                    operation == "orphan"
+                );
+                assert!(!is_mounted(&instance.backing));
+                assert!(
+                    !instance.backing.exists(),
+                    "successful stop must remove created backing"
+                );
+            }
+            assert_eq!(
+                std::fs::read_to_string(source.join("demo/SKILL.md")).unwrap(),
+                skill
+            );
+            drop(instance);
+        }
+    }
 }

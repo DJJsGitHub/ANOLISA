@@ -35,7 +35,7 @@ grants the plugin's declared capabilities by default. Set
 consent the install then fails until consent is granted interactively. Set
 `AGENT_MEMORY_SAFE_INSTALL=1` to decline the unsafe-install bypass on hosts
 that would still receive one. Full reference:
-[user guide](../../docs/user-guide/en/token-saving/agent-memory.md).
+[user guide](../../docs/user-guide/en/agent-memory/index.md).
 
 ```bash
 bash /usr/share/anolisa/adapters/agent-memory/openclaw/scripts/install.sh
@@ -99,7 +99,7 @@ The OpenClaw plugin uses `anolisa_memory_search` and `anolisa_memory_get` for
 ANOLISA memories, alongside `memory_observe` and `memory_get_context`. Update
 old tool-name references in prompts and allowlists when upgrading, restart the
 gateway, and start a new conversation. Internal MCP names and stored data stay
-unchanged. See the [user guide](../../docs/user-guide/en/token-saving/agent-memory.md)
+unchanged. See the [user guide](../../docs/user-guide/en/agent-memory/index.md)
 for migration from installers that disabled `memory-core`. The manifest keeps
 all four plugin tools in OpenClaw 2026.9.2's `coding` conversation profile. Custom
 allowlists, sandbox policies, and hosts that ignore this metadata need explicit
@@ -125,6 +125,33 @@ refuses to load with it.
 - Rust ≥ 1.85 (for source build)
 - Node.js ≥ 20 and npm (for source build — bundles the OpenClaw adapter)
 - Optional: embedding provider (OpenAI or Ollama) for vector search
+
+## GitHub build artifacts
+
+Release (`memory/v<version>`) and manual Preview builds produce Linux x86_64 and
+ARM64 raw packages on fixed Cross profiles, with a glibc 2.28 baseline. Each
+platform supplies `agent-memory-<version>-linux-<arch>.tar.gz`, `.sha256`,
+`.tar.gz.cdx.json` and its `.sha256` (eight files total). The archive contains
+both the Rust binary and the bundled OpenClaw adapter; its CycloneDX SBOM covers
+target Rust dependencies and npm code actually embedded in the plugin.
+Contracts, build inputs and packaging scripts come from the same source commit.
+Preview validation does not publish a version or switch the local release pipeline.
+
+## Raw package development
+
+Linux x86_64 and ARM64 packages contain the binary, configuration, user service
+and bundled OpenClaw adapter. Build the plugin with Node 22.23.2 using
+`make build-openclaw-plugin-ci`; this checks version consistency before using
+`npm ci --legacy-peer-deps` and emits an esbuild dependency manifest.
+
+`python3 packaging/raw/package.py --help` lists the explicit binary directory,
+plugin output directory, target, timestamp and TOML build metadata inputs.
+Metadata binds `version`, `target_os`, `target_arch`,
+`binaries.agent-memory` (SHA256) and `plugin.sha256` to the supplied files.
+The packager does not build or execute binaries. It renders the raw installation
+contract from `.anolisa/component.raw.toml.in` and Cargo.toml; the RPM contract
+remains separate. Both installation modes leave the user service stopped.
+Run `python3 tests/test_raw_packaging.py` for packaging regressions.
 
 ## License
 

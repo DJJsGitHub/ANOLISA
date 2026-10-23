@@ -10,18 +10,30 @@ import subprocess
 import sys
 from pathlib import Path
 
+if sys.version_info < (3, 9):
+    raise SystemExit("AW CI control jobs require Python 3.9 or newer")
+
+sys.dont_write_bytecode = True
+
 AW = Path(__file__).resolve().parents[1]
 REPO = AW.parents[1]
+# Also support importlib-based gate tests without loading full-tree modules in scope jobs.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 
-def run(command: list[str], cwd: Path, timeout: float = 600, capture: bool = False) -> str:
+def run(
+    command: list[str], cwd: Path, timeout: float = 600, capture: bool = False,
+    umask: int = -1,
+) -> str:
     """Run a bounded command and reap its owned process group on interruption."""
-    print("+ " + " ".join(command), flush=True)
+    permissions = f"umask={umask:04o} " if umask >= 0 else ""
+    print("+ " + permissions + " ".join(command), flush=True)
     with subprocess.Popen(
         command,
         cwd=cwd,
         text=True,
         start_new_session=True,
+        umask=umask,
         stdout=subprocess.PIPE if capture else None,
     ) as process:
         try:
@@ -83,8 +95,8 @@ def scope(event_name: str, event: dict, actual: str, repo: Path = REPO) -> bool:
     if event_name == "pull_request":
         base = sha(event["pull_request"]["base"]["sha"])
         head = sha(event["pull_request"]["head"]["sha"])
-        ancestor = sha(git("merge-base", base, head, repo=repo))
-        comparisons = [f"{base}...{head}", f"{ancestor}..{actual}"]
+        # Base-branch AW updates must not select an unrelated PR.
+        comparisons = [f"{base}...{head}"]
     elif event_name == "push":
         before, after = sha(event["before"]), sha(event["after"])
         if after != actual:
@@ -93,7 +105,13 @@ def scope(event_name: str, event: dict, actual: str, repo: Path = REPO) -> bool:
         if before == "0" * 40 or event.get("forced") is True:
             return True
         comparisons = [f"{before}..{after}"]
-    elif event_name in ("workflow_dispatch", "merge_group"):
+    elif event_name == "merge_group":
+        base = sha(event["merge_group"]["base_sha"])
+        head = sha(event["merge_group"]["head_sha"])
+        if head != actual:
+            raise ValueError("merge group head SHA does not match checkout")
+        comparisons = [f"{base}..{head}"]
+    elif event_name == "workflow_dispatch":
         return True
     else:
         raise ValueError(f"unsupported event: {event_name}")
@@ -106,40 +124,30 @@ def scope(event_name: str, event: dict, actual: str, repo: Path = REPO) -> bool:
             )
         )
     return any(
-        path.startswith("src/aw/") or path == ".github/workflows/aw-ci.yml" for path in changed
+        path.startswith(("src/aw/", "providers/"))
+        or (
+            event_name != "pull_request"
+            and path in {".github/workflows/aw-ci.yml", ".github/workflows/aw-preview.yml"}
+        )
+        for path in changed
     )
 
 
-def inventory(text: str) -> set[str]:
-    """Parse libtest's list output and reject truncated or unknown formats."""
-    tests = set()
-    summary = None
-    for line in text.splitlines():
-        if line.endswith(": test"):
-            tests.add(line[:-6])
-        elif match := re.fullmatch(r"(\d+) tests?, (\d+) benchmarks?", line):
-            if summary is not None:
-                raise ValueError("duplicate test inventory summary")
-            summary = int(match[1])
-        elif line.strip():
-            raise ValueError(f"unexpected test inventory line: {line!r}")
-    if summary is None or summary != len(tests):
-        raise ValueError("missing or inconsistent test inventory summary")
-    return tests
+def check_inventory(metadata: dict) -> None:
+    """Build once, then validate the runnable matrix against real test executables."""
+    from check_inventory import check_inventory as check_tests
+
+    check_tests(AW, metadata, run)
 
 
-def check_inventory() -> None:
-    """Require runnable tests in every contract integration target."""
-    for target in ("canonical", "schemas", "contracts", "orchestration"):
-        command = ["cargo", "test", "--locked", "--test", target, "--", "--list"]
-        tests = inventory(run(command, AW, capture=True))
-        ignored = inventory(run([*command, "--ignored"], AW, capture=True))
-        if not ignored <= tests or not tests - ignored:
-            raise ValueError(f"{target}: no runnable tests or inconsistent ignored inventory")
-        print(f"{target}: {len(tests - ignored)} runnable tests", flush=True)
+def structure(metadata: dict, root: Path) -> None:
+    """Load layout checks only after sparse scope selection."""
+    from check_layout import structure as check_structure
+
+    check_structure(metadata, root)
 
 
-def selftest() -> None:
+def selftest(scope_only: bool = False) -> None:
     """Run the gate's behavior tests, rejecting missing or empty discovery."""
     run(
         [
@@ -149,7 +157,9 @@ def selftest() -> None:
             """
 import sys
 import unittest
-suite = unittest.defaultTestLoader.discover('tests', pattern='test_ci_checks.py')
+suite = unittest.defaultTestLoader.discover('tests', pattern='test_ci_*.py')
+if sys.argv[1] == "scope":
+    suite = unittest.defaultTestLoader.loadTestsFromName("test_ci_checks.ScopeTests")
 if suite.countTestCases() == 0:
     raise SystemExit('AW gate self-tests are missing or empty')
 result = unittest.TextTestRunner(verbosity=2).run(suite)
@@ -157,10 +167,25 @@ if result.testsRun == len(result.skipped):
     raise SystemExit('AW gate self-tests were all skipped')
 sys.exit(not result.wasSuccessful())
 """,
+            "scope" if scope_only else "all",
         ],
         AW,
         timeout=120,
     )
+
+
+def package_permissions() -> None:
+    """Exercise package readers, transactions and leases under child-local umasks."""
+    commands = [
+        ["cargo", "test", "--locked", "-p", "aw-package", "--test", "database"],
+        ["cargo", "test", "--locked", "-p", "aw-cli", "--test", "inventory"],
+        ["cargo", "test", "--locked", "-p", "aw-package", "--lib", "transaction::tests"],
+        ["cargo", "test", "--locked", "-p", "aw-exec", "--test", "packages"],
+        ["cargo", "test", "--locked", "-p", "aw-cli", "--test", "packages"],
+    ]
+    for mask in (0o022, 0o002):
+        for command in commands:
+            run(command, AW, timeout=120, umask=mask)
 
 
 def check() -> None:
@@ -168,11 +193,37 @@ def check() -> None:
     actual = candidate()
     selftest()
     run(["cargo", "fmt", "--all", "--", "--check"], AW)
-    run(["cargo", "clippy", "--workspace", "--all-targets", "--locked", "--", "-D", "warnings"], AW)
-    check_inventory()
-    run(["cargo", "test", "--workspace", "--locked"], AW)
+    from check_native import load
+
+    load(AW)
+    metadata = json.loads(
+        run(
+            ["cargo", "metadata", "--locked", "--no-deps", "--format-version", "1"],
+            AW,
+            capture=True,
+        )
+    )
+    provider_roots = [REPO / "providers" / name for name in ("agent-sec-core", "tokenless")]
+    metadata["provider_workspaces"] = []
+    for root in provider_roots:
+        run(["cargo", "fmt", "--all", "--", "--check"], root)
+        metadata["provider_workspaces"].append(json.loads(run(
+            ["cargo", "metadata", "--locked", "--no-deps", "--format-version", "1"],
+            root, capture=True,
+        )))
+    structure(metadata, AW)
+    for root in [AW, *provider_roots]:
+        run(["cargo", "clippy", "--workspace", "--all-targets", "--locked", "--", "-D", "warnings"], root)
+    from check_legacy_cli import prepare_legacy_cli
+
+    os.environ["AW_LEGACY_PACKAGE_CLI"] = str(prepare_legacy_cli(AW, REPO, run))
+    check_inventory(metadata)
+    for root in [AW, *provider_roots]:
+        run(["cargo", "test", "--workspace", "--locked", "--no-fail-fast"], root)
+    package_permissions()
     run([sys.executable, "tests/check_canonical.py"], AW, timeout=30)
-    run(["cargo", "doc", "--workspace", "--no-deps", "--locked"], AW)
+    for root in [AW, *provider_roots]:
+        run(["cargo", "doc", "--workspace", "--no-deps", "--locked"], root)
     if candidate() != actual:
         raise ValueError("checkout changed during validation")
     output(tested_sha=actual)
@@ -207,7 +258,7 @@ def main() -> int:
     try:
         if command == "scope":
             actual = candidate()
-            selftest()
+            selftest(scope_only=True)
             event = json.loads(Path(os.environ["GITHUB_EVENT_PATH"]).read_text(encoding="utf-8"))
             selected = scope(os.environ["GITHUB_EVENT_NAME"], event, actual)
             output(selected=str(selected).lower(), candidate_sha=actual)

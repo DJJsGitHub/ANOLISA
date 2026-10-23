@@ -8,6 +8,8 @@
 
 VERSION ?= $(shell grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
 NAME := agent-memory
+NPM_INSTALL ?= install
+PLUGIN_BUILD_ARGS ?=
 
 # Remote Linux dev host used by remote-* targets.
 REMOTE_HOST ?= aos2
@@ -118,7 +120,7 @@ build-openclaw-plugin: sync-versions generate-component-contract ## Build opencl
 	# constraint is intentionally permissive (the plugin uses only the
 	# stable plugin-sdk surface), so we keep --legacy-peer-deps until
 	# openclaw publishes a semver-compatible package range.
-	cd $(OPENCLAW_PLUGIN_SRC_DIR) && npm install --legacy-peer-deps --no-audit --no-fund
+	cd $(OPENCLAW_PLUGIN_SRC_DIR) && npm $(NPM_INSTALL) --legacy-peer-deps --no-audit --no-fund
 	# esbuild (what `npm run build` runs) strips types without checking them, so
 	# a type error in src/ or tests/ still produces a dist/index.js. Nothing else
 	# in the pipeline would catch it either: agent-memory.spec.in's %build
@@ -129,9 +131,14 @@ build-openclaw-plugin: sync-versions generate-component-contract ## Build opencl
 	# written against, and needs only the devDependencies installed just above.
 	@echo "==> Type-checking $(NAME) OpenClaw plugin (tsc --noEmit)..."
 	cd $(OPENCLAW_PLUGIN_SRC_DIR) && npm run build:check
-	cd $(OPENCLAW_PLUGIN_SRC_DIR) && npm run build
+	cd $(OPENCLAW_PLUGIN_SRC_DIR) && npm run build -- $(PLUGIN_BUILD_ARGS)
 	@test -f $(OPENCLAW_PLUGIN_SRC_DIR)/dist/index.js \
 	    || { echo "ERROR: $(OPENCLAW_PLUGIN_SRC_DIR)/dist/index.js was not produced"; exit 1; }
+
+.PHONY: build-openclaw-plugin-ci
+build-openclaw-plugin-ci: ## Build the plugin from locked dependencies without version repair
+	python3 packaging/raw/verify-release.py .
+	$(MAKE) build-openclaw-plugin NPM_INSTALL=ci PLUGIN_BUILD_ARGS=--metafile=dist/build-meta.json
 
 build-debug: ## Build debug binary
 	cargo build --locked
@@ -167,7 +174,7 @@ test-tools: ## Run Tier A file-tool integration tests only
 # gate on it. The per-PR `Test agent-memory` job also runs this target.
 test-openclaw-plugin: ## Run openclaw adapter TS unit tests (needs npm registry)
 	@echo "==> Running openclaw adapter unit tests..."
-	cd $(OPENCLAW_PLUGIN_SRC_DIR) && npm install --legacy-peer-deps --no-audit --no-fund
+	cd $(OPENCLAW_PLUGIN_SRC_DIR) && npm $(NPM_INSTALL) --legacy-peer-deps --no-audit --no-fund
 	cd $(OPENCLAW_PLUGIN_SRC_DIR) && npm test
 
 # =============================================================================

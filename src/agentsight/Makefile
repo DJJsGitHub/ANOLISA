@@ -12,11 +12,12 @@ build: ## Build agentsight binary
 		LIBBPF_SYS_LIBRARY_PATH="$(LIBBPF_SYS_LIBRARY_PATH)" \
 		cargo build --release
 
+ENFORCER_BUILD = env -u DESTDIR -u MAKEFLAGS -u MFLAGS -u MAKEOVERRIDES \
+	LIBBPF_SYS_LIBRARY_PATH="$(LIBBPF_SYS_LIBRARY_PATH)" ./scripts/build-enforcer.sh
+
 .PHONY: build-enforcer
-build-enforcer: ## Build the privileged ActPlane enforcement daemon
-	env -u DESTDIR -u MAKEFLAGS -u MFLAGS -u MAKEOVERRIDES \
-		LIBBPF_SYS_LIBRARY_PATH="$(LIBBPF_SYS_LIBRARY_PATH)" \
-		./scripts/build-enforcer.sh
+build-enforcer: ## Build the privileged daemon; print its private verified path
+	@$(ENFORCER_BUILD)
 
 .PHONY: build-frontend
 build-frontend: ## Build and embed frontend into frontend-dist/
@@ -59,11 +60,15 @@ SERVICE_BINDIR ?= $(BINDIR)
 SETCAP ?= auto
 
 .PHONY: install uninstall
-install: build-all ## Build and install agentsight binary and set BPF capabilities
-	install -d -m 0755 $(DESTDIR)$(BINDIR)
+install: build-frontend build ## Build and install agentsight binary and set BPF capabilities
+	@enforcer_bin="$(ENFORCER_BIN)"; \
+		if [ -z "$$enforcer_bin" ]; then \
+			enforcer_bin=$$($(ENFORCER_BUILD)) || exit $$?; \
+		fi; \
+		install -d -m 0755 "$(DESTDIR)$(BINDIR)" && \
+		python3 scripts/copy-enforcer.py "$$enforcer_bin" "$(DESTDIR)$(BINDIR)/agentsight-enforcer"
 	install -d -m 0755 $(DESTDIR)$(SYSCONFDIR)/agentsight
 	install -p -m 0755 target/release/agentsight $(DESTDIR)$(BINDIR)/
-	install -p -m 0755 target/release/agentsight-enforcer $(DESTDIR)$(BINDIR)/
 	install -p -m 0644 agentsight.json $(DESTDIR)$(SYSCONFDIR)/agentsight/config.json
 	@if [ "$(SETCAP)" = "1" ] || { [ "$(SETCAP)" = "auto" ] && [ "$(INSTALL_PROFILE)" = "system" ] && [ -z "$(DESTDIR)" ] && command -v setcap >/dev/null 2>&1; }; then \
 		setcap cap_bpf,cap_perfmon=ep $(DESTDIR)$(BINDIR)/agentsight; \
@@ -103,9 +108,20 @@ stage-raw: ## Stage one raw payload into DESTDIR
 test-raw-package: ## Validate Linux and macOS raw package assembly
 	@bash scripts/test-package-raw.sh
 
+.PHONY: test-batch-analysis
+test-batch-analysis: ## Exercise batch discovery and execution without model calls
+	python3 -m unittest discover -s scripts/benchmark/tests -p test_batch_execution_regressions.py
+
+# Add the dependency separately from the shared native-test rule.
+test: test-batch-analysis
+
 .PHONY: test
 test: test-rpm-packaging test-raw-package ## Run unit tests (fast, no coverage)
 	cd $(CURDIR) && cargo test
+
+.PHONY: bench
+bench: ## Run stable userspace performance benchmarks
+	cd $(CURDIR) && cargo bench --bench pipeline
 
 .PHONY: test-rpm-packaging
 test-rpm-packaging: ## Validate the portable RPM payload contract
@@ -162,3 +178,7 @@ help: ## Show this help message
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-20s\033[0m %s\n", $$1, $$2}'
 
 .DEFAULT_GOAL := build-all
+
+.PHONY: test-tokenless-api
+test-tokenless-api: ## Verify built Tokenless and AgentSight CLI processes on Linux
+	python3 tests/tokenless-api-e2e.py

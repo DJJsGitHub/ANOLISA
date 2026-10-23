@@ -31,7 +31,7 @@ sudo yum install agent-memory
 随包附带的插件（`memory-anolisa`）由
 `/usr/share/anolisa/adapters/agent-memory/openclaw/scripts/install.sh` 部署，默认授予插件声明的能力。设置
 `AGENT_MEMORY_ACCEPT_CAPABILITIES=0` 可拒绝授予同意——带门禁的宿主上安装将失败，直至交互式授予。设置
-`AGENT_MEMORY_SAFE_INSTALL=1` 可在仍会传递 unsafe-install 覆盖参数的宿主上拒绝它。完整说明见[用户指南](../../docs/user-guide/zh/token-saving/agent-memory.md)。
+`AGENT_MEMORY_SAFE_INSTALL=1` 可在仍会传递 unsafe-install 覆盖参数的宿主上拒绝它。完整说明见[用户指南](../../docs/user-guide/zh/agent-memory/index.md)。
 
 ```bash
 bash /usr/share/anolisa/adapters/agent-memory/openclaw/scripts/install.sh
@@ -63,7 +63,7 @@ OpenClaw 插件通过 `anolisa_memory_search` 和 `anolisa_memory_get` 访问 AN
 记忆，另提供 `memory_observe` 和 `memory_get_context`。升级时请更新提示词和白名单
 中的旧工具名，重启 gateway 并开始新会话；内部 MCP 方法名和数据保持不变。
 旧安装脚本曾禁用 `memory-core` 的迁移说明见
-[用户指南](../../docs/user-guide/zh/token-saving/agent-memory.md)。manifest 声明会让全部四个插件工具
+[用户指南](../../docs/user-guide/zh/agent-memory/index.md)。manifest 声明会让全部四个插件工具
 保留在 OpenClaw 2026.9.2 的 `coding` 会话 profile 中。自定义白名单、sandbox 策略及
 不采用该元数据的宿主需要显式添加新名称；指南说明了如何追加而不覆盖已有策略。
 
@@ -86,6 +86,28 @@ Profile 门控（basic/advanced/expert）按部署形态控制工具可见性。
 - Rust ≥ 1.85（源码构建）
 - Node.js ≥ 20 与 npm（源码构建 —— 打包内置的 OpenClaw adapter）
 - 可选：用于向量检索的 embedding 提供方（OpenAI 或 Ollama）
+
+## GitHub 构建产物
+
+Release（`memory/v<版本>`）和手动 Preview 使用固定 Cross 配置生成 Linux x86_64、ARM64
+raw 包，glibc 基线为 2.28。每个平台提供 `agent-memory-<版本>-linux-<架构>.tar.gz`、
+对应的 `.sha256`、`.tar.gz.cdx.json` 及其 `.sha256`，总共八个文件。
+归档包含 Rust 主程序和已打包的 OpenClaw 适配器；CycloneDX SBOM 覆盖目标平台 Rust
+依赖和实际内嵌到插件的 npm 代码。契约、构建输入和打包脚本均来自同一源码提交。
+Preview 验证不会发布新版本，也不会切换本地发布流水线。
+
+## Raw 包开发
+
+Linux x86_64 和 ARM64 包包含主程序、配置、用户服务及已打包的 OpenClaw 适配器。
+使用 Node 22.23.2 执行 `make build-openclaw-plugin-ci`；该入口先检查版本一致性，
+再运行 `npm ci --legacy-peer-deps`，并生成 esbuild 依赖清单。
+
+`python3 packaging/raw/package.py --help` 列出必须显式传入的二进制目录、插件输出目录、
+目标架构、时间戳和 TOML 构建元数据。元数据以 `version`、`target_os`、`target_arch`、
+`binaries.agent-memory`（SHA256）和 `plugin.sha256` 绑定输入文件。
+打包器不构建或执行二进制；raw 安装契约由 `.anolisa/component.raw.toml.in` 和 Cargo.toml
+渲染，RPM 契约保持独立。两种安装模式均不会启动用户服务。
+通过 `python3 tests/test_raw_packaging.py` 运行打包回归测试。
 
 ## 许可证
 
