@@ -7,6 +7,23 @@
 本文档格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 项目遵循[语义化版本](https://semver.org/lang/zh-CN/spec/v2.0.0.html)。
 
+## [0.2.10] - 2026-10-15
+
+### 新增
+
+- **agent-memory**：更新至 v0.2.10，提供包含记忆服务和 OpenClaw 适配器的 Linux x86_64 与 ARM64 原始发布包，用户可直接安装经过校验的归档，无需从源码构建（#7648、#7649）
+
+### 修复
+
+- **agent-memory**：按宿主提供的 Tool Search 或直接工具调用方式引导 Agent，使延迟加载的记忆工具能够被发现并以有效参数调用（#7645）
+- **agent-memory**：等待 MCP 子进程退出，并在 OpenClaw 插件实例销毁时清理进程，避免关闭和重新加载时遗留记忆进程（#7482、#7661）
+
+## [0.2.9] - 2026-10-11
+
+### 修复
+
+- **agent-memory**: 更新至 v0.2.9，定位 OpenClaw adapter 的二进制时要求路径指向可执行文件，用户将目录配置为 `binaryPath` 时会在启动阶段收到配置错误；即使 `PATH` 较早的条目中存在名为 `agent-memory` 的目录，也能继续找到后续有效的可执行文件或指向可执行文件的符号链接（#4855）
+
 ## [0.2.8] - 2026-09-20
 
 ### 新增
@@ -16,7 +33,7 @@
 ### 变更
 
 - **agent-memory**：**不兼容变更：** OpenClaw 工具更名为 `anolisa_memory_search` 和 `anolisa_memory_get`，Agent 可以同时访问 ANOLISA 记忆和 OpenClaw 自带记忆工具，避免名称冲突；升级时需更新提示词及工具 allowlist、重启 gateway 并开启新会话。内部 MCP 名称和已存储记忆保持不变（#3347）
-- **agent-memory**：在 OpenClaw 的 `coding` profile 中声明全部四个插件工具，Agent 在该 profile 下无需禁用 `memory-core` 即可访问插件工具；自定义策略仍需显式添加工具条目，中间版本安装器留下的禁用标记需按[用户指南](../../docs/user-guide/zh/token-saving/agent-memory.md)手动恢复（#3347）
+- **agent-memory**：在 OpenClaw 的 `coding` profile 中声明全部四个插件工具，Agent 在该 profile 下无需禁用 `memory-core` 即可访问插件工具；自定义策略仍需显式添加工具条目，中间版本安装器留下的禁用标记需按[用户指南](../../docs/user-guide/zh/agent-memory/index.md)手动恢复（#3347）
 
 ### 修复
 

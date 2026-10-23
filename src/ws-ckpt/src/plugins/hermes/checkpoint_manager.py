@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -52,6 +53,17 @@ def map_error_to_message(stderr: str, context: Optional[Dict[str, Any]] = None) 
         ctx_str = f" (context: {json.dumps(context)})"
 
     lowered = stderr.lower()
+
+    # A filename may itself contain words such as "timeout" or "active write".
+    if "cannot be represented as utf-8" in lowered:
+        diagnostic = re.sub(r"\x1b\[[0-9;]*m", "", stderr).strip()
+        return (
+            "A workspace path cannot be represented as UTF-8. "
+            "This is NOT retryable until the filename is fixed. "
+            "Use a valid UTF-8 name for the affected file or directory. "
+            "The operation and escaped path token are shown in this diagnostic:\n"
+            f"{diagnostic}{ctx_str}"
+        )
 
     # CLI environment issues take priority over generic "not found" (snapshot)
     if "binary not found" in lowered or "not found on path" in lowered:

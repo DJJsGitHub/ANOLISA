@@ -57,6 +57,8 @@ cd src
 cargo build --release
 ```
 
+[Maintainer guide: Raw packaging and GitHub builds](../../docs/developer-guide/en/ws-ckpt/packaging.md)
+
 ### Install (RPM)
 
 ```bash
@@ -123,7 +125,7 @@ pins recovered orphans until explicitly deleted. Query them with
 IDs with `ws-ckpt delete -w <workspace> -s <complete-id> --force`. Delete no longer
 accepts prefixes. Missing pinned snapshots and guarded evidence remain unavailable;
 deleting an absent target returns `SnapshotNotFound`. Upgrade CLI and daemon together.
-See [snapshot recovery](../../docs/user-guide/en/runtime/ws-ckpt.md#snapshot-recovery-after-an-interrupted-cleanup).
+See [snapshot recovery](../../docs/user-guide/en/ws-ckpt/index.md#snapshot-recovery-after-an-interrupted-cleanup).
 
 ### Recovering interrupted initialization
 
@@ -139,7 +141,7 @@ registered workspace's live subvolume was deleted externally, use
 `ws-ckpt unregister -w <workspace> --force` to remove its stale registration;
 this restores no data and preserves snapshots and backups. For both commands,
 `--force` only skips interactive confirmation. See the
-[recovery guide](../../docs/user-guide/en/runtime/ws-ckpt.md#recovering-interrupted-initialization-and-stale-registrations).
+[recovery guide](../../docs/user-guide/en/ws-ckpt/index.md#recovering-interrupted-initialization-and-stale-registrations).
 
 ### Configuration
 
@@ -194,6 +196,41 @@ ws-ckpt reload
 | `plugin` | Install/uninstall ws-ckpt Agent runtime plugins (openclaw/hermes) |
 
 The OpenClaw adapter requires OpenClaw >= 2026.2.13. Installation stops rather than leaving a partial integration when the detected version or config capabilities cannot update the tool allowlist safely.
+
+## Components
+
+| Component | Status | Description |
+|-----------|--------|-------------|
+| Daemon | Mostly complete | Runs as root and performs the actual filesystem operations |
+| CLI | Mostly complete | init / checkpoint / rollback / delete / list / diff / cleanup / status / config / plugin |
+| plugin | Mostly complete | OpenClaw / Hermes plugins with automatic checkpoint/rollback |
+| skills | Initial draft | `src/skills/ws-ckpt/SKILL.md` first draft; currently OpenClaw-only |
+
+## OpenClaw Skill
+
+ws-ckpt ships a companion [OpenClaw](https://github.com/alibaba/anolisa) skill definition at `src/skills/ws-ckpt/SKILL.md`.
+
+To install it manually from source, copy the directory into the OpenClaw skill path:
+
+```bash
+cp -r src/skills/ws-ckpt <your-openclaw-skills-dir>/ws-ckpt
+```
+
+## Development
+
+```bash
+# Run tests
+cd src
+cargo test --workspace
+
+# Lint
+cargo clippy --workspace -- -D warnings
+```
+
+## Documentation
+
+- [User guide](../../docs/user-guide/en/ws-ckpt/index.md)
+- [RPM packaging](docs/RPM-PACKAGING.md)
 
 ## License
 

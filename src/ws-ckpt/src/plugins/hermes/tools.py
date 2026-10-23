@@ -25,6 +25,7 @@ from .checkpoint_manager import (
     cwd_inside_workspace,
     cwd_inside_workspace_reason,
     get_manager,
+    map_error_to_message,
 )
 
 
@@ -546,6 +547,19 @@ def handle_ws_ckpt_config(args: Dict[str, Any], **_kwargs) -> str:
         if not value:
             return _err("workspace requires a path value")
         new_path = str(value).strip()
+        if "\n" in new_path or "\r" in new_path:
+            # The workspace path is interpolated into crontab lines; a
+            # line break would install everything after it as an
+            # independent cron entry (see cron.py _build_cron_line).
+            return _err("workspace must be a single-line path without line breaks")
+        # Refuse when the session cwd is inside the NEW workspace: ws-ckpt
+        # replaces the workspace inode, so every ws-ckpt tool call from this
+        # session would then be refused by the same guard — switching the
+        # config now would silently point the plugin at a workspace it
+        # cannot operate on. Mirrors the autoCheckpoint branch above.
+        rejection = _reject_if_cwd_inside_workspace(new_path)
+        if rejection:
+            return rejection
         mgr = get_manager()
         old_path = mgr.config.workspace
         mgr.set_workspace(new_path)
@@ -699,7 +713,7 @@ def handle_ws_ckpt_rollback(args: Dict[str, Any], **_kwargs) -> str:
     success, output = _run_ws_ckpt_cmd(cmd)
     if success and not preview:
         get_manager().skip_next_auto_checkpoint = True
-    return _ok(output) if success else _err(output)
+    return _ok(output) if success else _err(map_error_to_message(output))
 
 
 def handle_ws_ckpt_list(args: Dict[str, Any], **_kwargs) -> str:
@@ -726,7 +740,7 @@ def handle_ws_ckpt_diff(args: Dict[str, Any], **_kwargs) -> str:
     if to_id:
         cmd.extend(["--to", to_id])
     success, output = _run_ws_ckpt_cmd(cmd)
-    return _ok(output) if success else _err(output)
+    return _ok(output) if success else _err(map_error_to_message(output))
 
 
 def handle_ws_ckpt_delete(args: Dict[str, Any], **_kwargs) -> str:

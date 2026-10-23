@@ -78,6 +78,9 @@
             "maintainers": [
                 {
                     "github": "yummypeng"
+                },
+                {
+                    "github": "Ziqi002"
                 }
             ]
         },
@@ -116,14 +119,6 @@
                 },
                 {
                     "github": "zkl123"
-                }
-            ]
-        },
-        {
-            "label": "component:blaze",
-            "maintainers": [
-                {
-                    "github": "casparant"
                 }
             ]
         },

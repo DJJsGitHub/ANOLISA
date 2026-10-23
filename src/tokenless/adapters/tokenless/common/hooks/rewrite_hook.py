@@ -26,6 +26,7 @@ from hook_utils import (
     _TOKENLESS_LOCAL_SHARE,
     build_pre_tool_request,
     mark_rtk_optimized,
+    prepare_hook_input,
     resolve_agent_id,
     resolve_binary,
     resolve_tool_call_id,
@@ -39,6 +40,18 @@ _AGENT_ID = resolve_agent_id()
 
 
 def main() -> None:
+    try:
+        input_data = json.load(sys.stdin)
+    except (json.JSONDecodeError, EOFError, ValueError):
+        skip()
+
+    if not isinstance(input_data, dict):
+        # A payload that is not a JSON object carries no command to
+        # rewrite; take the same silent path as undecodable input instead
+        # of raising, as the sibling schema hook already does.
+        skip()
+
+    input_data = prepare_hook_input(input_data, _AGENT_ID)
     tokenless_bin = resolve_binary(
         "tokenless",
         _TOKENLESS_FALLBACK,
@@ -47,11 +60,6 @@ def main() -> None:
     )
     if not tokenless_bin:
         warn("tokenless is not installed. Hook disabled.")
-        skip()
-
-    try:
-        input_data = json.load(sys.stdin)
-    except (json.JSONDecodeError, EOFError, ValueError):
         skip()
 
     tool_input = input_data.get("tool_input", {})
