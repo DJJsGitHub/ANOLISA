@@ -157,6 +157,7 @@ jobs:
 
           # Exercise cache consumers when the runner image or cache bootstrap changes.
           if echo "$CHANGED" | grep -Eq '^\.github/actions/setup-sccache/|^\.github/runner-images/ubuntu22-ci/|^\.github/workflows/ci\.yaml$'; then
+            AGENTSIGHT=true
             TOKENLESS=true
             AGENT_MEMORY=true
           fi
@@ -851,6 +852,16 @@ jobs:
             echo "::error::Incremental coverage gate failed: new code coverage < ${THRESHOLD}%"
             exit 1
           fi
+
+      # Runs after the Rust build so the generated FFI header exists for the
+      # native tests. The suite spawns bare python3 subprocesses, hence PATH.
+      - name: Test benchmark Python suite
+        working-directory: src/agentsight/scripts/benchmark
+        run: |
+          uv venv "$RUNNER_TEMP/benchmark-venv" --python 3.11.6
+          uv pip install --python "$RUNNER_TEMP/benchmark-venv/bin/python" -r requirements.txt
+          PATH="$RUNNER_TEMP/benchmark-venv/bin:$PATH" \
+            "$RUNNER_TEMP/benchmark-venv/bin/python" -m pytest -q tests
 
   # =========================================================================
   # Step 6: Test tokenless
