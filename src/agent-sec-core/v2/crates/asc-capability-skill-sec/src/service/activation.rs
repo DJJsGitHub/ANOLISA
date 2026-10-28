@@ -1,7 +1,8 @@
 //! Decision and activation entrypoints retain the Service's single write boundary.
 
 use super::{
-    SkillRoot, SkillSecService, check_locked, merge, poisoned, required_ledger, validate_skill,
+    SkillRoot, SkillSecService, check_locked, ledger_has_history, merge, required_ledger,
+    validate_skill,
 };
 use crate::UserDecision;
 use crate::activation::{decision_value, publish, summary};
@@ -113,20 +114,17 @@ impl SkillSecService {
     /// Reports unavailable keys, invalid source paths and deadlines.
     pub fn show(&self, root: &SkillRoot, deadline: Instant) -> Result<Value, SkillSecError> {
         self.with_skill(root, deadline, |directory, key| {
-            if !self
-                .config
-                .managed_skill_dirs
-                .iter()
-                .any(|pattern| pattern.contains(&root.identity))
-                && !self
-                    .managed
-                    .lock()
-                    .map_err(|_| poisoned())?
-                    .contains(&root.identity)
-            {
+            let ledger = Ledger::open(directory, false)?;
+            let configured = self.config()?.allows(&root.identity);
+            let mapped_history = !root.host_backed
+                && ledger
+                    .as_ref()
+                    .map(|ledger| ledger_has_history(ledger, deadline))
+                    .transpose()?
+                    .unwrap_or(false);
+            if !configured && !mapped_history {
                 return Ok(unmanaged(root));
             }
-            let ledger = Ledger::open(directory, false)?;
             let status = check_locked(directory, key, root, deadline)?;
             let mut result = summary(ledger.as_ref(), key, root, &status, deadline)?;
             let latest = if status["versionId"].is_string() {
@@ -179,15 +177,7 @@ impl SkillSecService {
             let recovered = self.recover_rollback(root, directory, key, deadline)?;
             validate_skill(directory)?;
             let ledger = required_ledger(directory)?;
-            let latest = ledger.latest(key, &root.identity, false, deadline).ok().flatten();
-            let newest = ledger.newest(key, &root.identity, false, deadline)?;
-            let mut repaired = false;
-            if let Some(manifest) = newest
-                && latest.as_ref() != Some(&manifest)
-                && ledger.snapshot(&manifest, deadline).is_ok() {
-                ledger.meta.write_atomic("latest.json", &serde_json::to_vec(&manifest)?, true)?;
-                repaired = true;
-            }
+            let repaired = ledger.repair_latest(key, &root.identity, deadline)?;
             cleanup_temporaries(&ledger, deadline)?;
             let activation = refresh_locked(&ledger, directory, key, root, deadline);
             Ok(json!({"canonicalSkillDir":root.identity,"skillName":root.identity.name(),

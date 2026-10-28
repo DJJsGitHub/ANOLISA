@@ -24,7 +24,7 @@ use std::ops::Range;
 use agentsight_atif::{AtifTrajectory, Step, StepSource, same_call_id};
 
 use super::claims::{Claim, ClaimClass, extract_claims, numbers_agree};
-use super::outcome::{CallStatus, CallVerdict, Confidence, classify_call, result_text};
+use super::outcome::{CallStatus, CallVerdict, Confidence, classify_call, command_of, result_text};
 
 /// Cap on pool numbers considered when testing whether a claim was computed from
 /// evidence. The check is pairwise, so this bounds it to a fixed cost.
@@ -556,12 +556,7 @@ fn strip_command_echo(text: &str, steps_prefix: &[Step], source_call_id: Option<
         .filter_map(|step| step.tool_calls.as_deref())
         .flatten()
         .find(|c| source_call_id.is_some_and(|id| same_call_id(c.tool_call_id.as_str(), id)))
-        .and_then(|call| {
-            call.arguments
-                .get("command")
-                .or_else(|| call.arguments.get("cmd"))
-        })
-        .and_then(|v| v.as_str())
+        .and_then(command_of)
     else {
         return text.to_string();
     };
@@ -651,10 +646,14 @@ fn ground_one(claim: &Claim, pool: &[EvidenceEntry]) -> Grounding {
 // retain containment, and numbers retain their separate approximate comparison.
 fn contains_literal(haystack: &str, needle: &str, class: ClaimClass) -> bool {
     // The delimiters include the structural separators the extractor splits a
-    // value out of, where they also bound one in real output. The CJK marks
-    // bound a value where prose puts no spaces around it. `|` is sqlite3's
-    // default column separator, so `1|/tmp/report.txt` is the text-column shape
-    // of the `complete|119` a count was once hidden in.
+    // value out of, where they also bound one in real output. A colon bounds
+    // the `path:line` shape of grep/compiler output, and `=` bounds an
+    // assignment. The CJK marks bound a value where prose puts no spaces
+    // around it. `|` is sqlite3's default column separator, so
+    // `1|/tmp/report.txt` is the text-column shape of the `complete|119` a
+    // count was once hidden in. `\` opens the escape that follows a value in a
+    // JSON payload serialized inside a string (`\"v1.2.3\",\n`), which the
+    // decoding pass in `push_entry` leaves raw.
     let boundary = |c: char| {
         c.is_whitespace()
             || matches!(
@@ -670,6 +669,9 @@ fn contains_literal(haystack: &str, needle: &str, class: ClaimClass) -> bool {
                     | '<'
                     | '>'
                     | '|'
+                    | ':'
+                    | '='
+                    | '\\'
                     | '（'
                     | '）'
                     | '【'
@@ -690,13 +692,15 @@ fn contains_literal(haystack: &str, needle: &str, class: ClaimClass) -> bool {
     haystack.match_indices(needle).any(|(start, _)| {
         let prefix = &haystack[..start];
         let before = prefix.chars().next_back();
-        let starts_value = before.is_none_or(|c| boundary(c) || matches!(c, ':' | '='))
+        // A comma opens a value, as in a CSV column, but does not close one:
+        // see the suffix rule below.
+        let starts_value = before.is_none_or(|c| boundary(c) || matches!(c, ':' | '=' | ','))
             || (class == ClaimClass::Version
                 && before == Some('v')
                 && prefix[..prefix.len() - 1]
                     .chars()
                     .next_back()
-                    .is_none_or(|c| boundary(c) || matches!(c, ':' | '=')));
+                    .is_none_or(|c| boundary(c) || matches!(c, ':' | '=' | ',')));
         // A terminal period/comma is sentence decoration; the same character
         // followed by more filename/version content is a continuation.
         let suffix = haystack[start + needle.len()..].trim_start_matches(['.', ',', ';', '!', '?']);
@@ -846,11 +850,17 @@ fn output_domain(function_name: &str) -> &'static [ClaimClass] {
         || name.contains("grep")
         || name.contains("search")
     {
+        // Dates and URLs belong here with the numbers and versions: a read
+        // returns the file's own content, and both (log lines, headers,
+        // timestamps; config values, docs) are among what that content
+        // carries. The pool builder already extracts URLs from a read result.
         return &[
             ClaimClass::Path,
+            ClaimClass::Url,
             ClaimClass::Quoted,
             ClaimClass::Identifier,
             ClaimClass::Number,
+            ClaimClass::Date,
             ClaimClass::Version,
         ];
     }

@@ -127,7 +127,17 @@ def _scan_endpoint(data_dir: Path, env: dict[str, str]):
     # Use a short private directory to stay within the UDS path-length limit.
     with tempfile.TemporaryDirectory(prefix="pii-e2e-", dir="/tmp") as directory:
         socket_path = Path(directory) / "daemon.sock"
-        argv = [binary, "--socket", str(socket_path)]
+        config = Path(directory) / "skillsec.json"
+        config.write_text(
+            json.dumps(
+                {
+                    "stateDir": str(Path(directory) / "skillsec-state"),
+                    "enableDefaultSkillDirs": False,
+                }
+            )
+        )
+        config.chmod(0o600)
+        argv = [binary, "--socket", str(socket_path), "--skillsec-config", str(config)]
         if _rules_path(data_dir).exists():
             argv += ["--pii-rules", str(_rules_path(data_dir))]
         process = subprocess.Popen(

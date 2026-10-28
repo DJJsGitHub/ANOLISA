@@ -321,7 +321,7 @@ def deduplicate_component_tree(component: dict[str, Any], seen: set[str]) -> Non
 
 
 def merge_sboms(documents: list[dict[str, Any]]) -> dict[str, Any]:
-    """Merge filtered cargo-sbom documents for every shipped Rust project."""
+    """Merge dependency documents for every shipped project."""
     if not documents:
         die("at least one cargo-sbom document is required")
     merged = documents[0]
@@ -375,7 +375,8 @@ def normalize_sbom(
     if not isinstance(metadata, dict) or not isinstance(root, dict):
         die("cargo-sbom output is missing metadata.component")
 
-    artifact_id = f"{component_name}-{version}-{target_os}-{target_arch}-tar"
+    archive_format = "zip" if target_os == "windows" else "tar"
+    artifact_id = f"{component_name}-{version}-{target_os}-{target_arch}-{archive_format}"
     root.update(
         {
             "type": "application",
@@ -447,6 +448,18 @@ def normalize_sbom(
             if not isinstance(target, str):
                 die("cargo-sbom output contains an invalid dependency target")
             targets.add(target)
+    root_refs = {
+        child["bom-ref"]
+        for child in root.get("components", [])
+        if isinstance(child, dict) and isinstance(child.get("bom-ref"), str)
+    }
+    if not root_refs:
+        root_refs = {
+            child["bom-ref"]
+            for child in components
+            if isinstance(child, dict) and isinstance(child.get("bom-ref"), str)
+        }
+    merged_dependencies.setdefault(artifact_id, set()).update(root_refs)
     data["dependencies"] = [
         {"ref": reference, "dependsOn": sorted(targets)}
         for reference, targets in sorted(merged_dependencies.items())
@@ -480,6 +493,7 @@ def main() -> int:
     parser.add_argument(
         "--project-dir", required=True, action="append", type=Path
     )
+    parser.add_argument("--extra-sbom", action="append", type=Path, default=[])
     parser.add_argument("--features", default="")
     parser.add_argument("--no-default-features", action="store_true")
     parser.add_argument("--source-date-epoch", required=True, type=int)
@@ -501,6 +515,7 @@ def main() -> int:
         ("linux", "aarch64"): "aarch64-unknown-linux-gnu",
         ("macos", "aarch64"): "aarch64-apple-darwin",
         ("macos", "x86_64"): "x86_64-apple-darwin",
+        ("windows", "x86_64"): "x86_64-pc-windows-msvc",
     }.get((args.target_os, args.target_arch))
     if expected_target is None or args.target != expected_target:
         die("target triple does not match the requested OS and architecture")
@@ -548,6 +563,8 @@ def main() -> int:
                 allowed,
             )
         )
+    for extra in args.extra_sbom:
+        documents.append(json.loads(extra.read_text()))
     raw = merge_sboms(documents)
     normalized = normalize_sbom(
         raw,

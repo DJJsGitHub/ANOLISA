@@ -1,10 +1,7 @@
 //! Private configuration publication for selected Agents and explicit policy templates.
 
-use crate::{
-    filesystem as paths,
-    install::{selected_receipts, verified_files},
-    require, Result,
-};
+use crate::{filesystem as paths, require, Result};
+mod installed;
 mod templates;
 
 use serde_json::Value;
@@ -23,7 +20,7 @@ pub struct Settings<'a> {
     pub state: &'a Path,
     /// Explicit policy selection; installed Providers are never enabled implicitly.
     pub policy: Policy<'a>,
-    /// Qoder CLI 1.1.64 executable.
+    /// Qoder CLI >=1.1.64 executable with compatible native command Hooks.
     pub qoder: Option<&'a Path>,
     /// Node executable used by the pinned OpenClaw installation.
     pub node: Option<&'a Path>,
@@ -79,7 +76,6 @@ pub(crate) fn configure_using(
         node,
         openclaw,
     } = settings;
-    let _lock = paths::shared_lock(prefix)?;
     let mut names = vec!["aw-core"];
     if matches!(policy, Policy::Tokenless | Policy::SecCoreTokenless { .. }) {
         names.push("aw-provider-tokenless");
@@ -91,7 +87,8 @@ pub(crate) fn configure_using(
         names.push("aw-provider-sec-core");
     }
 
-    let installed = selected_receipts(prefix, Some(&names))?;
+    let selection = installed::Selection::read(prefix, &names)?;
+    let installed = &selection.packages;
     require(
         installed.contains_key("aw-core"),
         "install AW core before configuring",
@@ -111,7 +108,7 @@ pub(crate) fn configure_using(
             "install the Tokenless Provider before selecting its template",
         )?;
     }
-    verified_files(prefix, &installed)?;
+    selection.verify(prefix)?;
     for path in [*config, *state] {
         paths::absolute(path)?;
     }
@@ -161,11 +158,31 @@ pub(crate) fn configure_using(
             entrypoint(Path::new(program), libc::X_OK, "executable")?;
         }
     }
-    let value = document(settings)?;
+    let mut value = document(settings)?;
+    if let Some(component) = installed.get("aw-provider-tokenless") {
+        let name = "libexec/aw/providers/tokenless/rtk";
+        require(
+            std::env::join_paths([prefix.join("libexec/aw/providers/tokenless")]).is_ok(),
+            "managed RTK directory cannot be represented in PATH",
+        )?;
+        let payload = component.files.get(name).ok_or_else(|| {
+            crate::Error::Invalid("installed Tokenless package record lacks managed RTK".into())
+        })?;
+        value["spec"]["providers"]["tokenless"]["transport"]["argv"]
+            .as_array_mut()
+            .ok_or_else(|| crate::Error::Invalid("Tokenless argv must be an array".into()))?
+            .extend([
+                serde_json::json!("--rtk"),
+                serde_json::json!(prefix.join(name)),
+                serde_json::json!("--rtk-sha256"),
+                serde_json::json!(payload.sha256),
+            ]);
+    }
     let yaml = serde_yaml_ng::to_string(&value)?;
     aw_config::Validator::new()
         .and_then(|validator| validator.parse(yaml.as_bytes()))
         .map_err(|error| crate::Error::Invalid(error.to_string()))?;
+    selection.verify(prefix)?;
     publish(config, yaml.as_bytes())
 }
 

@@ -33,19 +33,22 @@ pub(super) fn document(settings: &Settings<'_>) -> Result<Value> {
         Policy::SecCore { socket } | Policy::SecCoreTokenless { socket } => {
             let provider = settings.prefix.join("libexec/aw/providers/sec-core");
             let mut tools = json!({});
+            let mut selectors = Vec::new();
             if settings.qoder.is_some() {
+                selectors.push("native:qoder:Bash");
                 tools["Bash"] = json!({"language":"bash","input_pointer":"/command"});
             }
             if settings.openclaw.is_some() {
+                selectors.push("native:openclaw:exec");
                 tools["exec"] = json!({"language":"bash","input_pointer":"/command"});
             }
             value["spec"]["providers"]["security"] = json!({
                 "protocol":"aw-provider/v1alpha1",
                 "transport":{"type":"stdio","location":"agent","argv":[provider.join("aw-provider-sec-core"),"--cli",provider.join("agent-sec-cli"),"--socket",socket]},
                 "timeout_ms":2000,"max_output_bytes":4096,
-                "config":{"version":1,"mode":"block","tools":tools}});
+                "config":{"version":1,"mode":"block","unmapped_tool":"error","tools":tools}});
             value["spec"]["events"] = json!({
-                "tool.before":{"enabled":true,"required":true,"steps":[{"id":"scan-code","provider":"security","operation":"scan_code","effects":["observe","block"],"on_error":"block"}]},
+                "tool.before":{"enabled":true,"required":true,"steps":[{"id":"scan-code","match":{"tools":selectors},"provider":"security","operation":"scan_code","effects":["observe","block"],"on_error":"block"}]},
                 "tool.after":{"enabled":true,"required":true,"steps":[{"id":"observe-completion","provider":"security","operation":"observe_tool","effects":["observe"],"on_error":"report"}]}});
         }
         Policy::Command {
@@ -87,6 +90,22 @@ pub(super) fn document(settings: &Settings<'_>) -> Result<Value> {
         value["spec"]["providers"]["tokenless"] = json!({
             "protocol":"aw-provider/v1alpha1", "transport":{"type":"stdio","location":"agent","argv":[provider.join("aw-provider-tokenless"),"--cli",provider.join("tokenless"),"--data-dir",settings.state.join("tokenless")]},
             "timeout_ms":2000,"max_output_bytes":1048576,"config":{"version":1}});
+        let mut view_argv = value["spec"]["providers"]["tokenless"]["transport"]["argv"]
+            .as_array()
+            .ok_or_else(|| crate::Error::Invalid("Tokenless argv must be an array".into()))?
+            .clone();
+        view_argv.insert(1, json!("--view"));
+        value["spec"]["providers"]["tokenless"]["view"] = json!({
+            "protocol":"aw-provider-view/v1alpha1","implementation":"tokenless",
+            "transport":{"type":"stdio","location":"agent","argv":view_argv}});
+        if value["spec"]["events"]["tool.before"].is_null() {
+            value["spec"]["events"]["tool.before"] =
+                json!({"enabled":true,"required":true,"steps":[]});
+        }
+        value["spec"]["events"]["tool.before"]["steps"]
+            .as_array_mut()
+            .ok_or_else(|| crate::Error::Invalid("tool.before steps must be an array".into()))?
+            .push(json!({"id":"rewrite-command","provider":"tokenless","operation":"pre_tool","effects":["block"],"on_error":"report"}));
         if value["spec"]["events"]["tool.after"].is_null() {
             value["spec"]["events"]["tool.after"] =
                 json!({"enabled":true,"required":true,"steps":[]});

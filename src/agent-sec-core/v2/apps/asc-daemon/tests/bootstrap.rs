@@ -54,7 +54,8 @@ fn configured_command(directory: &Path) -> Command {
     std::fs::write(
         &config,
         serde_json::to_vec(&serde_json::json!({
-            "stateDir": directory.join("state")
+            "stateDir": directory.join("state"),
+            "enableDefaultSkillDirs": false
         }))
         .unwrap(),
     )
@@ -179,6 +180,44 @@ async fn dproc_002_003_and_partial_013_binary_registers_pap_and_cleans_socket() 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn dproc_configured_administrator_can_query_without_root() {
     run_binary_scenario(true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dproc_023_unsafe_policy_directory_reports_metadata_before_socket_admission() {
+    let directory = create_runtime_directory();
+    let socket_path = directory.join("daemon.sock");
+    let log = directory.join("log");
+    let data = log.join("agent-sec");
+    std::fs::create_dir_all(&data).unwrap();
+    std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::set_permissions(&log, std::fs::Permissions::from_mode(0o775)).unwrap();
+    let child = configured_command(&directory)
+        .env("AGENT_SEC_DATA_DIR", &data)
+        .args(["serve", "--socket"])
+        .arg(&socket_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(stderr_log(&directory))
+        .spawn()
+        .unwrap();
+    let mut running = RunningBinary {
+        child,
+        directory,
+        socket_path,
+    };
+    assert!(!wait_for_exit(&mut running).await.success());
+    let stderr = read_stderr(&running.directory);
+    for expected in [
+        log.display().to_string(),
+        "uid=".into(),
+        "gid=".into(),
+        "mode=0775".into(),
+        "without group/other write".into(),
+    ] {
+        assert!(stderr.contains(&expected), "{stderr}");
+    }
+    assert!(!data.join("policy-state.db").exists());
+    assert!(!running.socket_path.exists());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

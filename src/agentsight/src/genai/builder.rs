@@ -27,6 +27,34 @@ pub struct BuildOutput {
     pub pending_response_id: Option<String>,
 }
 
+impl BuildOutput {
+    /// Transfer serialized bodies after HTTP persistence and semantic parsing.
+    pub(crate) fn take_raw_bodies(&mut self, results: &mut [AnalysisResult]) {
+        let Some(GenAISemanticEvent::LLMCall(call)) = self.events.first_mut() else {
+            return;
+        };
+        let Some(http) = results.iter_mut().find_map(|result| match result {
+            AnalysisResult::Http(http) => Some(http),
+            AnalysisResult::HttpContext(context) => Some(&mut context.http),
+            _ => None,
+        }) else {
+            return;
+        };
+        call.request.raw_body = take_serialized_body(&mut http.request_body);
+        call.response.raw_body = take_serialized_body(&mut http.response_body);
+    }
+}
+
+fn take_serialized_body(body: &mut Option<String>) -> Option<String> {
+    let mut body = body.take()?;
+    // Serializer growth can leave almost twice the payload capacity. Do not
+    // carry that spare allocation through session waiting and callbacks.
+    if body.capacity() > body.len().saturating_add(body.len() / 4) {
+        body.shrink_to_fit();
+    }
+    Some(body)
+}
+
 /// Builder that constructs GenAI semantic events from AnalysisResult
 pub struct GenAIBuilder {
     /// Session ID prefix (timestamp-based, unique per agentsight run)
@@ -82,6 +110,40 @@ impl GenAIBuilder {
         format!("pmk-{:x}", hasher.finalize())
     }
 
+    pub(super) fn pending_match_key_json(
+        pid: u32,
+        timestamp: u64,
+        method: &str,
+        path: &str,
+        body: &serde_json::Value,
+    ) -> String {
+        struct HashWriter<'a>(&'a mut Sha256);
+        impl std::io::Write for HashWriter<'_> {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.update(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut hasher = Sha256::new();
+        hasher.update(b"agentsight-pending-v1\0");
+        for value in [
+            pid.to_string(),
+            timestamp.to_string(),
+            method.to_owned(),
+            path.to_owned(),
+        ] {
+            hasher.update(value.as_bytes());
+            hasher.update(b"\0");
+        }
+        if let Err(error) = serde_json::to_writer(HashWriter(&mut hasher), body) {
+            log::warn!("Cannot hash parsed request body: {error}");
+        }
+        format!("pmk-{:x}", hasher.finalize())
+    }
+
     fn parsed_request_match_body(
         request: &ParsedRequest,
         body: Option<&serde_json::Value>,
@@ -115,21 +177,99 @@ impl GenAIBuilder {
         response_mapper: &ResponseSessionMapper,
         pid_agent_name_cache: &impl PidAgentNameCache,
     ) -> (BuildOutput, Option<PendingCallInfo>) {
+        self.build_for_delivery(results, response_mapper, pid_agent_name_cache, true)
+    }
+
+    /// Build semantic delivery without pending-row copies when no SQLite sink exists.
+    pub(crate) fn build_for_delivery(
+        &self,
+        results: &[AnalysisResult],
+        response_mapper: &ResponseSessionMapper,
+        pid_agent_name_cache: &impl PidAgentNameCache,
+        need_pending: bool,
+    ) -> (BuildOutput, Option<PendingCallInfo>) {
+        self.build_delivery(
+            results,
+            response_mapper,
+            pid_agent_name_cache,
+            need_pending,
+            true,
+        )
+    }
+
+    /// Build without body copies; move bodies with `BuildOutput::take_raw_bodies`
+    /// only after deciding whether the original HTTP record is needed for fallback.
+    pub(crate) fn build_for_owned_delivery(
+        &self,
+        results: &[AnalysisResult],
+        response_mapper: &ResponseSessionMapper,
+        pid_agent_name_cache: &impl PidAgentNameCache,
+        need_pending: bool,
+    ) -> (BuildOutput, Option<PendingCallInfo>) {
+        self.build_delivery(
+            results,
+            response_mapper,
+            pid_agent_name_cache,
+            need_pending,
+            false,
+        )
+    }
+
+    fn build_delivery(
+        &self,
+        results: &[AnalysisResult],
+        response_mapper: &ResponseSessionMapper,
+        pid_agent_name_cache: &impl PidAgentNameCache,
+        need_pending: bool,
+        copy_raw: bool,
+    ) -> (BuildOutput, Option<PendingCallInfo>) {
         let timer = StageTimer::start("genai");
         let mut events = Vec::new();
         let mut pending: Option<PendingCallInfo> = None;
         let mut pending_response_id = None;
 
-        if let Some(llm_call) = self.build_llm_call(results, response_mapper, pid_agent_name_cache)
-        {
+        let resource_only = results.iter().any(|r| {
+            matches!(r,
+            AnalysisResult::Abandoned(reason) if reason.metadata_only())
+        });
+        if let Some(mut llm_call) = if resource_only {
+            self.build_resource_metadata(results, response_mapper, pid_agent_name_cache)
+        } else {
+            self.build_llm_call_with_raw(results, response_mapper, pid_agent_name_cache, copy_raw)
+        } {
+            if let Some(reason) = results.iter().find_map(|result| match result {
+                AnalysisResult::Abandoned(reason) => Some(*reason),
+                _ => None,
+            }) {
+                llm_call
+                    .metadata
+                    .insert("abandon_reason".into(), reason.as_str().into());
+                llm_call.metadata.insert("incomplete".into(), "true".into());
+                if reason == crate::aggregator::RemoveReason::OverBudget {
+                    llm_call.metadata.insert("truncated".into(), "true".into());
+                }
+                if llm_call.response.messages.is_empty() {
+                    llm_call.response.messages.push(OutputMessage {
+                        role: "assistant".into(),
+                        parts: Vec::new(),
+                        name: None,
+                        finish_reason: Some("incomplete".into()),
+                    });
+                } else {
+                    for message in &mut llm_call.response.messages {
+                        message.finish_reason = Some("incomplete".into());
+                    }
+                }
+            }
             // Build PendingCallInfo from the same LLMCall before moving it
             let http_record = results.iter().find_map(|r| match r {
-                AnalysisResult::Http(h) => Some(h.clone()),
+                AnalysisResult::Http(h) => Some(h),
+                AnalysisResult::HttpContext(context) => Some(&context.http),
                 _ => None,
             });
 
             // Extract input messages for the pending record
-            let (input_messages_json, system_instructions_json) = {
+            let (input_messages_json, system_instructions_json) = if need_pending {
                 let sys: Vec<_> = llm_call
                     .request
                     .messages
@@ -150,6 +290,8 @@ impl GenAIBuilder {
                         serde_json::to_string(&sys).ok()
                     },
                 )
+            } else {
+                (None, None)
             };
 
             // Determine response_id from call metadata (may come from parsed_message
@@ -165,9 +307,25 @@ impl GenAIBuilder {
                     .get_session_by_pid(llm_call.pid as u32)
                     .is_some();
 
+            let request_session = results.iter().any(|result| match result {
+                AnalysisResult::Message(message) => message.request_metadata_session_id().is_some(),
+                AnalysisResult::HttpContext(context) => context
+                    .request
+                    .as_ref()
+                    .and_then(|request| request.get("metadata"))
+                    .and_then(crate::analyzer::message::types::session_id_from_metadata)
+                    .is_some(),
+                _ => false,
+            });
+
             // If response_id exists but mapper didn't resolve session_id, queue
             // for deferred resolution so the next FileWrite event can fix it.
-            if response_id.is_some() && !mapper_hit {
+            if response_id.is_some()
+                && response_mapper.is_enabled()
+                && !request_session
+                && !mapper_hit
+                && !llm_call.metadata.contains_key("abandon_reason")
+            {
                 pending_response_id = response_id;
                 log::debug!(
                     "GenAI response_id {} not yet in mapper, will defer session_id resolution",
@@ -175,7 +333,7 @@ impl GenAIBuilder {
                 );
             }
 
-            pending = Some(PendingCallInfo {
+            pending = need_pending.then(|| PendingCallInfo {
                 call_id: llm_call.call_id.clone(),
                 trace_id: llm_call.metadata.get("response_id").cloned(),
                 conversation_id: llm_call.metadata.get("conversation_id").cloned(),
@@ -271,9 +429,22 @@ impl GenAIBuilder {
             match_body.as_deref(),
         );
 
-        // Determine if streaming
-        let is_sse = body
+        // A SysOM POP request wraps the LLM parameters in a JSON string
+        // (`llmParamString`). The match key above deliberately keeps the raw
+        // outer body (the completing call builds the same key from it), but
+        // every field below is an LLM parameter and has to come from the
+        // decoded object: reading the wrapper left `stream`, `model`, the
+        // messages and the conversation keys empty on every drained SysOM
+        // call.
+        let decoded_llm_body = body
             .as_ref()
+            .and_then(|value| value.get("llmParamString"))
+            .and_then(|value| value.as_str())
+            .and_then(|params| serde_json::from_str::<serde_json::Value>(params).ok());
+        let llm_body = decoded_llm_body.as_ref().or(body.as_ref());
+
+        // Determine if streaming
+        let is_sse = llm_body
             .and_then(|v| v.get("stream"))
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
@@ -297,10 +468,7 @@ impl GenAIBuilder {
             first_user_text,
             last_user_text,
             user_message_count,
-        ) = if let Some(view) = body
-            .as_ref()
-            .and_then(crate::parser::llm::extract_messages_view)
-        {
+        ) = if let Some(view) = llm_body.and_then(crate::parser::llm::extract_messages_view) {
             let (messages, instructions_text) = view;
 
             // First user message raw text — used as `session_key` material
@@ -366,8 +534,7 @@ impl GenAIBuilder {
             super::helpers::classify_call_kind_from_raw(&system_instructions, &first_user_text);
 
         // Extract model from request body JSON "model" field
-        let model = body
-            .as_ref()
+        let model = llm_body
             .and_then(|v| v.get("model"))
             .and_then(|m| m.as_str())
             .filter(|s| !s.is_empty())
@@ -389,10 +556,16 @@ impl GenAIBuilder {
         .or_else(|| Some(request.source_event.comm_str()));
 
         // 从 request body.metadata 提取 session_id（复用 types.rs 共享函数）
-        let metadata_session: Option<String> = body
-            .as_ref()
+        let metadata_session: Option<String> = llm_body
             .and_then(|b| b.get("metadata"))
-            .and_then(crate::analyzer::message::types::session_id_from_metadata);
+            .and_then(crate::analyzer::message::types::session_id_from_metadata)
+            // The wrapper may carry metadata beside `llmParamString`; decoding
+            // the parameters must not hide it.
+            .or_else(|| {
+                body.as_ref()
+                    .and_then(|b| b.get("metadata"))
+                    .and_then(crate::analyzer::message::types::session_id_from_metadata)
+            });
 
         // 双层兜底计算 session_id / conversation_id（详见上方注释）。
         // 这里不使用 unwrap_or_else(|| "") 是为了让“同 PID 同 agent”上下文下
@@ -623,7 +796,7 @@ impl GenAIBuilder {
             parts = native_parts;
             finish_reason = native_finish;
         }
-        let output_messages = if parts.is_empty() {
+        let output_messages = if parts.is_empty() && finish_reason.is_none() {
             None
         } else {
             serde_json::to_string(&vec![OutputMessage {
@@ -679,6 +852,35 @@ mod tests {
     use crate::genai::semantic::MessagePart;
     use crate::probes::sslsniff::SslEvent;
     use std::rc::Rc;
+
+    #[test]
+    fn payload_memory_delivery_does_not_defer_explicit_openai_request_session() {
+        let request = make_request(
+            "/v1/chat/completions",
+            r#"{"model":"fixture","messages":[{"role":"user","content":"hello"}],"metadata":{"session_id":"session-fixture"}}"#,
+        );
+        let result = crate::aggregator::AggregatedResult::RequestOnly {
+            connection_id: ConnectionId {
+                pid: 1234,
+                ssl_ptr: 1,
+            },
+            request,
+        };
+        let analysis = crate::analyzer::Analyzer::new().analyze_for_delivery(&result, false);
+        let (output, _) = GenAIBuilder::new().build_with_pending(
+            &analysis,
+            &ResponseSessionMapper::new(),
+            &std::collections::HashMap::new(),
+        );
+        assert!(output.pending_response_id.is_none());
+        let GenAISemanticEvent::LLMCall(call) = &output.events[0] else {
+            panic!("expected LLM call")
+        };
+        assert_eq!(
+            call.metadata.get("session_id").map(String::as_str),
+            Some("session-fixture")
+        );
+    }
 
     fn make_request(path: &str, body: &str) -> ParsedRequest {
         let buf = body.as_bytes().to_vec();
@@ -764,6 +966,34 @@ mod tests {
         }
     }
 
+    /// A drained Responses capture that attached after the deltas holds only
+    /// the closing events. The enrichment is what the pending row persists,
+    /// so it must carry the answer instead of writing `output_messages = NULL`.
+    #[test]
+    fn test_extract_sse_enrichment_keeps_a_closing_responses_answer() {
+        let events = vec![
+            make_sse_event(
+                r#"{"type":"response.created","response":{"id":"resp_close","model":"gpt-5"}}"#,
+            ),
+            make_sse_event(r#"{"type":"response.output_text.done","text":"hello there"}"#),
+            make_sse_event(
+                r#"{"type":"response.completed","response":{"id":"resp_close","status":"completed"}}"#,
+            ),
+        ];
+        let enrichment = GenAIBuilder::extract_sse_enrichment(&events).expect("enrichment");
+        let json = enrichment
+            .output_messages
+            .expect("a closing Responses answer must persist");
+        let parsed: Vec<OutputMessage> =
+            serde_json::from_str(&json).expect("must round-trip as Vec<OutputMessage>");
+        assert_eq!(parsed.len(), 1);
+        assert!(
+            matches!(&parsed[0].parts[0], MessagePart::Text { content } if content == "hello there"),
+            "got {:?}",
+            parsed[0].parts
+        );
+    }
+
     /// The drain enrichment must carry the cache counters the stream reported,
     /// as the provider reported them: Anthropic's terminal usage keeps them
     /// outside `input_tokens`, while OpenAI-style usage counts the cached part
@@ -805,6 +1035,87 @@ mod tests {
             "the reported prompt_tokens already include the cached part"
         );
         assert_eq!(enrichment.cache_read_tokens, Some(64));
+    }
+
+    /// A drained stream whose only content is a provider-side call
+    /// (`server_tool_use` / `mcp_tool_use`) persisted no output at all: the
+    /// merger folded the block into its text accumulator, so the call and
+    /// every `input_json_delta` fragment aimed at it were dropped and
+    /// `output_messages` stayed `None` — and with it the `tool_call_ids` the
+    /// pending row derives from it. The same stream captured live kept the
+    /// call, so the two paths disagreed on one response.
+    #[test]
+    fn test_extract_sse_enrichment_keeps_a_server_tool_call() {
+        let events = vec![
+            make_sse_event(
+                r#"{"type":"message_start","message":{"id":"msg_srv","type":"message","role":"assistant","model":"claude-sonnet-4-5","content":[],"usage":{"input_tokens":10,"output_tokens":0}}}"#,
+            ),
+            make_sse_event(
+                r#"{"type":"content_block_start","index":0,"content_block":{"type":"server_tool_use","id":"srvtoolu_1","name":"web_search","input":{}}}"#,
+            ),
+            make_sse_event(
+                r#"{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"query\":"}}"#,
+            ),
+            make_sse_event(
+                r#"{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"\"rust\"}"}}"#,
+            ),
+            make_sse_event(r#"{"type":"content_block_stop","index":0}"#),
+            make_sse_event(
+                r#"{"type":"content_block_start","index":1,"content_block":{"type":"mcp_tool_use","id":"mcptoolu_1","name":"github_search","input":{}}}"#,
+            ),
+            make_sse_event(
+                r#"{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"q\":\"drain\"}"}}"#,
+            ),
+            make_sse_event(r#"{"type":"content_block_stop","index":1}"#),
+            make_sse_event(
+                r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":5}}"#,
+            ),
+        ];
+        let enrichment = GenAIBuilder::extract_sse_enrichment(&events).expect("enrichment");
+        let json = enrichment
+            .output_messages
+            .expect("a drained server-tool turn must keep its calls");
+        let parsed: Vec<OutputMessage> =
+            serde_json::from_str(&json).expect("must round-trip as Vec<OutputMessage>");
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].finish_reason.as_deref(), Some("end_turn"));
+        let calls: Vec<(&str, &str, &serde_json::Value)> = parsed[0]
+            .parts
+            .iter()
+            .filter_map(|part| match part {
+                MessagePart::ToolCall {
+                    id,
+                    name,
+                    arguments,
+                } => Some((
+                    id.as_deref().unwrap_or_default(),
+                    name.as_str(),
+                    arguments.as_ref().expect("the streamed input must parse"),
+                )),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            calls,
+            vec![
+                (
+                    "srvtoolu_1",
+                    "web_search",
+                    &serde_json::json!({"query": "rust"})
+                ),
+                (
+                    "mcptoolu_1",
+                    "github_search",
+                    &serde_json::json!({"q": "drain"})
+                ),
+            ],
+            "both provider-side calls must reach the pending row: {json}"
+        );
+        assert_eq!(
+            crate::genai::semantic::tool_call_ids_json(&parsed).as_deref(),
+            Some(r#"["srvtoolu_1","mcptoolu_1"]"#),
+            "the tool_call_ids column is derived from these parts"
+        );
     }
 
     #[test]
@@ -941,6 +1252,24 @@ mod tests {
         )];
         let enrichment = GenAIBuilder::extract_sse_enrichment(&events).unwrap();
         assert!(enrichment.output_messages.is_none());
+    }
+
+    #[test]
+    fn test_extract_sse_enrichment_keeps_terminal_only_gemini_reason() {
+        let events = vec![make_sse_event(
+            r#"{"candidates":[{"finishReason":"SAFETY","index":0}]}"#,
+        )];
+        let enrichment = GenAIBuilder::extract_sse_enrichment(&events).expect("enrichment");
+        let messages: Vec<OutputMessage> = serde_json::from_str(
+            enrichment
+                .output_messages
+                .as_deref()
+                .expect("output messages"),
+        )
+        .expect("parsed output messages");
+        assert_eq!(messages.len(), 1);
+        assert!(messages[0].parts.is_empty());
+        assert_eq!(messages[0].finish_reason.as_deref(), Some("SAFETY"));
     }
 
     #[test]
@@ -1358,6 +1687,68 @@ mod tests {
         assert_eq!(pending.provider.as_deref(), Some("openai"));
         assert!(pending.system_instructions.is_some());
         assert!(pending.user_query.as_deref() == Some("hello"));
+    }
+
+    /// A SysOM POP request keeps its LLM parameters inside `llmParamString`.
+    /// The pending builder read the wrapper only, so a drained SysOM call
+    /// lost its model, streaming flag, messages and user query — every
+    /// conversation from one process then collapsed into the same crash
+    /// fallback bucket.
+    #[test]
+    fn test_build_pending_from_request_sysom_decodes_llm_params() {
+        let builder = GenAIBuilder::new();
+        let body = r#"{"llmParamString":"{\"model\":\"qwen3-coder-plus\",\"stream\":true,\"messages\":[{\"role\":\"system\",\"content\":\"sys\"},{\"role\":\"user\",\"content\":\"hello\"}]}"}"#;
+        let req = make_request("/api/v1/copilot/generate_copilot_stream_response", body);
+        let mapper = ResponseSessionMapper::new();
+        let cache = std::collections::HashMap::new();
+
+        let pending = builder
+            .build_pending_from_request(&req, &ConnectionId { pid: 1, ssl_ptr: 2 }, &mapper, &cache)
+            .expect("a SysOM POP request is an LLM call");
+
+        assert_eq!(pending.model.as_deref(), Some("qwen3-coder-plus"));
+        assert!(pending.is_sse, "stream:true lives inside llmParamString");
+        assert!(pending.system_instructions.is_some());
+        assert_eq!(pending.user_query.as_deref(), Some("hello"));
+        assert!(pending.input_messages.is_some());
+    }
+
+    /// Decoding must not hide metadata that sits on the wrapper rather than
+    /// inside `llmParamString`.
+    #[test]
+    fn test_build_pending_from_request_sysom_keeps_outer_metadata() {
+        let builder = GenAIBuilder::new();
+        let body = r#"{"llmParamString":"{\"model\":\"qwen\",\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}]}","metadata":{"session_id":"outer-session"}}"#;
+        let req = make_request("/api/v1/copilot/generate_copilot_stream_response", body);
+        let mapper = ResponseSessionMapper::new();
+        let cache = std::collections::HashMap::new();
+
+        let pending = builder
+            .build_pending_from_request(&req, &ConnectionId { pid: 1, ssl_ptr: 2 }, &mapper, &cache)
+            .expect("a SysOM POP request is an LLM call");
+
+        assert_eq!(pending.session_id.as_deref(), Some("outer-session"));
+        assert_eq!(pending.model.as_deref(), Some("qwen"));
+    }
+
+    /// A malformed `llmParamString` must fall back to the outer body instead
+    /// of failing the pending record.
+    #[test]
+    fn test_build_pending_from_request_sysom_malformed_params_fall_back() {
+        let builder = GenAIBuilder::new();
+        let body = r#"{"llmParamString":"not-json"}"#;
+        let req = make_request("/api/v1/copilot/generate_copilot_stream_response", body);
+        let mapper = ResponseSessionMapper::new();
+        let cache = std::collections::HashMap::new();
+
+        let pending = builder
+            .build_pending_from_request(&req, &ConnectionId { pid: 1, ssl_ptr: 2 }, &mapper, &cache)
+            .expect("the path still identifies a SysOM call");
+
+        assert!(pending.model.is_none());
+        assert!(pending.input_messages.is_none());
+        assert!(pending.user_query.is_none());
+        assert!(!pending.is_sse);
     }
 
     #[test]

@@ -134,6 +134,27 @@ impl Ledger {
         Ok(Some(manifest))
     }
 
+    pub fn repair_latest(
+        &self,
+        key: &SigningIdentity,
+        identity: &SkillIdentity,
+        deadline: Instant,
+    ) -> Result<bool, SkillSecError> {
+        let latest = self.latest(key, identity, false, deadline).ok().flatten();
+        let newest = self.newest(key, identity, false, deadline)?;
+        if let Some(manifest) = newest
+            && latest.as_ref() != Some(&manifest)
+            && self.snapshot(&manifest, deadline).is_ok()
+        {
+            check_deadline(deadline)?;
+            self.meta
+                .write_atomic("latest.json", &serde_json::to_vec(&manifest)?, true)?;
+            return Ok(true);
+        }
+        check_deadline(deadline)?;
+        Ok(false)
+    }
+
     pub fn next_id(
         &self,
         previous: Option<&Manifest>,

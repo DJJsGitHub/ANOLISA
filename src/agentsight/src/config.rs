@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 // ==================== Default Constants ====================
 
 /// Default LRU cache capacity for HTTP connections
-pub const DEFAULT_CONNECTION_CAPACITY: usize = 24;
+pub const DEFAULT_CONNECTION_CAPACITY: usize = 128;
 
 /// Default poll timeout for ring buffer polling (milliseconds)
 pub const DEFAULT_POLL_TIMEOUT_MS: u64 = 100;
@@ -69,8 +69,17 @@ pub const DEFAULT_EVENT_CHANNEL_MAX_BYTES: usize = 64 * 1024 * 1024;
 /// Default maximum number of pending GenAI events waiting for session_id resolution.
 pub const DEFAULT_PENDING_GENAI_MAX_COUNT: usize = 1_000;
 
-/// Default maximum bytes for pending GenAI events waiting for session_id resolution (64 MB).
-pub const DEFAULT_PENDING_GENAI_MAX_BYTES: usize = 64 * 1024 * 1024;
+/// Default maximum bytes for pending GenAI events waiting for session_id resolution (16 MiB).
+pub const DEFAULT_PENDING_GENAI_MAX_BYTES: usize = 16 * 1024 * 1024;
+
+/// Combined HTTP/1 connection and HTTP/2 stream payload budget.
+pub const DEFAULT_CONNECTION_MAX_BYTES: usize = 64 * 1024 * 1024;
+/// Payload budget retained until FFI callbacks return.
+pub const DEFAULT_FFI_CHANNEL_MAX_BYTES: usize = 64 * 1024 * 1024;
+/// Maximum inactivity before in-flight state is finalized as incomplete.
+pub const DEFAULT_CONNECTION_HARD_TIMEOUT_SECS: u64 = 300;
+/// Per-stream retained SSE payload limit.
+pub const DEFAULT_MAX_SSE_RETAINED_BYTES: usize = 2 * 1024 * 1024;
 
 /// Default PID → agent_name cache size.
 pub const DEFAULT_PID_CACHE_SIZE: usize = 1024;
@@ -88,7 +97,7 @@ pub const DEFAULT_MAX_CONNECTION_BODY_BYTES: usize = 8 * 1024 * 1024;
 pub const DEFAULT_CONNECTION_IDLE_TIMEOUT_SECS: u64 = 60;
 
 /// Default eBPF ring buffer size in MiB.
-pub const DEFAULT_RING_BUFFER_MB: usize = 32;
+pub const DEFAULT_RING_BUFFER_MB: usize = 64;
 
 pub const HF_ENDPOINT: &str = "https://hf-mirror.com";
 
@@ -222,7 +231,7 @@ const DEFAULT_AGENTS_JSON: &str = include_str!("../agentsight.json");
 /// At startup the on-disk config's `schema_version` is compared against this
 /// value. If the on-disk version is missing or older, the config file is
 /// backed up (`.bak`) and overwritten with the embedded default.
-pub const CURRENT_SCHEMA_VERSION: u32 = 4;
+pub const CURRENT_SCHEMA_VERSION: u32 = 5;
 
 // ==================== TCP Target Configuration ====================
 
@@ -673,7 +682,7 @@ pub struct JsonTrajectoryCollectionFeature {
     pub enabled: Option<bool>,
     #[serde(default)]
     pub scan_interval_secs: Option<u64>,
-    /// Optional override of the projects directories to scan.
+    /// 可选的会话根目录、Claude 工作区父目录或 Hermes 数据库位置。
     #[serde(default)]
     pub scan_dirs: Option<Vec<String>>,
 }
@@ -682,6 +691,10 @@ pub struct JsonTrajectoryCollectionFeature {
 #[derive(serde::Deserialize, Clone, Debug, Default)]
 #[serde(default)]
 pub struct JsonRuntimeLimits {
+    /// Cooperative process CPU target: 100 means one logical CPU, 0 disables pacing.
+    pub cpu_budget_percent: Option<u8>,
+    /// HTTP connection LRU entries; configure at least the expected concurrent connections.
+    pub connection_capacity: Option<usize>,
     pub event_channel_capacity: Option<usize>,
     #[serde(default)]
     pub event_channel_policy: Option<String>,
@@ -693,6 +706,16 @@ pub struct JsonRuntimeLimits {
     pub pid_cache_size: Option<usize>,
     pub max_connection_body_mb: Option<usize>,
     pub connection_idle_timeout_secs: Option<u64>,
+    /// Combined HTTP/1 and HTTP/2 retained payload budget in MiB.
+    pub connection_max_bytes_mb: Option<usize>,
+    /// FFI queue and active callback payload budget in MiB.
+    pub ffi_channel_max_bytes_mb: Option<usize>,
+    /// Inactivity limit for finalizing unfinished calls.
+    pub connection_hard_timeout_secs: Option<u64>,
+    /// Retained SSE state limit per stream in MiB.
+    pub max_sse_retained_mb: Option<usize>,
+    /// Keep raw SSE event sequences instead of reducing deltas.
+    pub retain_raw_sse: Option<bool>,
     /// eBPF ring buffer size in MiB. Must be a power-of-two multiple of the page
     /// size (common valid values: 8, 16, 32, 64). Loaded from `agentsight.json`
     /// and applied at BPF load time via `bpf_map__set_max_entries`.
@@ -812,7 +835,7 @@ fn extract_rules(parsed: &JsonFullConfig) -> (Vec<CmdlineRule>, Vec<HttpsRule>, 
 /// boundaries take the same one-mark rule, so a marked config parses as the
 /// config it is. Only the first mark is the format's: a second one is data
 /// and still fails the parse.
-fn strip_leading_bom(content: &str) -> &str {
+pub(crate) fn strip_leading_bom(content: &str) -> &str {
     content.strip_prefix('\u{feff}').unwrap_or(content)
 }
 
@@ -831,9 +854,10 @@ pub fn parse_json_rules(
 ///
 /// - If the file does not exist, creates it with the embedded default.
 /// - If the file exists but `schema_version` is missing or older than
-///   `CURRENT_SCHEMA_VERSION`, backs up the old file and replaces it with the
-///   embedded default.
-/// - If the file exists and `schema_version` matches, leaves it untouched.
+///   `CURRENT_SCHEMA_VERSION`, backs up the old file and shallow-merges its
+///   top-level settings into the embedded default.
+/// - If the file exists and `schema_version` matches or exceeds the current
+///   version, leaves it untouched.
 pub fn ensure_default_agents_config(path: &Path) -> anyhow::Result<()> {
     if !path.exists() {
         if let Some(parent) = path.parent() {
@@ -862,15 +886,37 @@ pub fn ensure_default_agents_config(path: &Path) -> anyhow::Result<()> {
     // *valid* JSON whose schema_version is outdated; silently overwriting an
     // invalid file masks the parse error and breaks the documented fallback
     // contract (see issue #1502).
-    if serde_json::from_str::<serde_json::Value>(content).is_err() {
-        return Ok(());
-    }
+    let user: serde_json::Value = match serde_json::from_str(content) {
+        Ok(user) => user,
+        Err(_) => return Ok(()),
+    };
 
     let on_disk_version = extract_schema_version(content);
 
     if on_disk_version >= Some(CURRENT_SCHEMA_VERSION) {
         return Ok(());
     }
+
+    // Overlay user top-level keys on the defaults so existing customizations
+    // survive while newly introduced sections are added.
+    let mut base: serde_json::Value = serde_json::from_str(DEFAULT_AGENTS_JSON)
+        .context("Embedded DEFAULT_AGENTS_JSON is invalid")?;
+
+    if let (Some(base_obj), Some(user_obj)) = (base.as_object_mut(), user.as_object()) {
+        for (key, value) in user_obj {
+            if key == "schema_version" {
+                continue;
+            }
+            base_obj.insert(key.clone(), value.clone());
+        }
+        base_obj.insert(
+            "schema_version".to_string(),
+            serde_json::Value::Number(CURRENT_SCHEMA_VERSION.into()),
+        );
+    }
+
+    let merged =
+        serde_json::to_string_pretty(&base).context("Failed to serialize merged agents config")?;
 
     let backup = {
         let ts = std::time::SystemTime::now()
@@ -881,10 +927,10 @@ pub fn ensure_default_agents_config(path: &Path) -> anyhow::Result<()> {
     };
     std::fs::copy(path, &backup)
         .with_context(|| format!("Failed to back up {path:?} to {backup:?}"))?;
-    std::fs::write(path, DEFAULT_AGENTS_JSON)
-        .with_context(|| format!("Failed to replace outdated config at {path:?}"))?;
+    std::fs::write(path, &merged)
+        .with_context(|| format!("Failed to write merged config to {path:?}"))?;
     log::info!(
-        "Config schema_version {on_disk_version:?} < {CURRENT_SCHEMA_VERSION}, replaced it with defaults at {path:?} (backup at {backup:?})"
+        "Config schema_version {on_disk_version:?} < {CURRENT_SCHEMA_VERSION}, merged user config with defaults at {path:?} (backup at {backup:?})"
     );
     Ok(())
 }
@@ -924,12 +970,12 @@ pub fn chrome_trace() -> bool {
 /// Policy applied when a bounded event channel is full.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ChannelPolicy {
-    /// Block the producer until space is available (backpressure).
+    /// Wait for an available channel slot after byte admission.
     #[default]
     Backpressure,
     /// Drop the newest event and log a warning.
     DropNewest,
-    /// Sample events: keep roughly 1 in N when overloaded.
+    /// Keep every Nth event when sampling is explicitly configured.
     Sample(usize),
 }
 
@@ -980,11 +1026,11 @@ pub struct FeatureFlags {
     pub token_consumption_enabled: bool,
     /// SLS Logtail export.
     pub sls_logtail_enabled: bool,
-    /// Qoder/QoderWork trajectory collection (scan + ATIF convert + persist).
+    /// Local JSONL and Hermes trajectory collection (scan + ATIF + persist).
     pub trajectory_collection_enabled: bool,
     /// Seconds between two trajectory scan rounds.
     pub trajectory_scan_interval_secs: u64,
-    /// Optional override of the trajectory projects directories to scan.
+    /// 可选的会话根目录、Claude 工作区父目录或 Hermes 数据库位置。
     pub trajectory_scan_dirs: Option<Vec<String>>,
     /// Whether a model may be asked to label collected trajectories.
     ///
@@ -1036,6 +1082,8 @@ impl Default for BatchConfig {
 /// Resource limits to prevent in-memory buffering leaks.
 #[derive(Debug, Clone, Copy)]
 pub struct RuntimeLimits {
+    /// Cooperative process CPU target as a percentage of one logical CPU; 0 disables pacing.
+    pub cpu_budget_percent: u8,
     /// Bounded channel capacity between probes and the event loop.
     pub event_channel_capacity: usize,
     /// Policy when the event channel is full.
@@ -1054,15 +1102,29 @@ pub struct RuntimeLimits {
     pub pid_cache_size: usize,
     /// Max bytes buffered per HTTP connection.
     pub max_connection_body_bytes: usize,
-    /// Idle timeout before an HTTP connection state is dropped.
+    /// Soft inactivity timeout for pending snapshots and empty connections.
     pub connection_idle_timeout_secs: u64,
+    /// Combined HTTP/1 and HTTP/2 retained payload budget.
+    pub connection_max_bytes: usize,
+    /// FFI payload budget, including callbacks currently running.
+    pub ffi_channel_max_bytes: usize,
+    /// Inactivity limit before emitting an incomplete record.
+    pub connection_hard_timeout_secs: u64,
+    /// Per-stream retained SSE payload limit.
+    pub max_sse_retained_bytes: usize,
+    /// Preserve raw SSE event sequences for debugging or raw export.
+    pub retain_raw_sse: bool,
     /// eBPF ring buffer size in MiB.
     pub ring_buffer_mb: usize,
 }
 
+/// Default cooperative CPU target as a percentage of one logical CPU.
+pub const DEFAULT_CPU_BUDGET_PERCENT: u8 = 25;
+
 impl Default for RuntimeLimits {
     fn default() -> Self {
         Self {
+            cpu_budget_percent: DEFAULT_CPU_BUDGET_PERCENT,
             event_channel_capacity: DEFAULT_EVENT_CHANNEL_CAPACITY,
             event_channel_policy: ChannelPolicy::Backpressure,
             event_channel_max_bytes: DEFAULT_EVENT_CHANNEL_MAX_BYTES,
@@ -1071,8 +1133,50 @@ impl Default for RuntimeLimits {
             pid_cache_size: DEFAULT_PID_CACHE_SIZE,
             max_connection_body_bytes: DEFAULT_MAX_CONNECTION_BODY_BYTES,
             connection_idle_timeout_secs: DEFAULT_CONNECTION_IDLE_TIMEOUT_SECS,
+            connection_max_bytes: DEFAULT_CONNECTION_MAX_BYTES,
+            ffi_channel_max_bytes: DEFAULT_FFI_CHANNEL_MAX_BYTES,
+            connection_hard_timeout_secs: DEFAULT_CONNECTION_HARD_TIMEOUT_SECS,
+            max_sse_retained_bytes: DEFAULT_MAX_SSE_RETAINED_BYTES,
+            retain_raw_sse: false,
             ring_buffer_mb: DEFAULT_RING_BUFFER_MB,
         }
+    }
+}
+
+#[cfg(test)]
+mod cpu_budget_tests {
+    use super::*;
+
+    #[test]
+    fn cpu_pacing_defaults_to_25_and_preserves_explicit_overrides() {
+        let mut config = AgentsightConfig::default();
+        assert_eq!(config.runtime_limits.cpu_budget_percent, 25);
+        for json in [r#"{}"#, r#"{"runtime_limits":{}}"#] {
+            config.load_from_json(json).unwrap();
+            assert_eq!(config.runtime_limits.cpu_budget_percent, 25);
+        }
+        for percent in [0, 25, 40, 100] {
+            config
+                .load_from_json(&format!(
+                    r#"{{"runtime_limits":{{"cpu_budget_percent":{percent}}}}}"#
+                ))
+                .unwrap();
+            assert_eq!(config.runtime_limits.cpu_budget_percent, percent);
+        }
+        config
+            .load_from_json(r#"{"runtime_limits":{"connection_capacity":32}}"#)
+            .unwrap();
+        assert_eq!(config.runtime_limits.cpu_budget_percent, 25);
+        assert!(
+            config
+                .load_from_json(r#"{"runtime_limits":{"cpu_budget_percent":101}}"#)
+                .is_err()
+        );
+        assert!(
+            config
+                .load_from_json(r#"{"runtime_limits":{"cpu_budget_percent":-1}}"#)
+                .is_err()
+        );
     }
 }
 
@@ -1536,6 +1640,14 @@ impl AgentsightConfig {
 
         // Parse runtime limits
         if let Some(limits) = parsed.runtime_limits.take() {
+            if let Some(capacity) = limits.connection_capacity {
+                if capacity == 0 {
+                    return Err(
+                        "runtime_limits.connection_capacity must be greater than zero".into(),
+                    );
+                }
+                self.connection_capacity = capacity;
+            }
             // A MiB budget becomes a byte budget with `* 1024 * 1024`. Do it
             // checked: with overflow checks off (the workspace disables dev
             // debug assertions) the multiply wraps silently in the shipped
@@ -1550,7 +1662,14 @@ impl AgentsightConfig {
                 })
                 .transpose()
             };
+            let cpu_budget_percent = limits
+                .cpu_budget_percent
+                .unwrap_or(DEFAULT_CPU_BUDGET_PERCENT);
+            if cpu_budget_percent > 100 {
+                return Err("runtime_limits.cpu_budget_percent must be between 0 and 100".into());
+            }
             self.runtime_limits = RuntimeLimits {
+                cpu_budget_percent,
                 event_channel_capacity: limits
                     .event_channel_capacity
                     .unwrap_or(DEFAULT_EVENT_CHANNEL_CAPACITY),
@@ -1581,6 +1700,25 @@ impl AgentsightConfig {
                 connection_idle_timeout_secs: limits
                     .connection_idle_timeout_secs
                     .unwrap_or(DEFAULT_CONNECTION_IDLE_TIMEOUT_SECS),
+                connection_max_bytes: bytes_from_mb(
+                    "connection_max_bytes_mb",
+                    limits.connection_max_bytes_mb,
+                )?
+                .unwrap_or(DEFAULT_CONNECTION_MAX_BYTES),
+                ffi_channel_max_bytes: bytes_from_mb(
+                    "ffi_channel_max_bytes_mb",
+                    limits.ffi_channel_max_bytes_mb,
+                )?
+                .unwrap_or(DEFAULT_FFI_CHANNEL_MAX_BYTES),
+                connection_hard_timeout_secs: limits
+                    .connection_hard_timeout_secs
+                    .unwrap_or(DEFAULT_CONNECTION_HARD_TIMEOUT_SECS),
+                max_sse_retained_bytes: bytes_from_mb(
+                    "max_sse_retained_mb",
+                    limits.max_sse_retained_mb,
+                )?
+                .unwrap_or(DEFAULT_MAX_SSE_RETAINED_BYTES),
+                retain_raw_sse: limits.retain_raw_sse.unwrap_or(false),
                 ring_buffer_mb: limits.ring_buffer_mb.unwrap_or(DEFAULT_RING_BUFFER_MB),
             };
         }
@@ -1703,6 +1841,9 @@ pub use event_clock::{ClockConversionError, ktime_to_unix_ns};
 #[cfg(target_os = "linux")]
 pub(crate) use event_clock::{initialize_event_clock, report_clock_error};
 #[cfg(test)]
+mod connection_capacity_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -1771,7 +1912,7 @@ mod tests {
 
     #[test]
     fn test_default_constants() {
-        assert_eq!(DEFAULT_CONNECTION_CAPACITY, 24);
+        assert_eq!(DEFAULT_CONNECTION_CAPACITY, 128);
         assert_eq!(DEFAULT_POLL_TIMEOUT_MS, 100);
         assert_eq!(DEFAULT_MIN_DUR_US, 10_000);
         assert_eq!(DEFAULT_MAX_HEADERS, 64);
@@ -1802,7 +1943,7 @@ mod tests {
             config.storage.primary_path(),
             default_base_path().join(PRIMARY_DB_NAME)
         );
-        assert_eq!(config.connection_capacity, 24);
+        assert_eq!(config.connection_capacity, 128);
         assert_eq!(config.poll_timeout_ms, 100);
         assert_eq!(config.min_duration_us, 10_000);
         assert_eq!(config.max_headers, 64);
@@ -2358,6 +2499,17 @@ mod tests {
             DEFAULT_CONNECTION_IDLE_TIMEOUT_SECS
         );
         assert_eq!(limits.ring_buffer_mb, DEFAULT_RING_BUFFER_MB);
+        assert_eq!(limits.connection_max_bytes, DEFAULT_CONNECTION_MAX_BYTES);
+        assert_eq!(limits.ffi_channel_max_bytes, DEFAULT_FFI_CHANNEL_MAX_BYTES);
+        assert_eq!(
+            limits.connection_hard_timeout_secs,
+            DEFAULT_CONNECTION_HARD_TIMEOUT_SECS
+        );
+        assert_eq!(
+            limits.max_sse_retained_bytes,
+            DEFAULT_MAX_SSE_RETAINED_BYTES
+        );
+        assert!(!limits.retain_raw_sse);
     }
 
     #[test]
@@ -2373,6 +2525,59 @@ mod tests {
         assert!(!flags.audit_enabled);
         assert!(!flags.token_consumption_enabled);
         assert!(!flags.sls_logtail_enabled);
+    }
+
+    #[test]
+    fn http_and_ffi_retention_limits_load_from_json() {
+        let mut config = AgentsightConfig::new();
+        config.load_from_json(r#"{"runtime_limits":{"connection_max_bytes_mb":48,"ffi_channel_max_bytes_mb":12,"max_sse_retained_mb":3,"connection_hard_timeout_secs":90,"retain_raw_sse":true}}"#).unwrap();
+        assert_eq!(config.runtime_limits.connection_max_bytes, 48 * 1024 * 1024);
+        assert_eq!(
+            config.runtime_limits.ffi_channel_max_bytes,
+            12 * 1024 * 1024
+        );
+        assert_eq!(
+            config.runtime_limits.max_sse_retained_bytes,
+            3 * 1024 * 1024
+        );
+        assert_eq!(config.runtime_limits.connection_hard_timeout_secs, 90);
+        assert!(config.runtime_limits.retain_raw_sse);
+    }
+
+    #[test]
+    fn shipped_json_uses_the_same_memory_defaults_as_the_library() {
+        let mut config = AgentsightConfig::new();
+        config
+            .load_from_json(include_str!("../agentsight.json"))
+            .unwrap();
+        let limits = RuntimeLimits::default();
+        assert_eq!(config.connection_capacity, DEFAULT_CONNECTION_CAPACITY);
+        assert_eq!(config.runtime_limits.ring_buffer_mb, limits.ring_buffer_mb);
+        assert_eq!(
+            config.runtime_limits.event_channel_max_bytes,
+            limits.event_channel_max_bytes
+        );
+        assert_eq!(
+            config.runtime_limits.pending_genai_max_bytes,
+            limits.pending_genai_max_bytes
+        );
+        assert_eq!(
+            config.runtime_limits.connection_max_bytes,
+            limits.connection_max_bytes
+        );
+        assert_eq!(
+            config.runtime_limits.ffi_channel_max_bytes,
+            limits.ffi_channel_max_bytes
+        );
+        assert_eq!(
+            config.runtime_limits.max_sse_retained_bytes,
+            limits.max_sse_retained_bytes
+        );
+        assert_eq!(
+            config.runtime_limits.connection_hard_timeout_secs,
+            limits.connection_hard_timeout_secs
+        );
+        assert!(!config.runtime_limits.retain_raw_sse);
     }
 
     #[test]
@@ -2427,6 +2632,9 @@ mod tests {
             "event_channel_max_bytes_mb",
             "pending_genai_max_bytes_mb",
             "max_connection_body_mb",
+            "connection_max_bytes_mb",
+            "ffi_channel_max_bytes_mb",
+            "max_sse_retained_mb",
         ] {
             for mb in [u64::MAX, 1u64 << 44] {
                 let json = format!(r#"{{"runtime_limits": {{"{field}": {mb}}}}}"#);
@@ -2816,26 +3024,65 @@ mod tests {
     }
 
     #[test]
-    fn ensure_default_agents_config_replaces_outdated_config() {
+    fn ensure_default_agents_config_preserves_user_cmdline_rules_on_merge() {
         let dir = unique_temp_dir();
         let path = dir.join("agentsight.json");
         let user_config = r#"{
-            "schema_version": 2,
+            "schema_version": 1,
             "cmdline": {
                 "allow": [
                     {"rule": ["*mycustomagent*"], "agent_name": "MyCustomAgent"}
-                ]
-            }
+                ],
+                "deny": [{"rule": ["*noisy*"]}]
+            },
+            "https": [{"rule": ["custom.api.example.com"]}]
         }"#;
         std::fs::write(&path, user_config).unwrap();
         ensure_default_agents_config(&path).unwrap();
         let result = std::fs::read_to_string(&path).unwrap();
-        assert_eq!(result, DEFAULT_AGENTS_JSON);
-        assert!(!result.contains("MyCustomAgent"));
+        assert!(
+            result.contains("MyCustomAgent"),
+            "user cmdline rule lost during migration: {result}"
+        );
+        assert!(
+            result.contains("custom.api.example.com"),
+            "user https rule lost during migration: {result}"
+        );
+        assert!(
+            result.contains("*noisy*"),
+            "user deny rule lost during migration: {result}"
+        );
+        let migrated: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(
+            migrated["schema_version"].as_u64().unwrap() as u32,
+            CURRENT_SCHEMA_VERSION
+        );
     }
 
     #[test]
-    fn ensure_default_agents_config_replacement_contains_storage_section() {
+    fn ensure_default_agents_config_adds_missing_sections_on_merge() {
+        let dir = unique_temp_dir();
+        let path = dir.join("agentsight.json");
+        let minimal_v1 = r#"{
+            "cmdline": {"allow": [{"rule": ["*test*"], "agent_name": "Test"}]}
+        }"#;
+        std::fs::write(&path, minimal_v1).unwrap();
+        ensure_default_agents_config(&path).unwrap();
+        let result = std::fs::read_to_string(&path).unwrap();
+        let migrated: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert!(
+            migrated.get("features").is_some(),
+            "features section not added from default"
+        );
+        assert!(
+            migrated.get("runtime_limits").is_some(),
+            "runtime_limits section not added from default"
+        );
+        assert!(result.contains("Test"), "user rule lost");
+    }
+
+    #[test]
+    fn ensure_default_agents_config_merged_config_contains_storage_section() {
         let dir = unique_temp_dir();
         let path = dir.join("agentsight.json");
         std::fs::write(&path, r#"{"schema_version": 2}"#).unwrap();

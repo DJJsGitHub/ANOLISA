@@ -47,15 +47,15 @@ pub enum SkillSecError {
     /// The operation requires the kernel-authenticated root administrator.
     #[error("SkillSec operation requires root administrator")]
     PermissionDenied,
-    /// A requested identity is outside administrator-configured Skill directories or mounts.
-    #[error("SkillSec path is outside managedSkillDirs and configured SkillFS mounts: {}", .0.path().display())]
+    /// A requested identity is outside enabled default or configured Skill directories and mounts.
+    #[error("SkillSec path is outside enabled default directories, managedSkillDirs and configured SkillFS mounts: {}; configure managedSkillDirs and restart agent-sec-core", .0.path().display())]
     ScopeDenied(SkillIdentity),
     /// Bounded shared-daemon admission is exhausted.
     #[error("SkillSec is busy; retry after an in-flight operation completes")]
     Busy,
-    /// Rotation must finish before ordinary ledger access resumes.
-    #[error("SkillSec key rotation is pending; administrator must resume rotation")]
-    RotationPending,
+    /// A retained command is explicitly unsupported.
+    #[error("unsupported SkillSec operation: {0}")]
+    Unsupported(String),
     /// A request exhausted its execution deadline before completing.
     #[error("SkillSec execution deadline exceeded")]
     Timeout,

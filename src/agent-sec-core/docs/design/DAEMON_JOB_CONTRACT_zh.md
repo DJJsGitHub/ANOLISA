@@ -625,11 +625,16 @@ SkillFS notify 驱动的后台合并队列、重试、shutdown、健康与实际
 通过同一个 `ActionService` 复用 `SkillSecService`、Action Runtime 和公共 Finalizer。没有另建 Python 子进程协议或
 通用 Job 调度器。每项变更分别执行 scan 和 activation，前者失败也会尝试后者；业务错误不
 自动重放，仅执行前的 `Busy` 在同一有界期限内重试。
+启动扫描使用内部、不可由 RPC 构造的 StartupScan，经同一 Action Runtime 按 scan 审计。
+仅既有只读系统 Skill 跳过结果不继续 activation，也不生成 pass verdict。启动任务与已到期
+notify 交替执行；未到期通知不阻挡启动任务。不增加 watcher 或周期扫描。
+DJOB-SG-002 由 `skill_worker.rs` 的交替执行、跳过不激活及原有失败后激活测试覆盖。
 
 实时通知按 canonical 身份合并，500 ms debounce，持续输入时最多延迟两秒；相同 Skill
 的具体文件列表不影响扫描范围，因此 worker 始终扫描完整 Skill。实时 pending 限制为 256
 个不同 Skill，满队列返回签名拒绝。这是取代上文无界 map 的明确资源边界。启动任务来自
-当前普通目录配置与仍受授权的 registry；同一个 daemon worker 也负责未配置 SkillFS 时的启动
+默认目录、显式普通目录配置与仍受授权的 registry；默认发现单独受 10,000 个目录项和
+1,024 个新增 Skill 限制，已有登记与显式配置不截断；单目录发现错误记录诊断并继续成功部分。同一个 daemon worker 也负责未配置 SkillFS 时的启动
 补扫，包含未登记的普通 Skill 和已登记的挂载 Skill，不遍历 FUSE，不受实时 pending 上限截断。
 
 关闭停止接收并等待当前有界操作。内存 pending 不持久化，daemon 重启后通过全量注册目录

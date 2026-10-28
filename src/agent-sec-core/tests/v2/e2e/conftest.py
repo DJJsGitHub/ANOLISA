@@ -115,6 +115,7 @@ def _daemon_settings(socket_path: Path) -> tuple[Path, dict[str, str]]:
             {
                 "stateDir": str(socket_path.with_suffix(".state")),
                 "managedSkillDirs": [str(socket_path.parent / "*")],
+                "enableDefaultSkillDirs": False,
             }
         )
     )
@@ -198,6 +199,12 @@ def _terminate(process: subprocess.Popen) -> str:
         _, stderr = process.communicate()
         raise AssertionError("agent-sec-daemon did not exit within the shutdown window")
     return stderr or ""
+
+
+@pytest.fixture(autouse=True)
+def isolate_daemon_data_dir(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Prevents the CI bootstrap daemon's storage from leaking into test daemons."""
+    monkeypatch.delenv("AGENT_SEC_DATA_DIR", raising=False)
 
 
 @pytest.fixture

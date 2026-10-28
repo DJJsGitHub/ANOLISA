@@ -46,6 +46,7 @@ import {
   openSync,
   readSync,
   statSync,
+  lstatSync,
 } from 'node:fs';
 import { join, dirname, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -66,6 +67,37 @@ if (!version) {
   process.exit(1);
 }
 
+// The QwenPaw requirements pin carries two spellings of this one version: the
+// release-tag path keeps the raw Cargo form (the release workflow tags it
+// verbatim) while the wheel filename takes the PEP 440 normalized form the
+// pinned maturin builds and pip accepts -- a Cargo 0.9.0-rc.1 publishes
+// anolisa_tokenless-0.9.0rc1-.... packaging/raw/wheel-version.py supplies that
+// spelling from the normalizer inside packaging/raw/verify-release.py, the gate
+// that rejects a payload mixing the two up, and the Makefile's
+// stamp-adapter-templates rule asks the same helper, so the npm bundle cannot
+// drift from the raw and RPM payloads. Asked on demand: only adapter bundling
+// stamps templates.
+const WHEEL_VERSION_SCRIPT = join(tokenlessRoot, 'packaging', 'raw', 'wheel-version.py');
+
+function wheelFilenameVersion() {
+  const python = process.platform === 'win32' ? 'python' : 'python3';
+  let normalized;
+  try {
+    normalized = execFileSync(python, [WHEEL_VERSION_SCRIPT, version], {
+      encoding: 'utf-8',
+    }).trim();
+  } catch (error) {
+    throw new Error(
+      `cannot normalize ${version} into a wheel filename version ` +
+      `(${python} ${WHEEL_VERSION_SCRIPT}): ${error.message}`,
+    );
+  }
+  if (!normalized) {
+    throw new Error(`wheel-version.py returned no wheel filename version for ${version}`);
+  }
+  return normalized;
+}
+
 const BINARIES = ['tokenless', 'rtk'];
 
 // npm registry every generated manifest and publish command is pinned to.
@@ -79,6 +111,14 @@ const PUBLISH_CONFIG = { registry: NPM_REGISTRY, access: 'public' };
 const GLIBC_MIN = '2.17';
 
 const TARGETS = [
+  {
+    rust_target: 'x86_64-pc-windows-msvc',
+    npm_os: 'win32',
+    npm_cpu: 'x64',
+    pkg_suffix: 'win32-x64',
+    binary_os: 'windows',
+    binary_arch: 'x86_64',
+  },
   {
     rust_target: 'x86_64-unknown-linux-gnu',
     npm_os: 'linux',
@@ -200,6 +240,21 @@ function readHeader(path) {
 
 function verifyBinaryFormat(target, name, path) {
   const header = readHeader(path);
+  if (target.binary_os === 'windows') {
+    if (header.length < 64 || header.readUInt16LE(0) !== 0x5a4d) {
+      throw new Error(`${name} is not a PE binary: ${path}`);
+    }
+    const descriptor = openSync(path, 'r');
+    try {
+      const pe = Buffer.alloc(26);
+      const size = readSync(descriptor, pe, 0, pe.length, header.readUInt32LE(60));
+      if (size !== pe.length || pe.readUInt32LE(0) !== 0x4550 ||
+          pe.readUInt16LE(4) !== 0x8664 || pe.readUInt16LE(24) !== 0x20b) {
+        throw new Error(`${name} is not an x64 PE32+ binary: ${path}`);
+      }
+    } finally { closeSync(descriptor); }
+    return;
+  }
   if (target.binary_os === 'linux') {
     const elfMagic = Buffer.from([0x7f, 0x45, 0x4c, 0x46]);
     if (header.length < 20 || !header.subarray(0, 4).equals(elfMagic)) {
@@ -281,7 +336,7 @@ function verifyGlibcBaseline(target, name, path) {
 function collectPrebuiltBinaries(target, binDir) {
   const binaryPaths = {};
   for (const binary of BINARIES) {
-    const path = join(binDir, binary);
+    const path = join(binDir, binary + (target.binary_os === 'windows' ? '.exe' : ''));
     if (!existsSync(path) || !statSync(path).isFile()) {
       throw new Error(`missing prebuilt ${binary} for ${target.pkg_suffix}: ${path}`);
     }
@@ -305,7 +360,7 @@ function packagePlatform(target, binaryPaths) {
 
   // Copy binaries
   for (const [bin, binPath] of Object.entries(binaryPaths)) {
-    const destination = join(pkgDir, 'bin', bin);
+    const destination = join(pkgDir, 'bin', bin + (target.binary_os === 'windows' ? '.exe' : ''));
     copyFileSync(binPath, destination);
     chmodSync(destination, 0o755);
   }
@@ -373,7 +428,23 @@ function buildAdapters() {
   // never leak into a published tarball.
   console.log('  Building OpenClaw plugin (TypeScript -> dist/index.js)...');
   try {
-    execSync('make build-openclaw-plugin build-dsh-plugin', {
+    if (process.platform === 'win32') {
+      for (const name of ['openclaw', 'dsh']) {
+        const directory = join(tokenlessRoot, 'adapters', 'tokenless', name);
+        for (const entry of readdirSync(directory).filter((name) => name.endsWith('.in'))) {
+          writeFileSync(join(directory, entry.slice(0, -3)),
+            readFileSync(join(directory, entry), 'utf8').replaceAll('@VERSION@', version));
+        }
+      }
+      execSync('npm ci --legacy-peer-deps --ignore-scripts --no-audit --no-fund && npm run build', {
+        stdio: 'inherit', cwd: openclawDir,
+      });
+      // dsh/dist/index.js is the ESM source, not a generated bundle; match Make's export check.
+      execFileSync(process.execPath, ['--input-type=module', '-e',
+        "import('./dist/index.js').then((plugin) => { if (typeof plugin.apply !== 'function' || plugin.name !== 'anolisa-tokenless') process.exit(1); })"], {
+        stdio: 'inherit', cwd: join(tokenlessRoot, 'adapters', 'tokenless', 'dsh'),
+      });
+    } else execSync('make build-openclaw-plugin build-dsh-plugin', {
       stdio: 'inherit',
       cwd: tokenlessRoot,
     });
@@ -401,33 +472,56 @@ function buildAdapters() {
 /**
  * Copy the adapter tree into the root package, mirroring what the Makefile's
  * install-adapter-resources does for FHS installs: strip build-only
- * artifacts, stamp @VERSION@ templates, and mark scripts executable.
+ * artifacts, stamp the version templates, and mark scripts executable.
  */
 function copyAdapters(rootPkgDir) {
   const adaptersSrc = join(tokenlessRoot, 'adapters', 'tokenless');
   const adaptersDest = join(rootPkgDir, 'adapters', 'tokenless');
   const legacyAgentscopeSrc = join(adaptersSrc, 'agentscope');
+  const filter = (src) =>
+    src !== legacyAgentscopeSrc &&
+    !src.startsWith(`${legacyAgentscopeSrc}${sep}`) &&
+    !src.split(sep).includes('node_modules') &&
+    !src.split(sep).includes('__pycache__') &&
+    !/\.py[co]$/.test(src) &&
+    !src.endsWith(`${sep}package-lock.json`) &&
+    !src.endsWith(`${sep}.gitignore`);
 
   console.log('  Bundling Agent adapters...');
   cpSync(adaptersSrc, adaptersDest, {
     recursive: true,
     // npm pack omits symlinks; shared hook dispatchers must ship as regular files.
     dereference: true,
-    filter: (src) =>
-      src !== legacyAgentscopeSrc &&
-      !src.startsWith(`${legacyAgentscopeSrc}${sep}`) &&
-      !src.split(sep).includes('node_modules') &&
-      !src.split(sep).includes('__pycache__') &&
-      !/\.py[co]$/.test(src) &&
-      !src.endsWith(`${sep}package-lock.json`) &&
-      !src.endsWith(`${sep}.gitignore`),
+    filter,
   });
 
+  // Git for Windows may check symlinks out as text files without Developer Mode.
+  // Materialize the tracked links in the package, leaving the checkout unchanged.
+  if (process.platform === 'win32') {
+    const entries = execFileSync('git', ['ls-files', '--stage', '-z', 'adapters/tokenless'],
+      { cwd: tokenlessRoot, encoding: 'utf8' }).split('\0');
+    for (const entry of entries) {
+      if (!entry.startsWith('120000 ')) continue;
+      const relative = entry.slice(entry.indexOf('\t') + 1);
+      const source = join(tokenlessRoot, relative);
+      const destination = join(rootPkgDir, relative);
+      if (!lstatSync(source).isSymbolicLink() && statSync(source).isFile()) {
+        const target = join(dirname(source), readFileSync(source, 'utf8').trim());
+        rmSync(destination, { force: true });
+        cpSync(target, destination, { recursive: true, dereference: true, filter });
+      }
+    }
+  }
+
   // Stamp *.in templates with the release version (Makefile does this via
-  // stamp-adapter-templates for RPM installs) and drop the raw templates.
+  // stamp-adapter-templates for RPM installs) and drop the raw templates. The
+  // QwenPaw requirements pin also needs the wheel-filename spelling.
+  const wheelVersion = wheelFilenameVersion();
   walkFiles(adaptersDest, (p) => {
     if (p.endsWith('.in')) {
-      const stamped = readFileSync(p, 'utf-8').replaceAll('@VERSION@', version);
+      const stamped = readFileSync(p, 'utf-8')
+        .replaceAll('@WHEEL_VERSION@', wheelVersion)
+        .replaceAll('@VERSION@', version);
       writeFileSync(p.slice(0, -3), stamped);
       rmSync(p);
     }

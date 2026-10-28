@@ -66,6 +66,7 @@ fn canonical_identity_is_lexical_and_validated_after_json_decode() {
     assert_eq!(left.name(), right.name());
     assert_ne!(left, right);
     let config = SkillSecConfig {
+        default_skill_dirs: Vec::new(),
         state_dir: "/var/lib/agent-sec/skillsec".into(),
         managed_skill_dirs: vec![
             asc_capability_skill_sec::ManagedSkillDir::new(left.path()).unwrap(),
@@ -329,7 +330,7 @@ fn service_construction_reclaims_crashed_key_temporaries() {
     fs::create_dir(&state).unwrap();
     fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).unwrap();
     // A private key stranded by a crash between the temp write and the rename.
-    let stranded = state.join(format!(".key-{}", "a".repeat(64)));
+    let stranded = state.join(format!(".key-{}.tmp", "a".repeat(64)));
     fs::write(&stranded, b"orphaned-private-key").unwrap();
     fs::set_permissions(&stranded, fs::Permissions::from_mode(0o600)).unwrap();
     let file = fs::File::options().write(true).open(&stranded).unwrap();
@@ -341,6 +342,7 @@ fn service_construction_reclaims_crashed_key_temporaries() {
 
     let service = SkillSecService::new(
         asc_capability_skill_sec::SkillSecConfig {
+            default_skill_dirs: Vec::new(),
             state_dir: state.clone(),
             managed_skill_dirs: vec![
                 asc_capability_skill_sec::ManagedSkillDir::new(

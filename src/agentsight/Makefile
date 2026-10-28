@@ -108,6 +108,13 @@ stage-raw: ## Stage one raw payload into DESTDIR
 test-raw-package: ## Validate Linux and macOS raw package assembly
 	@bash scripts/test-package-raw.sh
 
+.PHONY: test-batch-analysis
+test-batch-analysis: ## Exercise batch discovery and execution without model calls
+	python3 -m unittest discover -s scripts/benchmark/tests -p test_batch_execution_regressions.py
+
+# Add the dependency separately from the shared native-test rule.
+test: test-batch-analysis
+
 .PHONY: test
 test: test-rpm-packaging test-raw-package ## Run unit tests (fast, no coverage)
 	cd $(CURDIR) && cargo test
@@ -171,3 +178,7 @@ help: ## Show this help message
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-20s\033[0m %s\n", $$1, $$2}'
 
 .DEFAULT_GOAL := build-all
+
+.PHONY: test-tokenless-api
+test-tokenless-api: ## Verify built Tokenless and AgentSight CLI processes on Linux
+	python3 tests/tokenless-api-e2e.py

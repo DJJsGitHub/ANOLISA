@@ -61,6 +61,15 @@ impl GenAISqliteStore {
     // ─── Query methods ───────────────────────────────────────────────────────
 
     /// List all sessions within a nanosecond timestamp range.
+    ///
+    /// With `include_auxiliary=false` (the default for /api/sessions), recap
+    /// calls may still *form* a session (recap-only sessions surface with zero
+    /// tokens, #7271) but do not contribute tokens or conversation counts;
+    /// query previews and model/agent aggregates fall back to recap rows only
+    /// when the session has no main rows. Analyzer-only (cosh-ng background,
+    /// #2750) and web_search-only sessions stay hidden. Note the sibling
+    /// `list_traces_by_session` uses the same flag for trace visibility only —
+    /// billing there is unfiltered.
     pub fn list_sessions(
         &self,
         start_ns: i64,
@@ -68,30 +77,101 @@ impl GenAISqliteStore {
         include_auxiliary: bool,
     ) -> Result<Vec<SessionSummary>, Box<dyn std::error::Error>> {
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        // Session-formation predicate. Recap rows are allowed to *form* a
+        // session (#7271): a qwen CLI headless call whose main LLM call was
+        // missed by the capture path leaves only its follow-up managed-memory
+        // recap row; excluding recap entirely made such a user session
+        // permanently invisible in /api/sessions. The cosh-ng background
+        // analyzer is classified as its own 'analyzer' kind (#2750, #7271) so
+        // analyzer-only background sessions stay hidden; web_search-only
+        // sessions stay hidden too.
         let call_kind_filter = if include_auxiliary {
             ""
         } else {
-            " AND (call_kind = 'main' OR call_kind IS NULL)"
+            " AND (call_kind = 'main' OR call_kind IS NULL OR call_kind = 'recap')"
+        };
+        // Numbers stay billed on main calls only so existing sessions' token
+        // totals and conversation counts are unchanged; a recap-only session
+        // surfaces with zero tokens.
+        let aux_guard = if include_auxiliary {
+            ""
+        } else {
+            "CASE WHEN (call_kind = 'main' OR call_kind IS NULL) THEN "
+        };
+        let aux_guard_close = if include_auxiliary { "" } else { " ELSE 0 END" };
+        // Text aggregates guard with a NULL else (MAX skips NULLs); recap-only
+        // sessions fall back to their recap rows via COALESCE so the required
+        // last_seen_ns stays non-NULL. With include_auxiliary the guard is
+        // empty and COALESCE(x, x) is a no-op.
+        let text_aux_guard = if include_auxiliary {
+            ""
+        } else {
+            "CASE WHEN (call_kind = 'main' OR call_kind IS NULL) THEN "
+        };
+        let text_aux_end = if include_auxiliary { "" } else { " END" };
+        let conv_count_expr = if include_auxiliary {
+            "conversation_id".to_string()
+        } else {
+            "CASE WHEN (call_kind = 'main' OR call_kind IS NULL) THEN conversation_id END"
+                .to_string()
+        };
+        // Nullable-text fallbacks must only kick in when the session has no
+        // main rows at all (#7271 review): if main rows exist but carry NULL
+        // model/agent_name, falling back to a recap row would change what
+        // pre-#7271 queries returned.
+        // "The session has a main row" must be evaluated over the whole
+        // session, not over the rows that survived the time-window filter.
+        // The preview subqueries below already use the session-wide check, so
+        // a windowed aggregate here reported recap model/agent for a session
+        // whose main rows simply fell outside the requested window.
+        let has_main = if include_auxiliary {
+            ""
+        } else {
+            "EXISTS (SELECT 1 FROM genai_events gm \
+             WHERE gm.session_id = g1.session_id \
+               AND gm.event_type = 'llm_call' \
+               AND (gm.call_kind = 'main' OR gm.call_kind IS NULL))"
+        };
+        let model_expr = if include_auxiliary {
+            "MAX(model)".to_string()
+        } else {
+            format!(
+                "CASE WHEN {has_main} THEN MAX({text_aux_guard}model{text_aux_end}) ELSE MAX(model) END"
+            )
+        };
+        let agent_expr = if include_auxiliary {
+            "COALESCE(MAX(agent_name), MAX(process_name))".to_string()
+        } else {
+            format!(
+                "CASE WHEN {has_main} \
+                 THEN COALESCE(MAX({text_aux_guard}agent_name{text_aux_end}), \
+                            MAX({text_aux_guard}process_name{text_aux_end})) \
+                 ELSE COALESCE(MAX(agent_name), MAX(process_name)) END"
+            )
         };
         // Same filter for the correlated user-query subqueries (g2-qualified).
+        // Recap rows become visible when the session has no main rows, so a
+        // recap-only session's preview is inspectable instead of NULL (#7271
+        // review P1); mixed sessions keep main-only previews.
         let sub_call_kind_filter = if include_auxiliary {
             ""
         } else {
-            " AND (g2.call_kind = 'main' OR g2.call_kind IS NULL)"
+            " AND ((g2.call_kind = 'main' OR g2.call_kind IS NULL) OR (g2.call_kind = 'recap' \
+             AND NOT EXISTS (SELECT 1 FROM genai_events gm WHERE gm.session_id = g1.session_id \
+             AND gm.event_type = 'llm_call' AND (gm.call_kind = 'main' OR gm.call_kind IS NULL))))"
         };
         let sql = format!(
             concat!(
                 "SELECT session_id,
-                    COUNT(DISTINCT conversation_id) AS conversation_count,
-                    MIN(start_timestamp_ns)  AS first_seen_ns,
-                    MAX(start_timestamp_ns)  AS last_seen_ns,
-                    COALESCE(SUM(",
+                    COUNT(DISTINCT {conv_count_expr}) AS conversation_count,
+                    COALESCE(MIN({text_aux_guard}start_timestamp_ns{text_aux_end}), MIN(start_timestamp_ns)) AS first_seen_ns,
+                    COALESCE(MAX({text_aux_guard}start_timestamp_ns{text_aux_end}), MAX(start_timestamp_ns)) AS last_seen_ns,
+                    COALESCE(SUM({aux_guard}",
                 billed_input_col!(),
-                "), 0)  AS total_input,
-                    COALESCE(SUM(output_tokens), 0) AS total_output,
-                    MAX(model)               AS model,
-                    COALESCE(MAX(agent_name),
-                             MAX(process_name)) AS agent_name,
+                "{aux_close}), 0)  AS total_input,
+                    COALESCE(SUM({aux_guard}output_tokens{aux_close}), 0) AS total_output,
+                    {model_expr} AS model,
+                    {agent_expr} AS agent_name,
                     (SELECT substr(g2.user_query, 1, 200) FROM genai_events g2
                       WHERE g2.session_id = g1.session_id
                         AND g2.event_type = 'llm_call'
@@ -112,7 +192,14 @@ impl GenAISqliteStore {
              ORDER BY last_seen_ns DESC"
             ),
             sub_call_kind_filter = sub_call_kind_filter,
-            call_kind_filter = call_kind_filter
+            call_kind_filter = call_kind_filter,
+            aux_guard = aux_guard,
+            aux_close = aux_guard_close,
+            text_aux_guard = text_aux_guard,
+            text_aux_end = text_aux_end,
+            model_expr = model_expr,
+            agent_expr = agent_expr,
+            conv_count_expr = conv_count_expr
         );
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt.query_map(params![start_ns, end_ns], |row| {
@@ -371,10 +458,20 @@ impl GenAISqliteStore {
     ) -> Result<Vec<TraceSummary>, Box<dyn std::error::Error>> {
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
 
+        // Trace visibility mirrors the session predicate (#7271 review P1):
+        // recap rows are visible when the session has no main rows, so a
+        // recap-only session drill-down is inspectable instead of rendering
+        // "no traces" while the ATIF event view shows content. Mixed sessions
+        // keep main-only traces. `genai_events.session_id` correlates to the
+        // outer driving table in both usage contexts (outer WHERE and the
+        // correlated user_query subquery, whose FROM aliases the inner table
+        // as g2).
         let call_kind_filter = if include_auxiliary {
             ""
         } else {
-            " AND (call_kind = 'main' OR call_kind IS NULL)"
+            " AND ((call_kind = 'main' OR call_kind IS NULL) OR (call_kind = 'recap' \
+             AND NOT EXISTS (SELECT 1 FROM genai_events gm WHERE gm.session_id = genai_events.session_id \
+             AND gm.event_type = 'llm_call' AND (gm.call_kind = 'main' OR gm.call_kind IS NULL))))"
         };
 
         // When both start_ns and end_ns are present, rewrite with BETWEEN
@@ -538,10 +635,15 @@ impl GenAISqliteStore {
     /// consumers pass to every other agent-scoped query, which all match
     /// case-insensitively). The reported spelling is the group's `MIN`, the
     /// same stable-spelling rule `get_agent_token_summary` uses.
+    ///
+    /// `include_auxiliary` mirrors the session-formation predicate: with
+    /// `false`, an agent whose calls are all auxiliary (web_search, analyzer)
+    /// is omitted, because `/api/sessions` does not show its sessions.
     pub fn list_agent_names(
         &self,
         start_ns: i64,
         end_ns: i64,
+        include_auxiliary: bool,
     ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let mut stmt = conn.prepare(
@@ -549,15 +651,20 @@ impl GenAISqliteStore {
             // (`COALESCE(agent_name, process_name)`): a call recorded without
             // an agent name would otherwise be missing from the filter list
             // while the dashboard shows its sessions under that label.
+            // The auxiliary guard is bound as a parameter rather than
+            // concatenated into the statement.
             "SELECT MIN(COALESCE(agent_name, process_name)) AS agent_name
              FROM genai_events
              WHERE event_type = 'llm_call'
                AND COALESCE(agent_name, process_name) IS NOT NULL
                AND start_timestamp_ns BETWEEN ?1 AND ?2
+               AND (?3 = 1 OR call_kind = 'main' OR call_kind IS NULL OR call_kind = 'recap')
              GROUP BY COALESCE(agent_name, process_name) COLLATE NOCASE
              ORDER BY agent_name ASC",
         )?;
-        let rows = stmt.query_map(params![start_ns, end_ns], |row| row.get::<_, String>(0))?;
+        let rows = stmt.query_map(params![start_ns, end_ns, include_auxiliary as i32], |row| {
+            row.get::<_, String>(0)
+        })?;
         let mut result = Vec::new();
         for row in rows {
             result.push(row?);

@@ -21,21 +21,18 @@ const MAX_KEY_BYTES: u64 = 4096;
 /// leftover rather than an in-flight write by a concurrent initializer.
 ///
 /// Key writes finish in milliseconds, so an hour-old temporary can only be
-/// an orphan: either `initialize` or `replace` was interrupted between the
+/// an orphan: `initialize` was interrupted between the
 /// temp write and the rename, and its unlinkat cleanup never ran. The margin
 /// exists so a racing initializer's live temporary is never swept out from
 /// under it (its rename would then fail spuriously with ENOENT).
 const STALE_KEY_TEMP_AGE: Duration = Duration::from_secs(3600);
 
-/// Mirrors the two nonce shapes produced by this module: `replace` writes
-/// `.key-<64hex>` and `initialize` writes `.key-<64hex>.tmp`. Anything else
-/// in the state directory (`signing-key.pk8`, `key-rotation.json`,
-/// `managed-skills.json`, `.rollback-*.json`) must never match; if a nonce
-/// format above changes, this predicate must change with it.
+/// Matches only the temporary names produced by initialization.
 fn is_key_temp(name: &str) -> bool {
     name.strip_prefix(".key-").is_some_and(|suffix| {
-        let hex = suffix.strip_suffix(".tmp").unwrap_or(suffix);
-        hex.len() == 64 && hex.bytes().all(|c| c.is_ascii_hexdigit())
+        suffix
+            .strip_suffix(".tmp")
+            .is_some_and(|hex| hex.len() == 64 && hex.bytes().all(|c| c.is_ascii_hexdigit()))
     })
 }
 
@@ -98,33 +95,6 @@ impl KeyStore {
         result
     }
 
-    /// Replaces current trust after the service has withdrawn all managed activation.
-    /// No previous public key or private key is retained.
-    pub(crate) fn replace(&self) -> Result<SigningIdentity, SkillSecError> {
-        self.load()?;
-        let key =
-            Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).map_err(|_| SkillSecError::Key)?;
-        let temp = crate::ledger::storage::nonce(".key-")?;
-        let result = (|| {
-            let directory = crate::ledger::storage::Directory::open(&self.path)?;
-            directory.write_new(&temp, key.as_ref(), 0o600)?;
-            renameat_with(
-                &self.directory,
-                temp.as_str(),
-                &self.directory,
-                KEY_FILE,
-                RenameFlags::empty(),
-            )
-            .map_err(|e| io_error(&self.path, e))?;
-            self.directory
-                .sync_all()
-                .map_err(|e| io_error(&self.path, e))?;
-            self.load()
-        })();
-        let _ = unlinkat(&self.directory, temp.as_str(), AtFlags::empty());
-        result
-    }
-
     /// Creates the first key atomically, or loads the existing identity unchanged.
     ///
     /// # Errors
@@ -175,9 +145,9 @@ impl KeyStore {
         outcome
     }
 
-    /// Removes `.key-` temporaries left by an interrupted `initialize` or `replace`.
+    /// Removes `.key-` temporaries left by an interrupted `initialize`.
     ///
-    /// Both writers only unlink their temporary when the process survives the
+    /// The initializer only unlinks its temporary when the process survives the
     /// function; a crash between the temp write and the rename strands a full
     /// Ed25519 PKCS#8 private key in the state directory forever, because
     /// nothing else in the recovery story reclaims this class of temporary
@@ -211,7 +181,7 @@ impl KeyStore {
     /// Returns whether an entry was removed. An entry that vanished since the
     /// enumeration — a concurrent cleanup, or the writer's own trailing
     /// unlink after a successful rename — is already reclaimed and reports
-    /// `false` instead of failing service construction or key rotation with
+    /// `false` instead of failing service construction with
     /// ENOENT; every other stat failure stays visible. An mtime in the future
     /// (clock skew, or a rollback across the sweep) makes the age unknowable
     /// and likewise fails safe to "keep", exactly like a young in-flight
@@ -302,8 +272,8 @@ mod tests {
     }
 
     #[test]
-    fn key_temp_shape_matches_both_nonce_formats_only() {
-        assert!(is_key_temp(&format!(".key-{}", hex64('a'))));
+    fn key_temp_shape_matches_initialization_nonce_only() {
+        assert!(!is_key_temp(&format!(".key-{}", hex64('a'))));
         assert!(is_key_temp(&format!(".key-{}.tmp", hex64('0'))));
         for name in [
             "signing-key.pk8",
@@ -350,9 +320,9 @@ mod tests {
 
         let store = KeyStore::open(&path).unwrap();
         let deadline = Instant::now() + Duration::from_secs(10);
-        assert_eq!(store.reclaim_temporaries(deadline).unwrap(), 2);
+        assert_eq!(store.reclaim_temporaries(deadline).unwrap(), 1);
 
-        assert!(!path.join(&stale_replace).exists());
+        assert!(path.join(&stale_replace).exists());
         assert!(!path.join(&stale_initialize).exists());
         // A concurrent initializer's in-flight temporary survives the sweep.
         assert_eq!(
@@ -372,7 +342,7 @@ mod tests {
         // in-flight one — while still reclaiming provably stale siblings in
         // the same sweep: "not provably young" must never mean "stale".
         let (_dir, path) = state_dir();
-        let skewed = format!(".key-{}", hex64('1'));
+        let skewed = format!(".key-{}.tmp", hex64('1'));
         let stale = format!(".key-{}.tmp", hex64('2'));
         plant(&path.join(&skewed), b"skewed-in-flight-key");
         plant(&path.join(&stale), b"orphaned-private-key");
@@ -399,9 +369,9 @@ mod tests {
         // A temp that disappears between the readdir and its stat — a
         // concurrent cleanup, or the writer's own trailing unlink after a
         // successful rename — must be treated as already reclaimed, never
-        // propagated as ENOENT to fail service construction or rotation.
+        // propagated as ENOENT to fail service construction.
         let (_dir, path) = state_dir();
-        let vanished = format!(".key-{}", hex64('3'));
+        let vanished = format!(".key-{}.tmp", hex64('3'));
         plant(&path.join(&vanished), b"concurrently-removed");
         let directory = crate::ledger::storage::Directory::open(&path).unwrap();
         let deadline = Instant::now() + Duration::from_secs(10);

@@ -41,17 +41,22 @@ fn bundle(root: &Path, names: &[&str]) -> PathBuf {
     let mut components = Vec::new();
     for name in names {
         let entries = if *name == "aw-core" {
-            vec!["bin/aw".into(), "bin/aw-package".into()]
+            vec!["bin/aw".into()]
         } else if *name == "aw-provider-tokenless" {
-            ["aw-provider-tokenless", "tokenless"]
+            ["aw-provider-tokenless", "tokenless", "rtk"]
                 .iter()
                 .map(|name| format!("libexec/aw/providers/tokenless/{name}"))
                 .collect()
         } else {
-            ["aw-provider-sec-core", "agent-sec-cli", "agent-sec-daemon"]
-                .iter()
-                .map(|name| format!("libexec/aw/providers/sec-core/{name}"))
-                .collect()
+            [
+                "aw-provider-sec-core",
+                "agent-sec-cli",
+                "agent-sec-daemon",
+                "agent-sec-daemon-health",
+            ]
+            .iter()
+            .map(|name| format!("libexec/aw/providers/sec-core/{name}"))
+            .collect()
         };
         let mut files = BTreeMap::new();
         for entry in entries {
@@ -177,10 +182,10 @@ fn tampered_payload_is_rejected_before_creating_prefix() {
 fn required_binaries_must_be_executable_but_data_may_be_read_only() {
     for name in [
         "bin/aw",
-        "bin/aw-package",
         "libexec/aw/providers/sec-core/aw-provider-sec-core",
         "libexec/aw/providers/sec-core/agent-sec-cli",
         "libexec/aw/providers/sec-core/agent-sec-daemon",
+        "libexec/aw/providers/sec-core/agent-sec-daemon-health",
     ] {
         let f = Fixture::new();
         modify_manifest(&f.combined, |manifest| {
@@ -348,7 +353,7 @@ fn lock_permission_failure_removes_owned_prefix_and_allows_retry() {
             held = Some(paths::lock(prefix)?);
             // Inject an fd that rejects fchmod even as root, after creating the
             // actual owned lock. Keep that flock held throughout rollback.
-            Ok(File::open("/proc/self/status")?)
+            Ok(PackageLock::from_locked(File::open("/proc/self/status")?))
         },
         |_, _| panic!("copy must not run after permission setup fails"),
     );
@@ -388,6 +393,7 @@ fn damaged_installed_core_rejects_provider_and_allows_retry() {
     for name in ["bin/aw", "bin/aw-package"] {
         for damage in ["bytes", "missing", "mode", "setuid"] {
             let f = Fixture::new();
+            unified_cli::with_legacy_cli(&f.core);
             install(&f.core, &f.prefix).unwrap();
             let before = receipts(&f.prefix).unwrap();
             let receipt = f.prefix.join(".aw-packages/aw-core.json");
@@ -681,7 +687,12 @@ fn already_cancelled_install_does_not_create_prefix() {
 }
 
 mod configuration;
+mod reported;
 mod standalone;
+mod unified_cli;
 
 #[path = "tests/tokenless.rs"]
 mod tokenless;
+
+#[path = "tests/sec_core.rs"]
+mod sec_core;

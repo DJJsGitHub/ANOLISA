@@ -186,7 +186,7 @@ fn parse_frontmatter(
     dir_name: &str,
     issues: &mut Vec<String>,
 ) -> SkillMetadata {
-    if yaml_str.is_empty() {
+    if yaml_str.trim().is_empty() {
         if !dir_name.is_empty() {
             issues.push("missing frontmatter".to_string());
         }
@@ -227,7 +227,7 @@ fn parse_frontmatter(
 }
 
 pub(crate) fn validate_name(name: &str, issues: &mut Vec<String>) {
-    if name.len() > 64 {
+    if name.chars().count() > 64 {
         issues.push("name too long (max 64 chars)".to_string());
     }
     if !is_kebab_case(name) {
@@ -575,6 +575,28 @@ Say hello to the world.
         assert!(entry.parse_status.is_ok());
     }
 
+    #[test]
+    fn test_validate_name_counts_characters_not_utf8_bytes() {
+        let mut issues = Vec::new();
+        validate_name(&"技".repeat(64), &mut issues);
+
+        assert!(
+            !issues
+                .iter()
+                .any(|issue| issue == "name too long (max 64 chars)")
+        );
+        assert!(issues.iter().any(|issue| issue == "name not kebab-case"));
+
+        let mut over_limit_issues = Vec::new();
+        validate_name(&"技".repeat(65), &mut over_limit_issues);
+
+        assert!(
+            over_limit_issues
+                .iter()
+                .any(|issue| issue == "name too long (max 64 chars)")
+        );
+    }
+
     // -----------------------------------------------------------------------
     // Edge Case Tests - Frontmatter
     // -----------------------------------------------------------------------
@@ -625,6 +647,35 @@ Search the web.
 
         assert_eq!(entry.metadata.name, "web-search"); // from dir_name
         assert!(entry.parse_status.is_degraded());
+    }
+
+    #[test]
+    fn whitespace_only_frontmatter_is_missing_not_invalid() {
+        // A blank line that keeps a stray space or tab is the same shape as
+        // an exactly empty block: missing frontmatter (degraded), never an
+        // invalid-YAML error that aborts validate and mounts.
+        for yaml in [" ", "\t", "  "] {
+            let content = format!("---\n{yaml}\n---\nBody\n");
+            let entry = parse_skill_md(&content, "demo");
+            assert!(
+                !entry.parse_status.is_error(),
+                "whitespace-only frontmatter {:?} must not be invalid YAML: {:?}",
+                yaml,
+                entry.parse_status
+            );
+            assert!(
+                entry.parse_status.is_degraded(),
+                "whitespace-only frontmatter {:?} must degrade like an empty block: {:?}",
+                yaml,
+                entry.parse_status
+            );
+            assert!(
+                format!("{:?}", entry.parse_status).contains("missing frontmatter"),
+                "whitespace-only frontmatter {:?} must report missing frontmatter: {:?}",
+                yaml,
+                entry.parse_status
+            );
+        }
     }
 
     #[test]

@@ -1,13 +1,12 @@
 //! Token Savings API handlers
 //!
-//! Provides endpoints that cross-reference genai_events.db with the external
-//! ~/.tokenless/stats.db to compute token savings metrics.
+//! Join captured tool calls with Tokenless API statistics or the local statistics database.
 
 use actix_web::{HttpResponse, Responder, get, web};
 use serde::{Deserialize, Serialize};
 
 use super::AppState;
-use crate::storage::sqlite::tokenless::{self, TokenlessStatsStore};
+use super::tokenless::{QueryClient, savings_rows};
 
 // ─── Query parameters ────────────────────────────────────────────────────────
 
@@ -349,13 +348,19 @@ fn compute_diff_lines(before: Option<&str>, after: Option<&str>) -> Vec<DiffLine
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
-/// Current UNIX time in nanoseconds
-fn now_ns() -> u64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos() as u64
+/// Nanoseconds since the Unix epoch at `at`; 0 if that clock is before it.
+///
+/// Every `/api/token-savings` request that defaults `end_ns` lands here, so a
+/// pre-epoch realtime clock (a failed RTC battery, a VM snapshot restored
+/// with a stale clock) must degrade to 0 — the family contract,
+/// `utils::epoch_nanos` — instead of unwrapping and taking the handler
+/// thread down. This was the one production-code straggler the family fixes
+/// (#6626 hardened the dashboard handlers and the CLI, #7238 the health
+/// endpoints) left behind: the bare unwrap was carried into this file by the
+/// `handlers.rs` split, and `/api/token-savings` kept dying without a
+/// response after every sibling endpoint had been hardened.
+fn now_ns(at: std::time::SystemTime) -> u64 {
+    crate::utils::epoch_nanos(at)
 }
 
 /// Compute compression ratio clamped to [0.0, 100.0].
@@ -475,17 +480,19 @@ pub(crate) fn generate_optimization_tips(
 
 /// GET /api/token-savings?start_ns=<i64>&end_ns=<i64>&agent_name=<str>
 ///
-/// Returns token savings data by cross-referencing genai_events.db
-/// with the external ~/.tokenless/stats.db.
+/// Refresh configured API statistics for captured tool IDs before computing savings.
 #[get("/token-savings")]
 pub async fn get_token_savings(
     data: web::Data<AppState>,
     query: web::Query<TokenSavingsQuery>,
+    client: Option<web::Data<QueryClient>>,
 ) -> impl Responder {
     if let Some(response) = super::handlers::reject_inverted_window(query.start_ns, query.end_ns) {
         return response;
     }
-    let end_ns = query.end_ns.unwrap_or_else(|| now_ns() as i64);
+    let end_ns = query
+        .end_ns
+        .unwrap_or_else(|| now_ns(std::time::SystemTime::now()) as i64);
     let start_ns = match super::handlers::start_or_default(
         query.start_ns,
         end_ns,
@@ -509,11 +516,6 @@ pub async fn get_token_savings(
         }
     };
 
-    // Step 2: Open stats.db (read-only, graceful if absent)
-    let stats_path = tokenless::default_stats_path();
-    let stats_store = TokenlessStatsStore::open_if_exists(&stats_path);
-    let stats_available = stats_store.is_some();
-
     // Step 3: Build tool_call_id → (turn_index, session_id) map from genai_events.
     // This gives us all known tool_use_ids and their session membership.
     let session_ids: Vec<&str> = sessions.iter().map(|s| s.session_id.as_str()).collect();
@@ -521,10 +523,16 @@ pub async fn get_token_savings(
         .get_tool_call_turn_indices(&session_ids)
         .unwrap_or_default();
 
-    // Step 4: Query stats.db by tool_use_ids (instead of session_ids)
-    let stats_by_session = if let Some(ref store) = stats_store {
-        let tool_use_ids: Vec<&str> = turn_indices.keys().map(|s| s.as_str()).collect();
-        let rows = store.get_stats_by_tool_use_ids(&tool_use_ids);
+    // Refresh and read statistics using the source tool IDs, not local session IDs.
+    // The records are bounded to the request window so the savings numerator
+    // shrinks with the denominator when the window narrows.
+    let tool_use_ids: Vec<&str> = turn_indices.keys().map(|s| s.as_str()).collect();
+    let (stats_available, rows) =
+        match savings_rows(&data, client, &tool_use_ids, start_ns, end_ns).await {
+            Ok(result) => result,
+            Err(response) => return response,
+        };
+    let stats_by_session = {
         // Group by session: use turn_indices to determine session, fallback to row.session_id
         let mut map: std::collections::HashMap<String, Vec<_>> = std::collections::HashMap::new();
         for row in rows {
@@ -535,8 +543,6 @@ pub async fn get_token_savings(
             map.entry(sid).or_default().push(row);
         }
         map
-    } else {
-        std::collections::HashMap::new()
     };
 
     // Step 5: Build response
@@ -758,6 +764,7 @@ pub async fn get_token_savings(
 pub async fn get_session_savings(
     data: web::Data<AppState>,
     path: web::Path<String>,
+    client: Option<web::Data<QueryClient>>,
 ) -> impl Responder {
     let session_id = path.into_inner();
 
@@ -795,18 +802,17 @@ pub async fn get_session_savings(
         .get_tool_call_turn_indices(&session_ids)
         .unwrap_or_default();
 
-    // Step 3: Open stats.db
-    let stats_path = tokenless::default_stats_path();
-    let stats_store = TokenlessStatsStore::open_if_exists(&stats_path);
-    let stats_available = stats_store.is_some();
-
+    let tool_use_ids: Vec<&str> = turn_indices.keys().map(|s| s.as_str()).collect();
+    // The per-session endpoint's denominator spans the session's whole
+    // history, so its numerator stays unbounded to match.
+    let (stats_available, rows) =
+        match savings_rows(&data, client, &tool_use_ids, 0, i64::MAX).await {
+            Ok(result) => result,
+            Err(response) => return response,
+        };
     let mut items = Vec::new();
     let mut total_compounded_saved: i64 = 0;
-
-    if let Some(ref store) = stats_store {
-        let tool_use_ids: Vec<&str> = turn_indices.keys().map(|s| s.as_str()).collect();
-        let rows = store.get_stats_by_tool_use_ids(&tool_use_ids);
-
+    {
         for row in &rows {
             // Only include rows belonging to this session
             let sid = turn_indices
@@ -997,6 +1003,24 @@ mod tests {
     }
 
     // ─── Unit tests for mapping functions ─────────────────────────────────
+
+    #[test]
+    fn now_ns_survives_a_pre_epoch_clock() {
+        use std::time::{Duration, SystemTime, UNIX_EPOCH};
+        // Red run: the previous body —
+        // `at.duration_since(UNIX_EPOCH).unwrap()` — panicked on this input,
+        // which is exactly what a /api/token-savings request with no `end_ns`
+        // did on a host whose realtime clock read before 1970-01-01 (a failed
+        // RTC battery, a VM snapshot restored with a stale clock): the unwrap
+        // took the handler thread down and the request died without a response
+        // while every sibling endpoint kept working.
+        assert_eq!(now_ns(SystemTime::UNIX_EPOCH - Duration::from_secs(1)), 0);
+        assert_eq!(now_ns(UNIX_EPOCH - Duration::from_secs(1_000_000_000)), 0);
+        // The epoch itself reads as 0, never a panic.
+        assert_eq!(now_ns(UNIX_EPOCH), 0);
+        // Post-epoch clocks count forward in nanoseconds.
+        assert_eq!(now_ns(UNIX_EPOCH + Duration::from_millis(1)), 1_000_000);
+    }
 
     #[test]
     fn savings_fraction_guards_zero_and_bounds_both_ends() {
@@ -1271,6 +1295,138 @@ mod tests {
         assert!(
             compounded_rate <= 1.0,
             "the compounded rate is documented as a fraction in [0, 1], got {compounded_rate}"
+        );
+
+        match orig_home {
+            Some(v) => unsafe { std::env::set_var("HOME", v) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// The window bounds the denominator (`list_sessions_for_savings`) but the
+    /// numerator read every stats record for the session's tool calls, of any
+    /// age: narrowing the dashboard window kept yesterday's optimizations in
+    /// `session_saved`, and the rate could inflate past 100% built entirely
+    /// from older records.
+    #[allow(clippy::await_holding_lock)]
+    #[actix_web::test]
+    async fn savings_window_excludes_out_of_window_stats_records() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let orig_home = std::env::var("HOME").ok();
+        let tmp = std::env::temp_dir().join(format!(
+            "agentsight_test_savings_windowed_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        // One session, two calls: an old one outside the window whose tool
+        // output was heavily compressed, and one inside the window.
+        let base_ns: i64 = 1_700_000_000_000_000_000;
+        let db_path = tmp.join("genai_events.db");
+        {
+            let store = crate::storage::sqlite::GenAISqliteStore::new_with_path(
+                &db_path,
+                crate::config::PeriodicStoragePolicy::default(),
+            )
+            .unwrap();
+            drop(store);
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            for (call, tool, input, output, at) in [
+                ("call-old", "tc-old", 500, 250, base_ns - 86_400_000_000_000),
+                ("call-in", "tc-in", 800, 400, base_ns + 500_000_000_000),
+            ] {
+                conn.execute(
+                    "INSERT INTO genai_events (event_type, session_id, call_id, agent_name, model, input_tokens, output_tokens, start_timestamp_ns, event_json, tool_call_ids)
+                     VALUES ('llm_call', 'sess-1', ?1, 'test-agent', 'gpt-4', ?2, ?3, ?4, '{}', ?5)",
+                    rusqlite::params![call, input, output, at, format!("[\"{tool}\"]")],
+                )
+                .unwrap();
+            }
+        }
+
+        // stats.db carrying the RFC3339 `timestamp` column: the old record
+        // saves 8_000 tokens, the in-window one 600.
+        let rfc3339 = |secs: i64| {
+            chrono::DateTime::from_timestamp(secs, 0)
+                .unwrap()
+                .to_rfc3339()
+        };
+        let stats_dir = tmp.join(".tokenless");
+        std::fs::create_dir_all(&stats_dir).unwrap();
+        {
+            let stats = rusqlite::Connection::open(stats_dir.join("stats.db")).unwrap();
+            stats
+                .execute_batch(
+                    "CREATE TABLE stats (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        session_id TEXT,
+                        tool_use_id TEXT,
+                        before_tokens INTEGER,
+                        after_tokens INTEGER,
+                        before_text TEXT,
+                        after_text TEXT,
+                        operation TEXT,
+                        timestamp TEXT
+                    );",
+                )
+                .unwrap();
+            for (tool, before, after, secs) in [
+                (
+                    "tc-old",
+                    9_000,
+                    1_000,
+                    (base_ns - 86_400_000_000_000) / 1_000_000_000,
+                ),
+                (
+                    "tc-in",
+                    1_000,
+                    400,
+                    (base_ns + 500_000_000_000) / 1_000_000_000,
+                ),
+            ] {
+                stats
+                    .execute(
+                        "INSERT INTO stats (session_id, tool_use_id, before_tokens, after_tokens, before_text, after_text, operation, timestamp)
+                         VALUES ('sess-1', ?1, ?2, ?3, 'long text', 'short', 'compress-response', ?4)",
+                        rusqlite::params![tool, before, after, rfc3339(secs)],
+                    )
+                    .unwrap();
+            }
+        }
+        unsafe { std::env::set_var("HOME", &tmp) };
+
+        let state = make_app_state(db_path);
+        let app = actix_test::init_service(
+            App::new()
+                .app_data(web::Data::new(state))
+                .service(get_token_savings),
+        )
+        .await;
+
+        // The window covers only the in-window call.
+        let req = actix_test::TestRequest::get()
+            .uri(&format!(
+                "/token-savings?start_ns={}&end_ns={}",
+                base_ns,
+                base_ns + 1_000_000_000_000
+            ))
+            .to_request();
+        let resp = actix_test::call_service(&app, req).await;
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = actix_test::read_body_json(resp).await;
+        assert_eq!(body["stats_available"], true);
+
+        let total_saved = body["summary"]["total_saved_tokens"].as_i64().unwrap();
+        assert_eq!(
+            total_saved, 600,
+            "the out-of-window record must not land in the numerator: {body}"
+        );
+        let rate = body["summary"]["savings_rate"].as_f64().unwrap();
+        assert!(
+            (rate - 600.0 / 1200.0).abs() < 1e-9,
+            "600 saved of the 1200 tokens billed inside the window, got {rate}"
         );
 
         match orig_home {

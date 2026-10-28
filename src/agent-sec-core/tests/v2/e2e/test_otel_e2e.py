@@ -51,7 +51,23 @@ class OtelEnvironment:
     def start(self, authorize=True, stderr=None, **env):
         self.socket = self.directory / "daemon.sock"
         self.log = (self.directory / "daemon.log").open("w+")
-        command = [self.binaries["agent-sec-daemon"], "--socket", str(self.socket)]
+        config = self.directory / "skillsec.json"
+        config.write_text(
+            json.dumps(
+                {
+                    "stateDir": str(self.directory / "skillsec-state"),
+                    "enableDefaultSkillDirs": False,
+                }
+            )
+        )
+        config.chmod(0o600)
+        command = [
+            self.binaries["agent-sec-daemon"],
+            "--socket",
+            str(self.socket),
+            "--skillsec-config",
+            str(config),
+        ]
         if authorize:
             command.extend(["--policy-admin-uid", str(os.getuid())])
         self.daemon = subprocess.Popen(

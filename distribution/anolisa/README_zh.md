@@ -66,9 +66,9 @@ unsafe-install 覆盖权限。
 通过 `anolisa adapter enable tokenless opencode` 启用 Tokenless 本地插件。
 ANOLISA 管理插件链接；启用或禁用后需重启 OpenCode。
 自定义配置目录及已有安装的接管规则见
-[adapter 参考](../../docs/user-guide/zh/user-entrypoint/anolisa-cli.md#adapter)。
+[adapter 参考](../../docs/user-guide/zh/getting-started/anolisa-cli.md#adapter)。
 
-千问办公 QwenWorkCN 的 macOS 本地模式使用
+千问办公 QwenWorkCN 的原生 Bash 和 macOS 工作区 Shell 会话使用
 `anolisa adapter enable tokenless qwenwork` 接入 Tokenless。完成后重启应用并在应用内
 检查激活状态；CLI 验证文件，但激活状态为 `unknown`。已有脚本安装需先卸载再通过 CLI 启用。
 
@@ -97,10 +97,15 @@ scope。因此，即使 system scope 已安装同名组件，
 | `--no-color` | 禁用彩色输出 |
 
 完整的命令形式、scope 行为与恢复流程见
-[CLI 用户指南](../../docs/user-guide/zh/user-entrypoint/anolisa-cli.md)。
+[CLI 用户指南](../../docs/user-guide/zh/getting-started/anolisa-cli.md)。
 
 RPM 安装支持 Yum 3 和 DNF 4。使用 `sudo` 执行 RPM `--dry-run`，
 可在安装前检查依赖和冲突。
+
+raw 安装可使用 `anolisa install <component> --backend raw --no-deps`
+跳过运行依赖检查和安装，也支持与 `--all` 组合。使用组件前需自行确保
+所需依赖可用。安装成功后会向 stderr 输出提醒，`--quiet` 可隐藏提醒。
+RPM 后端不支持此选项，会明确报错。
 
 ## 架构
 

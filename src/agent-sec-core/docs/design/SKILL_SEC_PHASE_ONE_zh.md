@@ -4,7 +4,13 @@
 
 SkillSec 在一个 `asc-capability-skill-sec` crate 内拆分 Skill 扫描、内容完整性、
 版本存储和激活，由系统 daemon 中的 `SkillSecService` 编排。本文记录迁移合同、开发批次
-及 Linux 验收边界。
+及 Linux 验收边界。当前合同不支持密钥轮转，以系统 `managedSkillDirs` 配置作为唯一持久化
+发现集合。下文带日期的旧换钥与私有登记表验收仅是历史证据，不代表当前功能。
+
+当前 Rust CLI 入口为 `agent-sec-cli skillsec`，`skill-ledger` 保留为兼容别名，使用相同的
+命令树、请求参数、输出和退出码。此次命名迁移不改变 `action.skill_sec`、审计事件类型、
+能力 ID、环境变量或持久化数据，现有 Hook 调用保持兼容。CLI 合同测试覆盖两种命令名，
+核心工作流及目录发现的进程测试使用 `skillsec`。
 
 ## 交付与验收
 
@@ -48,11 +54,11 @@ SkillFS notify -> 认证队列 / worker -> ActionService
 
 daemon 启动层统一组装 Service、Executor、Projector、Runtime 和共享 Finalizer。
 SkillFS 位于 `asc-daemon::skillfs`，复用现有 dispatcher/session 接口。启动顺序为准备 resolver
-与队列、注册 ActionService、执行恢复、启动 daemon 所有的 worker、开放 socket。
+与队列、注册 ActionService、启动 daemon 所有的 worker、开放 socket。
 即使未配置 SkillFS，worker 也会在后台线程执行有期限的发现与扫描。Executor 只持有解析与健康
 查询资源，不持有 worker。配置、私有状态或 bridge 初始化及 worker 启动失败
-阻止准入；换钥恢复未完成时保留围栏，允许 status／管理员重试；单项 reconcile 失败记录诊断
-并继续其他项。
+阻止准入。worker 调用普通逐 Skill 操作并沿用其回滚恢复，失败时记录诊断并继续其他项；
+启动覆盖来自配置发现，不再由私有历史登记补齐。
 
 普通请求沿用主干顶层 OTel carrier、兼容标签和 request scope。UID/GID/PID 来自内核；Agent
 baggage 仅用于关联，不授予权限。每个出队通知和启动恢复项建立独立 daemon Context；scan、
@@ -63,7 +69,7 @@ Finalizer，保持既有 telemetry 字段白名单和各输出失败隔离。
 SkillFS 保持 HMAC／notify 消息合同。认证会话先于普通请求分流，仍使用有界五秒交互；普通
 SkillSec 执行默认 60 秒，上限 120 秒，其他方法沿用配置。关闭顺序为停止 UDS 准入并排空请求，
 并行等待 SkillSec worker（65 秒）与 PAP（30 秒），再关闭外层 Runtime、持久化 sinks 和 OTel。
-等待中的通知通过重启后扫描登记 Skill 恢复，不提供持久队列或 exactly-once 保证。
+等待中的通知通过重启后扫描配置中的 Skill 恢复，不提供持久队列或 exactly-once 保证。
 
 Backing mount 先创建分离克隆，通过 `/proc/self/fd` 设为 private，再由 `move_mount` 发布，
 防止已运行 daemon 收到的副本被后续原位 FUSE 覆盖。daemon 无需新增挂载 capability；操作
@@ -227,9 +233,9 @@ V1 源码提供业务行为对照，不作为 Rust 运行时的回退实现。�
    canonical JSON 递归排序 key、使用紧凑 UTF-8、排除 `manifestHash` 与 `signature`，
    然后计算 SHA-256；Ed25519 签署 UTF-8 的 `sha256:<hex>` 字符串。这是新记录合同，
    不承诺 V1 字节兼容。SkillFS 的协议版本独立，保持不变。
-3. **换钥：** 仅管理员可轮换系统密钥，不保留旧公钥回退，换钥前的 V2 记录同样不继续验签。
-   换钥必须撤销旧 activation，再通过重新扫描、签名和激活建立信任。
-   第一批的密钥初始化 API 尚不实现换钥。
+3. **密钥生命周期：** 系统密钥初始化保持幂等，V2 不支持密钥轮转。`rotate-keys` 与
+   `init --force-keys` 保留可识别入口，但在副作用前拒绝执行。不保留换钥事务，
+   也不对未发布的私有登记表做兼容处理。
 4. **授权：** 当前允许所有本地用户操作所有受管 Skill。受管目录配置定义管理范围，
    不是按归属判断的 ACL。用户隔离留明确 TODO，不提供任意字节签名端点。
 5. **运行时：** 一个 root daemon 是唯一写入者；Rust CLI 调用 daemon，不回调 Python Ledger，
@@ -272,13 +278,12 @@ SkillFS 使用公共 V2 socket，权限检查适配系统 socket 布局，同时
 不因此开放其他 V1 RPC 方法。
 
 对于 `init`、`scan` 和 `certify`，Service 负责参数校验及后续密钥操作。Executor 通过公共
-运行时委托这些命令；非法扫描器名称，以及认证时格式错误的 findings，均在创建或轮换密钥前
+运行时委托这些命令；非法扫描器名称，以及认证时格式错误的 findings，均在创建密钥前
 失败。公开 Service 和独立 Scanner 入口校验输入，内部单 Skill 扫描使用明确的扫描器选择，
 不重复检查名称；baseline 处理多个 Skill 时也遵循同一规则。
 
-已有密钥的初始化检查使用共享 generation 锁。仅在密钥缺失时释放读锁，取得独占锁并再次检查
-后创建。换钥保留独占边界，同一 Skill 的写操作仍由自身的锁串行化。密钥权限、换钥状态和内容
-身份仍在实际使用时检查。
+密钥初始化串行执行，检查现有密钥后才创建缺失密钥；同一 Skill 的写操作仍由自身的锁串行化。
+密钥权限和内容身份仍在实际使用时检查，不再保留密钥替换的 generation 锁或换钥围栏。
 
 ## 回退边界
 
@@ -323,8 +328,8 @@ Unicode、元数据、符号链接、目录排除及覆盖不完整。仅归一�
 ## 第三批 Ledger 与 Service 边界
 
 `SkillSecService` 按 canonical Skill 身份加锁，直接路径和已验证的映射路径共用同一把锁，
-闲置锁条目会释放。操作持有密钥代际读锁，第五批换钥时使用写锁。受管目录精确登记在 daemon
-私有状态中，不会把用户指定目录的同级 Skill 自动纳入管理。
+闲置锁条目会释放。扫描或认证成功后将 canonical 精确路径记入实际系统配置，不维护第二份
+私有登记表，也不会把用户指定目录的同级 Skill 自动纳入管理。
 业务根目录不得位于 `.skill-meta` 内，包括已认证映射的物理路径；内部快照校验不经过该业务根入口。
 
 扫描先捕获最多 2,000 个普通文件、50 MiB、10,000 个目录、32 层深度，排除 `.git` 和 `.skill-meta`。
@@ -340,9 +345,10 @@ Unicode、元数据、符号链接、目录排除及覆盖不完整。仅归一�
 没有任何账本工件时，即使尚未初始化密钥，`check` 仍返回 `none`，空历史 `audit` 仍成功。
 这些只读查询不创建密钥或账本；已有工件仍须通过认证。
 
-登记在签名提交之后、激活发布之前。首次登记失败时，请求报错且不发布激活，但版本可能已经提交。
-启动恢复仅枚举已登记根目录，并拒绝当前配置范围外的目录。修复所报告的失败原因后，对未变化内容重试 `scan`，会复用可信版本并
-完成登记；不承诺为尚未成功响应的首次请求提供持久化发现队列。
+成功处理后保存配置，包括内容未变化的 noop。保存失败追加 warning，不丢弃 findings，也不阻止
+激活；重试 `scan` 可补存。已被 `managedSkillDirs` 模式覆盖的普通目录不重复添加；映射 Skill 始终保存 canonical
+精确项，供重启时经 resolver 发现。不承诺持久化发现队列，也不再通过登记表恢复无法发现的目录。
+单 Skill 回滚恢复及其校验顺序保持不变。
 
 导出从可信快照生成 `snapshot/`、`manifest.json` 和 `findings.json`。调用者须先在 Skill 与
 状态目录之外创建自己的空输出目录；Service 校验真实 peer UID、目录类型和写权限。daemon 不以
@@ -364,7 +370,8 @@ Service 已提供 `decide`、`clear_decision`、`show`、`activate` 和 `rollbac
 `show` 只读，分别呈现 latest/active、源目录一致性、findings 和有长度限制的审核说明。
 
 发布写入 SkillFS 使用的最小 schema-1 `activation.json` 与目录 xattr；目标是已验证快照、
-安全的待审核占位目录，或显式 block 对应的 null。`contractWritten`、
+安全的待审核占位目录，或显式 block 对应的 null。占位内容将目录名保留为 YAML 字符串，
+转义 YAML 会作为换行处理或拒绝的字面字符；description 和审核说明固定不变。`contractWritten`、
 `activationXattr.written`、`activationPending` 区分业务提交与发布完成。xattr 失败不会撤销
 已签名决策；activate 或启动 reconcile 可重试。发布成功不等于已证明真实 FUSE 暴露效果。
 
@@ -389,8 +396,9 @@ latest 的分裂，清理遗留内部临时项并重新发布。不引入自动�
 CLI 调用者自身权限执行。
 
 支持 `init`、`check`、`analyze`、`scan`、`certify`、`status`、`audit`、`list-scanners`、`decide`、
-`show`、`export`、`rotate-keys`，以及发布重试命令 `activate`。`init --no-baseline` 只建密钥；
-`init --force-keys` 与 `rotate-keys` 要求内核 UID 为 0。旧 `init-keys` 和用户口令 `--passphrase`
+`show`、`export`，以及发布重试命令 `activate`。`init --no-baseline` 只建密钥；
+`init --force-keys` 与 `rotate-keys` 在 CLI 发现和服务端根目录解析前返回不支持错误，RPC 返回
+`NotImplementedError`、退出码 1。旧 `init-keys` 和用户口令 `--passphrase`
 不属于系统密钥接口。`scan/certify` 可首次创建缺失密钥，但不会替换损坏密钥。`check` 的
  deny/tampered/error 退出 1；scan/certify 与完整 analyze 的风险结果退出 0。analyze 覆盖不足退出 1，
 非法输入退出 2。已提交操作可能退出 0 且 `activation.activationPending=true`；消费者必须检查
@@ -402,36 +410,34 @@ CLI 调用者自身权限执行。
 默认仍为 0600。这部分定向对齐尚未合并的系统服务 PR #3217（`5d2ff1f`）；不意味着该 PR 已合并，
 也不采用其服务身份设计。
 
-root 所有的 `/etc/agent-sec/skillsec.json` 或 `--skillsec-config` 指定 `stateDir`、精确
-`managedSkillDirs`、scanner 覆盖配置与 parsers。默认状态目录 `/var/lib/agent-sec/skillsec`
+root 所有的 `/etc/agent-sec/skillsec.json` 或 `--skillsec-config` 指定 `stateDir`、
+`managedSkillDirs`、`enableDefaultSkillDirs`、scanner 覆盖配置与 parsers。默认状态目录 `/var/lib/agent-sec/skillsec`
 要求 root 所有、0700，当前密钥保持 0600。不导入用户配置、旧历史和 keyring。
 `managedSkillDirs` 保留精确路径、末尾 `/*` 和末尾 `/**` 三种形式，与请求中的精确身份分开解析，
 不增加 `allowedSkillRoots`。递归发现包含有 `SKILL.md` 的模式根目录自身，跳过隐藏后代，拒绝符号
 链接遍历；每次聚合请求重新发现，因此通配范围内新增子目录无需重启。配置采用绝对路径，不展开 HOME。
 
-Executor 在物理解析和业务副作用前，拒绝不属于配置模式或已认证 SkillFS 挂载范围的调用路径。
-analyze、导出、后台工作及普通启动 reconcile 共用这个边界。聚合发现合并配置模式和仍受授权的
-登记历史，调用端发现不能扩权；一个越界调用路径就会使整个批次在处理任一 Skill 前失败。
-空 check/scan --all 仍为执行失败，不创建密钥；调用端发现限制为 1024 项。登记只记录运行历史，
-不能作为授权来源。status 使用当前配置和仍受授权的历史，不随调用者 HOME 改变。
-配置挂载子树不经 FUSE 遍历，其精确目录由认证通知和已有登记提供。
+Executor 在物理解析和业务副作用前，拒绝不属于默认/显式配置模式或已认证 SkillFS 挂载范围的调用路径。
+analyze、导出、后台工作及普通启动 reconcile 共用这个边界。聚合发现合并默认及显式配置模式，
+调用端输入不能扩权；一个越界调用路径就会使整个批次在处理任一 Skill 前失败。空 check/scan --all
+仍为执行失败，不创建密钥；调用端显式输入限制为 1024 项。status 使用同一配置，不随调用者 HOME
+改变。精确挂载项直接经已认证 resolver 解析，不通过 FUSE 遍历配置挂载子树。
 
-新的换钥若需撤销已移出范围的历史暴露，root 须先恢复该范围配置。已有的私有换钥恢复意图仍可在
-配置变化后完成撤销；例外仅适用于 root 换钥恢复，不允许对当前范围外目录发起新的 baseline 扫描。
+scan/certify/noop 成功处理后将路径记入 daemon 实际使用的配置文件，保留无关设置和安全权限。
+保存的精确项同时授予普通目录访问权限，移除 SkillFS 挂载或关闭默认目录发现后仍然有效；
+管理员还须移除保存项并重启 daemon 才撤销授权。保存失败追加业务 `warnings`，不隐藏扫描 findings 或激活结果。启动、status 和聚合
+请求共用这一份配置发现集合。
 
-CLI 的共享发现逻辑包括 `$XDG_DATA_HOME/anolisa/skills` 下的直接 Skill 子目录，遵循安装器的
-路径规则：未设置、为空、相对路径或原始路径含 `.`/`..` 段时，回退到
-`$HOME/.local/share/anolisa/skills`；合法但不存在的目录直接跳过。`HOME` 未设置或为空时，
-使用 CLI 当前用户的系统账户主目录。只有 CLI 读取调用者环境，
-`init --no-baseline` 和显式路径请求不触发发现，隐藏目录及快照过滤保持不变。
+`enableDefaultSkillDirs` 默认开启，省略时也为 true。daemon 启动时从本地 `/etc/passwd` 获取
+HOME，加入系统及标准用户目录，详见 [V2 指南](../../../../docs/user-guide/zh/agent-sec-core/skillsec-v2.md#系统配置与信任)。
+不使用调用者环境变量或 CLI 发现。仅默认发现限制为 10,000 个目录项、1,024 个新增 Skill；
+显式模式保持完整。单目录错误保留发现结果，返回 `discoveryErrors` 和失败状态。
+账户与配置变更需重启 daemon。
 
-换钥持有全局代际写锁，写入私有 intent，撤销全部登记 Skill 的 activation 后才替换密钥。
-有未完成回滚时须先 reconcile。撤销失败保留旧密钥，并阻止普通账本操作，直到管理员重试或启动
-恢复成功。intent 仅保存旧密钥指纹和 canonical Skill 身份；启动恢复、`rotate-keys` 和
-`init --force-keys` 在撤销前重新解析当前物理目录及 inode，Service 要求映射完整覆盖记录中的
-Skill 集合。解析失败保留 intent 和旧密钥，允许重试；指纹已经变化时无需再解析映射，只清理
-intent，不会再次换钥。启动恢复经过公共 Action Runtime；单个 Skill
-恢复失败可见，但不关闭其他 daemon 方法。
+`managed-skills.json` 和 `key-rotation.json` 不读取、不写入、不检测、不迁移，也不删除。
+不再维护换钥事务、重启重放或旧密钥回退；现有单 Skill 回滚 intent 和校验保持不变。
+启动只恢复当前配置能发现的目录；缺失或无法被发现的目录，需在可用后重试显式的已授权操作。
+恢复经公共 Action Runtime 执行，单个 Skill 失败不关闭其他 daemon 方法。
 
 公共 Finalizer/Sink 仅记录受控的 command、数量、判定状态、版本和执行错误类别；不包含原始
 findings、源码、导入证据、人工理由、路径和密钥字节。完整业务结果仍返回客户端。最多同时执行
@@ -441,15 +447,15 @@ CLI --timeout-ms 在服务端最多 120 秒；其他方法保留原有预算。�
 操作；findings 导入上限为 2 MiB。
 
 `v2/fixtures/skillsec/consumer.json` 提供正常、风险、未初始化、超时、执行错误及激活未完成
-样例。CLI 输出测试消费样例，Runtime 与真实 CLI 测试独立验证执行、调用者身份、换钥和审计脱敏。
-这些证据不代表 Hook 接入或 SkillFS 生效。第五批 Linux 格式检查、严格 Clippy、工作区测试及
+样例。CLI 输出测试消费样例，Runtime 与真实 CLI 测试独立验证执行、调用者身份、不支持换钥和审计脱敏。
+这些证据不代表 Hook 接入或 SkillFS 生效。以下为简化前的历史验收：第五批 Linux 格式检查、严格 Clippy、工作区测试及
 rustdoc 均通过，共覆盖 806 个不同测试。跨 UID CLI 用例在正常 root DAC 能力下运行，其他
 工作区测试采用削减 DAC 的配置。独立 daemon 与 CLI 完成 25 次操作，覆盖重启恢复、换钥、
 普通用户导出、PAP、公共 Code Scan，以及审计身份、风险判定和敏感内容脱敏。
 
 第五批保留公共审计的 `result.verdict`：按命令投影，批量操作取最高风险结果，非判定操作不虚构安全结论。
 单项 scan/certify/decide 保留 `keyCreated`；空 `check/scan --all` 返回执行失败且不创建密钥。
-调用端单次发现最多 1024 个目录，已持久化的系统注册表不受此请求输入限制，避免阻塞状态查询和换钥。
+调用端显式输入最多 1024 个目录；系统配置发现与调用端输入分别处理。
 
 root daemon 回滚后，恢复的普通文件与目录归属于源 Skill 目录的所有者，普通用户可以继续
 编辑。快照仍去除特权权限位。跨 UID CLI 用例验证回滚后由真实普通用户写入原文件。
@@ -471,13 +477,13 @@ worker 意外退出会关闭通知准入并报告不健康状态，需重启 dae
 
 SkillFS 认证客户端接受原有私有端点，或 root 所有的 `0755` 父目录加 `0666` socket。
 握手前检查祖先目录归属、符号链接、可写权限、端点类型与归属，以及已连接进程的内核 UID。
-HMAC 密钥仍为仅所有者可访问的 `0600` 普通文件。公共 socket 不授予管理员换钥权限，也不
+HMAC 密钥仍为仅所有者可访问的 `0600` 普通文件。公共 socket 不会开放不受支持的换钥，也不
 改变 PAP 授权；第一阶段仍允许所有本地用户操作所有受管 Skill。
 
 root 所有的 `--skillsec-config` 文件接受以下可选绑定。路径必须为规范化绝对路径，
 同一挂载的 canonical/live 根可完全相等（普通非原地挂载），否则必须互不包含；不同挂载的
 前缀不能重叠。daemon 和各 SkillFS 进程分别持有同一原始 HMAC 密钥的私有副本。
-该密钥独立于 `stateDir/signing-key.pk8`；系统签名换钥和用户 HOME 都不决定 HMAC 密钥。
+该密钥独立于 `stateDir/signing-key.pk8`，不由用户 HOME 决定。
 
 ```json
 {
@@ -500,7 +506,7 @@ control 端点保持私有：配置中的 peer UID、仅所有者访问的父目
 前缀、精确相对 Skill ID 和 `shared_path`。source/live 别名映射到同一个 canonical 锁身份。
 打开 backing 目录时检查返回的 device/inode，进入 service 后再次检查。配置内解析失败不
 回退读取 FUSE 可见视图。批量命令保留逐 Skill 的解析错误，`status` 仍返回密钥就绪状态。
-换钥的私有恢复记录持久化目录身份；映射未解析成功时不会开始替换密钥。
+`show` 对映射 Skill 的已有账本仍验证并报告风险，记忆路径不会绕过校验。
 
 一个 worker 按 canonical Skill 合并通知，默认 debounce 为 500 ms，持续编辑时最多延迟
 两秒。它通过公共 Action Runtime 执行 scan，然后执行 activation；扫描失败或 noop 也不
@@ -508,9 +514,9 @@ control 端点保持私有：配置中的 peer UID、仅所有者访问的父目
 重放。每个操作限时 30 秒。失败保留在审计、stderr 和 `status` 的 `skillfs` 计数中。
 关闭时停止队列接收，等待当前一组有界操作结束。
 
-daemon 同步恢复 rollback/latest/activation 后，由其持有的唯一 worker 根据当前精确路径、`/*`、
-`/**` 配置及仍受授权的历史记录发现普通 Skill，也包括尚未登记的 Skill；同时补扫已登记的挂载
-Skill，不要求 SkillFS 同时重启。发现复用 RPC 的有界、无符号链接遍历并跳过挂载子树。
+daemon 所有的唯一 worker 根据已启用的默认目录及当前精确路径、`/*`、`/**` 配置发现 Skill，
+同时补扫精确配置的挂载 Skill，不要求 SkillFS 同时重启。发现复用 RPC 的有界、无符号链接遍历，跳过挂载子树，
+精确挂载根目录直接交给 resolver。逐 Skill 处理仍执行恢复，不由另一份登记表补齐缺失目录。
 启动列表去重后进入同一扫描／激活循环，慢扫描不延迟 socket 开放。实时通知最多保留
 256 个不同 Skill，满队列返回签名拒绝。这是 Rust 相比 Python 无界 pending map 增加的
 明确资源限制，不表示持久化接受。挂载启动通知补充新发现的 Skill；没有持久事件队列，也不
@@ -547,7 +553,7 @@ V2 CI 使用 Node 22。`V2_CARGO_TARGET_DIR` 支持任务私有缓存，同时�
 不自动激活或创建密钥，以及 V1 unit 隔离。安装后的 Python V2 E2E 使用独立状态和审计目录，
 并以普通 UID 验证 root daemon 的 PAP 权限拒绝。这些检查与实际 systemd 生命周期和真实
 FUSE 证据分别记录。
-[核心指南](../../../../docs/user-guide/zh/agent-security/agent-sec-core/skillsec-v2.md)
+[核心指南](../../../../docs/user-guide/zh/agent-sec-core/skillsec-v2.md)
 提供源码/RPM 命令、共享卷要求及恢复匹配状态的升级回退步骤。
 
 历史交付验收（早于本次对齐）在 Alibaba Cloud Linux 4 x86_64 上通过。与主线系统 daemon 对齐后，源码
@@ -573,7 +579,7 @@ noexec，用例原位执行选定产物，仅在隔离测试 unit 注入非终�
 调整 daemon 初始化与命令结果校验，并将 Cosh 宿主超时设为 10 秒，覆盖顺序执行的
 3 秒初始化和 5 秒查询；不引入统一 Hook 框架或第二套策略层。
 六类适配器的行为和执行错误边界见
-[用户指南](../../../../docs/user-guide/zh/agent-security/agent-sec-core/skillsec-v2.md#agent-hook-接入)。
+[用户指南](../../../../docs/user-guide/zh/agent-sec-core/skillsec-v2.md#agent-hook-接入)。
 
 按四个逻辑提交交付：初始化、结果处理、真实 Rust CLI／daemon 合同、文档与验收记录。
 真实宿主验收单独推进。

@@ -151,9 +151,25 @@ $(ADAPTER_SRC_DIR)/qwenpaw/plugin.json: $(ADAPTER_SRC_DIR)/qwenpaw/plugin.json.i
 	@echo "==> Generating qwenpaw/plugin.json (version=$(VERSION))..."
 	sed 's/@VERSION@/$(VERSION)/g' $< > $@
 
+# The requirements file is the one stamped artifact whose content needs more
+# than the raw workspace version: it pins release-asset wheel URLs, where the
+# filename carries the PEP 440 normalized spelling (the pinned maturin names a
+# Cargo 0.9.0-rc.1 wheel anolisa_tokenless-0.9.0rc1-..., and pip refuses the
+# unnormalized form) while the release-tag path keeps the raw Cargo spelling
+# the release workflow tags verbatim. packaging/raw/verify-release.py owns that
+# contract and the normalization behind it, so the stamping asks its normalizer
+# through packaging/raw/wheel-version.py instead of carrying a second
+# implementation that could drift from the gate it has to satisfy. python3 is
+# already a hard requirement of this component (runtime Requires, the hooks,
+# and packaging/raw/package.sh, which runs the same gate).
 $(ADAPTER_SRC_DIR)/qwenpaw/requirements.txt: $(ADAPTER_SRC_DIR)/qwenpaw/requirements.txt.in Cargo.toml
-	@echo "==> Generating qwenpaw/requirements.txt (version=$(VERSION))..."
-	sed 's/@VERSION@/$(VERSION)/g' $< > $@
+	@wheel_version=$$(python3 packaging/raw/wheel-version.py '$(VERSION)') || { \
+	    echo "ERROR: cannot normalize $(VERSION) into a wheel filename version" >&2; \
+	    exit 1; }; \
+	test -n "$$wheel_version" || { \
+	    echo "ERROR: no wheel filename version for $(VERSION)" >&2; exit 1; }; \
+	echo "==> Generating qwenpaw/requirements.txt (version=$(VERSION), wheel version=$$wheel_version)..."; \
+	sed -e 's/@WHEEL_VERSION@/'"$$wheel_version"'/g' -e 's/@VERSION@/$(VERSION)/g' $< > $@
 
 $(AGENTSCOPE_PACKAGE_DIR)/pyproject.toml: \
     $(AGENTSCOPE_PACKAGE_DIR)/pyproject.toml.in Cargo.toml
@@ -324,9 +340,14 @@ test-claude-code-detect:
 # tests. It is unittest-shaped now and rides on this target beside the other
 # plain-python3 suites the Test tokenless job already runs, which is what
 # gives the raw packaging gate regression coverage in CI.
-test-integration: test-hook-parity test-claude-code-detect test-toon-cleanup test-hook-scripts test-qwenwork-hooks
+# Keep the worker protocol suite as a prerequisite so test-integration and
+# its aggregate callers cannot omit it. It is stdlib-only: the subprocess
+# fixture supplies Headroom stubs on PYTHONPATH, without a Headroom venv.
+test-integration: test-hook-parity test-claude-code-detect test-toon-cleanup test-hook-scripts \
+                  test-qwenwork-hooks test-headroom-pipeline-worker
 	@echo "==> Testing hook integration (Python)..."
 	python3 tests/test_codex_response_diagnostics.py
+	python3 tests/test_codex_rewrite_hook.py
 	python3 tests/test_hermes_lifecycle.py
 	python3 tests/test_compress_schema_hook.py
 	python3 tests/test_hook_payload_shapes.py
@@ -338,6 +359,11 @@ test-integration: test-hook-parity test-claude-code-detect test-toon-cleanup tes
 	python3 tests/test_verify_release_versions.py
 	python3 tests/test_qwenpaw_plugin.py
 	python3 tests/test_cosh_ng_compat.py
+	python3 tests/test_stats_http.py
+
+.PHONY: test-headroom-pipeline-worker
+test-headroom-pipeline-worker:
+	python3 tests/test_headroom_pipeline_worker_protocol.py
 
 # Keep this standalone entry free of Rust/plugin builds. CI runs the shared
 # suites through test-integration and only the installer through test-adapters.
@@ -350,7 +376,7 @@ test-qwenwork-hooks:
 	python3 tests/test_resolve_agent_id.py
 
 test-qwenwork-install:
-	@echo "==> Testing QwenWork macOS local-mode sideloading..."
+	@echo "==> Testing QwenWork sideloading..."
 	python3 tests/test_qwenwork_install.py
 
 # The L1 runner records an `rtk_version` in benchmark_identity.json through a
@@ -368,7 +394,9 @@ test-benchmark-rtk-probe:
 	@echo "==> Testing benchmark RTK version probe..."
 	bash tests/test-benchmark-rtk-version-probe.sh
 
+# Hook counterfactuals need both real binaries to rule out fail-open success.
 test-rtk-integration: test-benchmark-rtk-probe
+	cargo build --locked -p tokenless-cli
 	bash scripts/setup-rtk.sh
 	cargo build --release --locked --manifest-path third_party/rtk/Cargo.toml
 	TOKENLESS_TEST_RTK_BINARY="$(CURDIR)/third_party/rtk/target/release/rtk" \
@@ -426,6 +454,10 @@ test-adapters: build-openclaw-plugin build-dsh-plugin test-npm-package
 	bash tests/test-dsh-adapter.sh
 	@echo "==> Testing qoder adapter installer..."
 	bash tests/test-qoder-adapter-install.sh
+	@echo "==> Testing Claude Code adapter installer..."
+	bash tests/test-claude-code-adapter-install.sh
+	@echo "==> Testing Codex adapter installer..."
+	bash tests/test-codex-adapter-install.sh
 	@echo "==> Testing Qwen Code adapter installer..."
 	python3 tests/test_qwencode_install.py
 	@echo "==> Testing OpenCode adapter..."
@@ -485,8 +517,15 @@ stage-raw:
 	@$(MAKE) build-openclaw-plugin build-dsh-plugin
 	@./packaging/raw/package.sh stage
 
+# The second pass publishes a prerelease: that is the only version shape whose
+# release-tag path (raw Cargo 0.9.0-rc.1) and wheel filenames (PEP 440
+# normalized 0.9.0rc1, what the pinned maturin builds and what pip accepts)
+# differ, so it is the pass that would catch a stamping rule writing one
+# spelling into both positions. Both passes run packaging/raw/package.sh, whose
+# verify-release.py gate rejects the mix.
 test-raw-package:
 	@bash tests/test-package-raw.sh
+	@TOKENLESS_RAW_TEST_VERSION=0.9.0-rc.1 bash tests/test-package-raw.sh
 
 # tests/test-package-npm-prebuilt.sh drives npm/scripts/package-npm.js, whose
 # buildAdapters() recursively runs `make build-openclaw-plugin build-dsh-plugin`.
@@ -656,7 +695,7 @@ qoder-uninstall:
 
 # Explicit opt-in only; bulk adapter actions must not modify desktop plugins.
 qwenwork-install:
-	@echo "==> Sideloading tokenless for QwenWork (macOS local mode)..."
+	@echo "==> Sideloading tokenless for QwenWork (macOS)..."
 	@bash "$(SHARE_DIR)/qwenwork/scripts/install.sh"
 
 qwenwork-uninstall:
@@ -774,7 +813,7 @@ npm-package: prepare-npm-native-binaries \
 	@echo "==> Packaging anolisa-tokenless for npm (current platform)..."
 	node npm/scripts/package-npm.js
 
-# Package all four prebuilt target directories from target/npm-prebuilt.
+# Package all five prebuilt target directories from target/npm-prebuilt.
 npm-package-all:
 	@echo "==> Packaging anolisa-tokenless for npm (all platforms)..."
 	node npm/scripts/package-npm.js --all
@@ -795,7 +834,7 @@ NPM_REGISTRY ?= https://registry.npmjs.org/
 npm-publish: npm-package-all
 	@echo "==> Publishing anolisa-tokenless packages to $(NPM_REGISTRY) (platform packages first, root last)..."
 	@set -e; \
-	for pkg in tokenless-linux-x64 tokenless-linux-arm64 tokenless-darwin-x64 tokenless-darwin-arm64 tokenless; do \
+	for pkg in tokenless-linux-x64 tokenless-linux-arm64 tokenless-darwin-x64 tokenless-darwin-arm64 tokenless-win32-x64 tokenless; do \
 		dir=npm/dist/$$pkg; \
 		name=$$(node -p "require('./$$dir/package.json').name"); \
 		ver=$$(node -p "require('./$$dir/package.json').version"); \
@@ -838,7 +877,7 @@ help:
 	@echo "  hermes-uninstall  Uninstall Hermes Agent plugin"
 	@echo "  qoder-install     Register Qoder CLI plugin"
 	@echo "  qoder-uninstall   Unregister Qoder CLI plugin"
-	@echo "  qwenwork-install  Sideload QwenWork plugin (macOS local mode, opt-in)"
+	@echo "  qwenwork-install  Sideload QwenWork plugin (macOS, opt-in)"
 	@echo "  qwenwork-uninstall Remove the QwenWork sideload"
 	@echo "  test-qwenwork     Test QwenWork installer and shared hooks (no Rust build)"
 	@echo "  claude-code-install   Register Claude Code plugin via claude CLI"

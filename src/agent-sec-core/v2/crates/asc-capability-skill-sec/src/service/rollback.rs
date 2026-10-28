@@ -64,7 +64,7 @@ impl SkillSecService {
             let snapshot_path = ledger.versions.path.join(format!("{id}.snapshot"));
             let snapshot_tree = ScanTree::open(&snapshot_path, deadline)?;
             let (staging_dir, tree) =
-                content.scan_tree(&self.config.state_dir, &snapshot_tree, deadline)?;
+                content.scan_tree(&self.config()?.state_dir, &snapshot_tree, deadline)?;
             let mut entries = self.registry.scan_tree(
                 &tree,
                 &crate::scanner::DEFAULT_SCANNERS.map(String::from),
@@ -179,7 +179,7 @@ impl SkillSecService {
         key: &SigningIdentity,
         deadline: Instant,
     ) -> Result<bool, SkillSecError> {
-        let state = Directory::open(&self.config.state_dir)?;
+        let state = Directory::open(&self.config()?.state_dir)?;
         let bytes = match state.read(&intent_name(root), MAX_RECORD_BYTES, deadline) {
             Ok(bytes) => bytes,
             // No intent: backups are retained. Absence of an intent alone is
@@ -253,7 +253,7 @@ impl SkillSecService {
                 "rollback recovery record exceeds 8 MiB".into(),
             ));
         }
-        Directory::open(&self.config.state_dir)?.write_atomic(
+        Directory::open(&self.config()?.state_dir)?.write_atomic(
             &intent_name(root),
             &bytes,
             replace,
@@ -262,7 +262,7 @@ impl SkillSecService {
     }
 
     fn remove_intent(&self, root: &SkillRoot, deadline: Instant) -> Result<(), SkillSecError> {
-        Directory::open(&self.config.state_dir)?.remove_child(&intent_name(root), deadline)
+        Directory::open(&self.config()?.state_dir)?.remove_child(&intent_name(root), deadline)
     }
 }
 
@@ -523,7 +523,7 @@ mod tests {
             .unwrap();
         let directory = Directory::open(&root.io_dir).unwrap();
         let ledger = required_ledger(&directory).unwrap();
-        let key = KeyStore::open(&service.config.state_dir)
+        let key = KeyStore::open(&service.config().unwrap().state_dir)
             .unwrap()
             .load()
             .unwrap();
@@ -543,7 +543,7 @@ mod tests {
             .unwrap();
         intent.backup_links = source_links(&directory, deadline()).unwrap();
         intent.replace_started = true;
-        Directory::open(&service.config.state_dir)
+        Directory::open(&service.config().unwrap().state_dir)
             .unwrap()
             .write_atomic(
                 &intent_name(&root),
@@ -574,7 +574,14 @@ mod tests {
             fs::read_link(root.io_dir.join("nested/.git/link")).unwrap(),
             PathBuf::from("config")
         );
-        assert!(!service.config.state_dir.join(intent_name(&root)).exists());
+        assert!(
+            !service
+                .config()
+                .unwrap()
+                .state_dir
+                .join(intent_name(&root))
+                .exists()
+        );
     }
 
     #[test]
@@ -585,7 +592,7 @@ mod tests {
             .unwrap();
         let directory = Directory::open(&root.io_dir).unwrap();
         let ledger = required_ledger(&directory).unwrap();
-        let key = KeyStore::open(&service.config.state_dir)
+        let key = KeyStore::open(&service.config().unwrap().state_dir)
             .unwrap()
             .load()
             .unwrap();
@@ -609,7 +616,14 @@ mod tests {
         // prepared flag proves this rollback never replaced files, not that
         // the live tree still duplicates the copy (the edit above already
         // diverged them), so the pre-edit tree remains inspectable.
-        assert!(!service.config.state_dir.join(intent_name(&root)).exists());
+        assert!(
+            !service
+                .config()
+                .unwrap()
+                .state_dir
+                .join(intent_name(&root))
+                .exists()
+        );
         let retained = ledger
             .meta
             .path
@@ -624,7 +638,7 @@ mod tests {
             .begin_rollback(&root, &ledger, &backup, &manifest, deadline())
             .unwrap();
         intent.replace_started = true;
-        Directory::open(&service.config.state_dir)
+        Directory::open(&service.config().unwrap().state_dir)
             .unwrap()
             .write_atomic(
                 &intent_name(&root),
@@ -647,7 +661,14 @@ mod tests {
             fs::read_to_string(root.io_dir.join("run.sh")).unwrap(),
             "later edits"
         );
-        assert!(service.config.state_dir.join(intent_name(&root)).exists());
+        assert!(
+            service
+                .config()
+                .unwrap()
+                .state_dir
+                .join(intent_name(&root))
+                .exists()
+        );
     }
 
     /// The reviewer's exact counterexample: a prepared backup can hold the
@@ -666,7 +687,7 @@ mod tests {
             .unwrap();
         let directory = Directory::open(&root.io_dir).unwrap();
         let ledger = required_ledger(&directory).unwrap();
-        let key = KeyStore::open(&service.config.state_dir)
+        let key = KeyStore::open(&service.config().unwrap().state_dir)
             .unwrap()
             .load()
             .unwrap();
@@ -694,7 +715,12 @@ mod tests {
             "a never-started rollback must not undo later external edits"
         );
         assert!(
-            !service.config.state_dir.join(intent_name(&root)).exists(),
+            !service
+                .config()
+                .unwrap()
+                .state_dir
+                .join(intent_name(&root))
+                .exists(),
             "the prepared intent itself is dropped"
         );
         assert_eq!(
@@ -720,7 +746,7 @@ mod tests {
             .unwrap();
         let directory = Directory::open(&root.io_dir).unwrap();
         let ledger = required_ledger(&directory).unwrap();
-        let key = KeyStore::open(&service.config.state_dir)
+        let key = KeyStore::open(&service.config().unwrap().state_dir)
             .unwrap()
             .load()
             .unwrap();
@@ -733,7 +759,7 @@ mod tests {
             .begin_rollback(&root, &ledger, &backup, &manifest, deadline())
             .unwrap();
         intent.replace_started = true;
-        Directory::open(&service.config.state_dir)
+        Directory::open(&service.config().unwrap().state_dir)
             .unwrap()
             .write_atomic(
                 &intent_name(&root),

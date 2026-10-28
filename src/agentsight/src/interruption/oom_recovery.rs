@@ -63,8 +63,12 @@ pub fn recover_oom_events(
 
     let mut written = 0usize;
     for ev in &events {
-        // Skip events at or before the last recorded OOM timestamp
-        if since_ns > 0 && ev.timestamp_ns <= since_ns {
+        // Skip events strictly before the last recorded OOM timestamp. The
+        // boundary itself is not skipped: `dmesg -T` has one-second
+        // resolution, so a different pid killed in the same second as the
+        // recorded one still needs the per-event (pid, timestamp) check
+        // below. The comparison must not duplicate that check.
+        if since_ns > 0 && ev.timestamp_ns < since_ns {
             continue;
         }
 
@@ -291,6 +295,11 @@ fn parse_dmesg_lines(content: &str) -> Result<Vec<OomKillEvent>, Box<dyn std::er
     let mut events = Vec::new();
     // Boot epoch, only needed for boot-relative stamps; read once per scan.
     let boot_ns = boot_time_ns();
+    // Last report per pid, to fold the structured and summary spellings of one
+    // kill. `dmesg -T` has one-second resolution, so the pair can straddle a
+    // boundary and defeat the downstream exact-(pid, timestamp) dedup.
+    let mut last_report: std::collections::HashMap<i32, (bool, i64)> =
+        std::collections::HashMap::new();
 
     for line in content.lines() {
         // Summary format: "Killed process <pid> (<name>)"
@@ -298,14 +307,14 @@ fn parse_dmesg_lines(content: &str) -> Result<Vec<OomKillEvent>, Box<dyn std::er
         // Both must be recognised — memcg OOM on modern kernels (5.0+) emits
         // only the structured line, so matching the summary alone misses it (#3130).
         let parsed = if line.contains("Killed process") {
-            parse_killed_process(line)
+            parse_killed_process(line).map(|parsed| (parsed, false))
         } else if line.contains("oom-kill:") {
-            parse_oom_kill_structured(line)
+            parse_oom_kill_structured(line).map(|parsed| (parsed, true))
         } else {
             continue;
         };
 
-        let (pid, process_name) = match parsed {
+        let ((pid, process_name), structured) = match parsed {
             Some(v) => v,
             None => continue,
         };
@@ -324,6 +333,17 @@ fn parse_dmesg_lines(content: &str) -> Result<Vec<OomKillEvent>, Box<dyn std::er
                 _ => continue,
             },
         };
+
+        // One kill reported in both formats. Same-format reports stay separate:
+        // they are two kills of a recycled pid, not two descriptions of one.
+        if let Some((previous_structured, previous_ts)) = last_report.get(&pid) {
+            if *previous_structured != structured
+                && timestamp_ns.abs_diff(*previous_ts) <= 1_000_000_000
+            {
+                continue;
+            }
+        }
+        last_report.insert(pid, (structured, timestamp_ns));
 
         events.push(OomKillEvent {
             timestamp_ns,
@@ -854,6 +874,92 @@ printf '[%s] Out of memory: Killed process 4000003 (openclaw-gatewa) total-vm:10
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Two kills in the same second: the recorded one seeds the cutoff, and
+    /// the other must still be recovered. The cutoff used `<=`, which dropped
+    /// every event sharing the last recorded timestamp even though the
+    /// per-event `(pid, timestamp)` dedup had never seen that pid.
+    const FAKE_DMESG_SAME_SECOND: &str = r#"#!/bin/sh
+printf '[Fri Apr 17 10:00:00 2026] Out of memory: Killed process 4000101 (openclaw-gatewa) total-vm:1024kB\n'
+printf '[Fri Apr 17 10:00:00 2026] Out of memory: Killed process 4000102 (openclaw-gatewa) total-vm:1024kB\n'
+"#;
+
+    #[cfg(unix)]
+    #[test]
+    fn recovered_same_second_oom_kills_are_not_skipped() {
+        const CHILD: &str = "AGENTSIGHT_OOM_SAME_SECOND_CHILD";
+        let fake_dir = std::env::temp_dir().join(format!(
+            "agentsight-fake-dmesg-same-second-{}",
+            std::process::id()
+        ));
+
+        if std::env::var_os(CHILD).is_none() {
+            std::fs::create_dir_all(&fake_dir).expect("create fake dmesg directory");
+            let script = fake_dir.join("dmesg");
+            std::fs::write(&script, FAKE_DMESG_SAME_SECOND).expect("write fake dmesg");
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+                    .expect("make fake dmesg executable");
+            }
+            let path_var = format!(
+                "{}:{}",
+                fake_dir.display(),
+                std::env::var("PATH").unwrap_or_default()
+            );
+            let output = Command::new(std::env::current_exe().expect("test binary path"))
+                .args([
+                    "--exact",
+                    "interruption::oom_recovery::tests::recovered_same_second_oom_kills_are_not_skipped",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env("TZ", "UTC")
+                .env("PATH", path_var)
+                .output()
+                .expect("re-exec the test binary");
+            let _ = std::fs::remove_dir_all(&fake_dir);
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success() && stdout.contains("1 passed"),
+                "child test did not pass: {:?}\n{stdout}\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        let dir = std::env::temp_dir().join(format!("oom-same-second-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create fixture dir");
+        let istore = Arc::new(
+            InterruptionStore::new_with_path(&dir.join("interruption_events.db"))
+                .expect("interruption store"),
+        );
+        // 2026-04-17T10:00:00Z, the timestamp both fake dmesg lines carry.
+        let occurred_at_ns = 1_776_420_000_000_000_000i64;
+        istore
+            .insert(&InterruptionEvent::new(
+                InterruptionType::AgentCrash,
+                None,
+                None,
+                None,
+                None,
+                Some(4_000_101),
+                Some("OpenClaw".to_string()),
+                occurred_at_ns,
+                Some(serde_json::json!({"oom": true})),
+            ))
+            .expect("seed the already-recorded kill");
+
+        recover_oom_events(&istore, None, 0);
+
+        assert!(
+            istore.oom_event_exists(4_000_102, occurred_at_ns),
+            "a distinct pid killed in the recorded second must still be recovered"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn oom_recency_gate_rejects_stale_lines_and_accepts_fresh_ones() {
         // The wall-clock lines are a day apart and the cutoff sits between
@@ -1111,6 +1217,29 @@ esac
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].pid, 669334);
         assert_eq!(events[0].process_name, "python3");
+    }
+
+    #[test]
+    fn parse_dmesg_lines_collapses_one_kill_reported_twice() {
+        // A memcg OOM emits both the structured `oom-kill:` line and the
+        // "Killed process" summary. `dmesg -T` has one-second resolution, so
+        // the pair straddling a second boundary used to produce two events and
+        // two agent_crash rows for one kill.
+        let dmesg = "[Fri Apr 17 10:00:00 2026] oom-kill:constraint=CONSTRAINT_MEMCG,task=python3,pid=12345,uid=0\n\
+                     [Fri Apr 17 10:00:01 2026] Out of memory: Killed process 12345 (python3) total-vm:1024kB\n";
+        let events = parse_dmesg_lines(dmesg).expect("parse");
+        assert_eq!(events.len(), 1, "one kill must produce one event");
+        assert_eq!(events[0].pid, 12345);
+        assert_eq!(events[0].process_name, "python3");
+    }
+
+    #[test]
+    fn parse_dmesg_lines_keeps_distinct_kills_of_one_pid() {
+        // Two structured reports seconds apart are two kills (a recycled pid),
+        // not two descriptions of one.
+        let dmesg = "[Fri Apr 17 10:00:00 2026] oom-kill:constraint=CONSTRAINT_MEMCG,task=python3,pid=12345,uid=0\n\
+                     [Fri Apr 17 10:00:05 2026] oom-kill:constraint=CONSTRAINT_MEMCG,task=python3,pid=12345,uid=0\n";
+        assert_eq!(parse_dmesg_lines(dmesg).expect("parse").len(), 2);
     }
 
     #[test]

@@ -1,5 +1,9 @@
 //! Explicit system configuration, independent of caller HOME and environment variables.
 
+mod file;
+pub(crate) use file::remember;
+pub use file::{prepare_private_state, read_system_config};
+
 use crate::{SkillIdentity, SkillSecError};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -14,9 +18,23 @@ pub struct SkillSecConfig {
     // TODO(SkillSec maintainers): add per-user isolation before restricting the phase-one
     // contract that allows every local caller to operate every managed Skill.
     pub managed_skill_dirs: Vec<ManagedSkillDir>,
+    /// Standard directories derived by the daemon from trusted local account records.
+    /// Only discovery in this additional scope uses the default-discovery budget.
+    #[serde(default)]
+    pub default_skill_dirs: Vec<ManagedSkillDir>,
 }
 
 impl SkillSecConfig {
+    pub(crate) fn patterns(&self) -> impl Iterator<Item = &ManagedSkillDir> {
+        self.managed_skill_dirs
+            .iter()
+            .chain(&self.default_skill_dirs)
+    }
+
+    pub(crate) fn allows(&self, identity: &SkillIdentity) -> bool {
+        self.patterns().any(|pattern| pattern.contains(identity))
+    }
+
     /// Checks deployment paths before loading keys or accessing Skills.
     ///
     /// # Errors
@@ -74,6 +92,17 @@ impl ManagedSkillDir {
             root: SkillIdentity::new(base)?,
             scope,
         })
+    }
+
+    /// Rejects identities whose literal names would become wildcard authorization.
+    pub(crate) fn exact(identity: &SkillIdentity) -> Result<Self, SkillSecError> {
+        let pattern = Self::new(identity.path())?;
+        if pattern.scope != Scope::Exact {
+            return Err(SkillSecError::Invalid(
+                "Skill identity cannot be saved as an exact managedSkillDirs entry".into(),
+            ));
+        }
+        Ok(pattern)
     }
 
     /// Matches path components, excluding hidden descendants of wildcard roots.

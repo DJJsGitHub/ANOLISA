@@ -7,10 +7,14 @@
 pub mod config;
 pub mod diff;
 pub mod home;
+#[cfg(feature = "query-server")]
+pub mod http;
 pub mod path_policy;
 pub mod query;
+pub mod reader;
 pub mod record;
 pub mod recorder;
+pub mod rtk_outcome;
 pub mod sls;
 pub mod tokenizer;
 pub mod trace;

@@ -19,7 +19,7 @@ use asc_daemon_handler::{DaemonDispatcher, JsonRejectionEncoder, QueryHandler};
 use asc_daemon_service::ShutdownToken;
 use asc_event_sink::ConfiguredSecurityEventSinks;
 use asc_pap::{PapRepository, PapService, ScopeDiscovery};
-use asc_policy_repository_sqlite::SqlitePolicyRepository;
+use asc_policy_repository_sqlite::{SqlitePolicyRepository, select_policy_database_path};
 use asc_policy_runtime::reconciliation::ReconciliationRuntime;
 use asc_policy_types::scope::ScopeStatus;
 use asc_security_events::config::daemon_security_event_paths;
@@ -50,6 +50,7 @@ const FINAL_PASS_BUDGET: Duration = Duration::from_secs(5);
 /// The telemetry runtime's own shutdown grace, reserved at the end of the
 /// unit stop budget.
 const TELEMETRY_SHUTDOWN: Duration = Duration::from_secs(2);
+const FALLBACK_POLICY_DATABASE: &str = "/var/lib/agent-sec/policy/policy-state.db";
 
 fn main() -> ExitCode {
     install_panic_hook();
@@ -86,7 +87,20 @@ fn main() -> ExitCode {
     };
     let paths = asc_security_events::config::DaemonDataDirEnv::from_process();
     let data_dir = paths.override_dir.as_ref().unwrap_or(&paths.system_dir);
-    let repository = match SqlitePolicyRepository::open(&data_dir.join("policy-state.db")) {
+    let fallback = paths
+        .override_dir
+        .is_none()
+        .then(|| Path::new(FALLBACK_POLICY_DATABASE));
+    let repository = select_policy_database_path(&data_dir.join("policy-state.db"), fallback)
+        .map_err(std::io::Error::other)
+        .and_then(|path| {
+            tracing::info!(target: "asc_process_diagnostic", path = %path.display(), "Policy database selected");
+            SqlitePolicyRepository::open(&path).map_err(|error| std::io::Error::other(format!(
+                "cannot open Policy database '{}': {error}; refusing to switch databases; existing Policy state must be preserved",
+                path.display()
+            )))
+        });
+    let repository = match repository {
         Ok(repository) => Arc::new(repository),
         Err(problem) => {
             report_error(&telemetry, &problem);
@@ -174,9 +188,7 @@ async fn run(
         executor = executor.with_environment(bridge.environment());
     }
     let actions = asc_daemon::skill_application(finalizer, pii_rules, executor.clone());
-    if let Err(error) =
-        recover_and_start_skills(&skill_sec, &actions, &skill_worker, executor, telemetry)
-    {
+    if let Err(error) = start_skills(&actions, &skill_worker, executor) {
         report_error(telemetry, &error);
         return (
             ExitCode::FAILURE,
@@ -437,20 +449,11 @@ fn prepare_skillfs(
         .map(|bridge| bridge.map(Arc::new))
 }
 
-fn recover_and_start_skills(
-    service: &Arc<asc_capability_skill_sec::SkillSecService>,
+fn start_skills(
     actions: &Arc<asc_daemon_core::ActionService>,
     worker: &asc_daemon::SkillWorker,
     executor: asc_capability_skill_sec::executor::SkillSecExecutor,
-    telemetry: &asc_observability::TelemetryRuntime,
 ) -> Result<(), asc_daemon::skillfs::SkillFsError> {
-    let recovery = skill_sec::recover(service, actions);
-    if let Err(error) = recovery {
-        report_error(telemetry, &error);
-        telemetry.report(
-            "agent-sec-daemon: SkillSec recovery is degraded; status and administrator retry remain available",
-        );
-    }
     worker.start(actions.clone(), move || {
         executor.discover(std::time::Instant::now() + Duration::from_secs(30))
     })

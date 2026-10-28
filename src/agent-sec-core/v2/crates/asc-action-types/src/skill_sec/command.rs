@@ -19,10 +19,10 @@ pub enum SkillSecCommand {
         /// False corresponds to CLI --no-baseline.
         #[serde(default = "yes")]
         baseline: bool,
-        /// Root-only trust reset, identical to rotate-keys when keys exist.
+        /// Unsupported compatibility input; rejected before initialization.
         #[serde(default)]
         force_keys: bool,
-        /// Exact additional roots discovered by the CLI, never parent globs.
+        /// Exact additional roots explicitly supplied by the caller, never parent globs.
         #[serde(default)]
         skill_dirs: Vec<SkillIdentity>,
         /// Optional built-in scanner selection.
@@ -126,7 +126,13 @@ pub enum SkillSecCommand {
         /// Canonical root prepared by daemon startup.
         skill_dir: SkillIdentity,
     },
-    /// Replace the current system key; requires kernel UID zero.
+    /// Startup-only scan with the batch policy for read-only system defaults.
+    #[serde(skip)]
+    StartupScan {
+        /// Canonical root selected by daemon discovery.
+        skill_dir: SkillIdentity,
+    },
+    /// Unsupported compatibility request; never replaces the system key.
     RotateKeys {},
 }
 
@@ -141,7 +147,7 @@ impl SkillSecCommand {
             Self::Init { .. } => "init",
             Self::Check { .. } => "check",
             Self::Analyze { .. } => "analyze",
-            Self::Scan { .. } => "scan",
+            Self::Scan { .. } | Self::StartupScan { .. } => "scan",
             Self::Certify { .. } => "certify",
             Self::Status { .. } => "status",
             Self::Audit { .. } => "audit",
@@ -216,7 +222,8 @@ impl SkillSecCommand {
             | Self::Show { skill_dir }
             | Self::Export { skill_dir, .. }
             | Self::Activate { skill_dir }
-            | Self::Reconcile { skill_dir } => vec![skill_dir.clone()],
+            | Self::Reconcile { skill_dir }
+            | Self::StartupScan { skill_dir } => vec![skill_dir.clone()],
         };
         if let Self::Decide {
             action,

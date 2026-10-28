@@ -195,6 +195,42 @@
         },
         "state_dir": {
           "$ref": "#/$defs/text"
+        },
+        "limits": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "bindings": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 4096,
+              "default": 64
+            },
+            "events": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 4096,
+              "default": 128
+            },
+            "calls": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 4096,
+              "default": 64
+            },
+            "connections": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 4096,
+              "default": 128
+            },
+            "invocations_per_binding": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 4096,
+              "default": 256
+            }
+          }
         }
       }
     },
@@ -240,14 +276,25 @@
       "properties": {
         "adapter": {
           "enum": [
+            "pi",
             "qwenpaw",
+            "agentscope",
             "qoder",
             "openclaw",
-            "hermes"
+            "hermes",
+            "claude-sdk",
+            "qoder-sdk"
           ]
         },
         "argv": {
           "$ref": "#/$defs/argv"
+        },
+        "shutdown_grace_ms": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 120000,
+          "default": 2000,
+          "description": "Grace before forced Agent-group cleanup, starting when aw run first forwards an external termination signal."
         },
         "qoder": {
           "type": "object",
@@ -255,6 +302,108 @@
           "properties": {
             "sequential": {
               "type": "boolean"
+            }
+          }
+        },
+        "evidence": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "source_id",
+            "endpoint",
+            "query_timeout_ms",
+            "query_bytes",
+            "max_items",
+            "max_bytes"
+          ],
+          "allOf": [
+            {
+              "if": {
+                "properties": {
+                  "endpoint": {
+                    "pattern": "^https://"
+                  }
+                }
+              },
+              "then": {
+                "required": [
+                  "token_file"
+                ]
+              }
+            }
+          ],
+          "properties": {
+            "source_id": {
+              "$ref": "#/$defs/name"
+            },
+            "endpoint": {
+              "$ref": "#/$defs/text"
+            },
+            "token_file": {
+              "$ref": "#/$defs/text"
+            },
+            "query_timeout_ms": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 60000
+            },
+            "query_bytes": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 4194304
+            },
+            "max_items": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 128
+            },
+            "max_bytes": {
+              "type": "integer",
+              "minimum": 4096,
+              "maximum": 2097152
+            },
+            "mode": {
+              "type": "string",
+              "enum": [
+                "auto",
+                "off"
+              ]
+            }
+          }
+        },
+        "qoder_sdk": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "sites": {
+              "type": "array",
+              "minItems": 1,
+              "maxItems": 2,
+              "uniqueItems": true,
+              "items": {
+                "enum": [
+                  "global",
+                  "cn"
+                ]
+              }
+            },
+            "command_wrappers": {
+              "type": "array",
+              "maxItems": 16,
+              "items": {
+                "$ref": "#/$defs/qoderSdkAsset"
+              }
+            },
+            "runtime_preloads": {
+              "type": "array",
+              "maxItems": 16,
+              "items": {
+                "$ref": "#/$defs/qoderSdkAsset"
+              }
+            },
+            "declarative_plugins": {
+              "type": "boolean",
+              "default": false
             }
           }
         }
@@ -288,6 +437,26 @@
         },
         "config": {
           "type": "object"
+        },
+        "view": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "protocol",
+            "implementation",
+            "transport"
+          ],
+          "properties": {
+            "protocol": {
+              "const": "aw-provider-view/v1alpha1"
+            },
+            "implementation": {
+              "$ref": "#/$defs/name"
+            },
+            "transport": {
+              "$ref": "#/$defs/transport"
+            }
+          }
         }
       },
       "allOf": [
@@ -388,24 +557,7 @@
           "maxItems": 128
         },
         "match": {
-          "type": "object",
-          "additionalProperties": false,
-          "required": [
-            "tools"
-          ],
-          "properties": {
-            "tools": {
-              "type": "array",
-              "items": {
-                "type": "string",
-                "minLength": 1,
-                "maxLength": 256
-              },
-              "minItems": 1,
-              "maxItems": 128,
-              "uniqueItems": true
-            }
-          }
+          "$ref": "#/$defs/toolMatch"
         }
       }
     },
@@ -436,24 +588,7 @@
           "maxItems": 128
         },
         "match": {
-          "type": "object",
-          "additionalProperties": false,
-          "required": [
-            "tools"
-          ],
-          "properties": {
-            "tools": {
-              "type": "array",
-              "items": {
-                "type": "string",
-                "minLength": 1,
-                "maxLength": 256
-              },
-              "minItems": 1,
-              "maxItems": 128,
-              "uniqueItems": true
-            }
-          }
+          "$ref": "#/$defs/toolMatch"
         },
         "guard": {
           "const": "security.violation"
@@ -517,6 +652,9 @@
           "not": {
             "pattern": "[^A-Za-z0-9_.-]"
           }
+        },
+        "match": {
+          "$ref": "#/$defs/toolMatch"
         }
       },
       "oneOf": [
@@ -550,6 +688,49 @@
           }
         }
       ]
+    },
+    "toolMatch": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "tools"
+      ],
+      "properties": {
+        "tools": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256
+          },
+          "minItems": 1,
+          "maxItems": 128,
+          "uniqueItems": true
+        }
+      }
+    },
+    "qoderSdkAsset": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "sha256"
+      ],
+      "properties": {
+        "path": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 4096,
+          "pattern": "^/",
+          "not": {
+            "pattern": "\\u0000"
+          }
+        },
+        "sha256": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$"
+        }
+      }
     }
   }
 }

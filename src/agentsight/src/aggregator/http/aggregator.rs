@@ -9,6 +9,7 @@ use super::pair::HttpPair;
 mod pending_response;
 use super::response::AggregatedResponse;
 use super::sse_prefix::{SseReadState, repair_prefix};
+use super::sse_stream::SseStream;
 use crate::config::DEFAULT_CONNECTION_CAPACITY;
 use crate::parser::http::{HttpParser, ParsedHttpMessage, ParsedRequest, ParsedResponse};
 use crate::parser::sse::{ParsedSseEvent, SseParser};
@@ -16,6 +17,18 @@ use crate::probes::sslsniff::SslEvent;
 use crate::utils::decompress::ZstdStreamDecoder;
 use lru::LruCache;
 use pending_response::{PendingResponse, is_informational};
+#[path = "compact.rs"]
+mod compact;
+#[path = "lifecycle.rs"]
+pub(crate) mod lifecycle;
+#[cfg(test)]
+#[path = "lifecycle_tests.rs"]
+mod lifecycle_tests;
+#[cfg(test)]
+#[path = "pressure_tests.rs"]
+mod pressure_tests;
+#[path = "retained.rs"]
+mod retained;
 use std::cell::RefCell;
 use std::num::NonZeroUsize;
 use std::rc::Rc;
@@ -51,7 +64,7 @@ impl ConnectionId {
 /// `pub(crate)`: this is aggregation-internal state (review F3) — no
 /// crate-external consumer exists, and keeping it crate-private lets fields
 /// evolve (e.g. the incremental zstd decoder) without breaking the lib API.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub(crate) enum ConnectionState {
     /// Idle - waiting for request
     ///
@@ -88,51 +101,10 @@ pub(crate) enum ConnectionState {
         /// Incremental zstd decoder fed as compressed fragments arrive, so a
         /// stream whose frame never closes (HTTP/2 framing, missing chunked
         /// terminator) still decodes from the blocks flushed so far (#2267).
-        /// `Rc<RefCell<..>>` because this enum must stay `Clone` for the
-        /// snapshot/drain paths while the underlying zstd context is not
-        /// clonable — clones deliberately share the one live decoder, which
-        /// is also what lets a drain snapshot see the latest decoded bytes.
+        /// Interior mutability lets borrowed drain enrichment read flushed
+        /// output before ownership passes to finalization.
         zstd_decoder: Option<Rc<RefCell<ZstdStreamDecoder>>>,
     },
-}
-
-impl ConnectionState {
-    /// Estimate payload bytes retained specifically for request/response
-    /// correlation. Container overhead is excluded, so the value remains a
-    /// stable diagnostic rather than allocator-specific heap accounting.
-    fn buffered_bytes(&self) -> usize {
-        fn request_bytes(request: &ParsedRequest) -> usize {
-            request
-                .reassembled_body
-                .as_ref()
-                .map_or(request.body_len, Vec::len)
-        }
-
-        match self {
-            Self::Idle => 0,
-            Self::RequestPending { request } => request_bytes(request),
-            Self::RequestBodyPending { body_buffer, .. } => body_buffer.len(),
-            Self::ResponsePending { request, assembly } => request
-                .as_ref()
-                .map_or(0, request_bytes)
-                .saturating_add(assembly.buffered_bytes()),
-            Self::SseActive {
-                request,
-                response_headers,
-                sse_events,
-                compressed_buffer,
-                ..
-            } => {
-                request.as_ref().map_or(0, request_bytes)
-                    + response_headers.body_len
-                    + sse_events
-                        .iter()
-                        .map(|event| event.data().len())
-                        .sum::<usize>()
-                    + compressed_buffer.as_ref().map_or(0, Vec::len)
-            }
-        }
-    }
 }
 
 /// Snapshot of memory and lifecycle state retained by HTTP correlation.
@@ -193,10 +165,24 @@ pub struct HttpConnectionAggregator {
     /// path). Mirrors `AgentsightConfig::max_headers` so a raised cap
     /// applies to every HTTP/1 header parse, not only the first one.
     max_headers: usize,
-    /// Idle timeout before a connection state is forcibly dropped.
+    /// Soft timeout for pending snapshots and empty connection cleanup.
     idle_timeout: Duration,
     /// Cumulative automatic eviction count for diagnostics.
     eviction_count: u64,
+    bytes_budget: usize,
+    max_sse_retained_bytes: usize,
+    hard_timeout: Duration,
+    ready: Vec<AggregatedResult>,
+    compact_sse: bool,
+    sse_streams: LruCache<ConnectionId, SseStream>,
+    sse_errors: LruCache<ConnectionId, crate::aggregator::RemoveReason>,
+    /// Bounded markers prevent abandoned SSE tails from restarting correlation.
+    retired_sse: LruCache<ConnectionId, (Instant, crate::aggregator::RemoveReason)>,
+    /// Payload-free capacity reservations bridge requests on keep-alive connections.
+    recently_completed: LruCache<ConnectionId, Instant>,
+    request_chunks: LruCache<ConnectionId, super::chunk_stream::ChunkStream>,
+    retained: std::collections::HashMap<ConnectionId, retained::RetainedConnection>,
+    retained_metrics: ConnectionMetrics,
 }
 
 /// Default per-connection body buffer cap (8 MiB).
@@ -238,12 +224,31 @@ impl HttpConnectionAggregator {
             max_headers: crate::config::DEFAULT_MAX_HEADERS,
             idle_timeout,
             eviction_count: 0,
+            bytes_budget: crate::config::DEFAULT_CONNECTION_MAX_BYTES,
+            max_sse_retained_bytes: max_body_bytes.max(1024),
+            hard_timeout: Duration::from_secs(crate::config::DEFAULT_CONNECTION_HARD_TIMEOUT_SECS),
+            ready: Vec::new(),
+            compact_sse: false,
+            sse_streams: LruCache::new(cap),
+            sse_errors: LruCache::new(cap),
+            retired_sse: LruCache::new(cap),
+            recently_completed: LruCache::new(cap),
+            request_chunks: LruCache::new(cap),
+            retained: std::collections::HashMap::new(),
+            retained_metrics: ConnectionMetrics::default(),
         }
     }
 
     /// Current per-connection body buffer cap.
     pub fn max_body_bytes(&self) -> usize {
         self.max_body_bytes
+    }
+
+    /// Apply shared retention limits from runtime configuration.
+    pub(crate) fn configure_retention(&mut self, limits: &crate::config::RuntimeLimits) {
+        self.bytes_budget = limits.connection_max_bytes;
+        self.max_sse_retained_bytes = limits.max_sse_retained_bytes.max(1024);
+        self.hard_timeout = Duration::from_secs(limits.connection_hard_timeout_secs);
     }
 
     /// Set the HTTP/1 header cap for the aggregator's re-parse sites.
@@ -259,192 +264,14 @@ impl HttpConnectionAggregator {
         self.max_headers
     }
 
-    /// Insert connection state, logging if an unrelated entry is evicted by LRU.
-    /// Also records activity timestamp for idle eviction.
-    fn insert(&mut self, key: ConnectionId, state: ConnectionState) {
-        self.touch(&key);
-        if let Some((evicted_key, evicted_state)) = self.connections.push(key, state) {
-            if evicted_key != key {
-                self.eviction_count = self.eviction_count.saturating_add(1);
-                self.sse_continuation_buffers.pop(&evicted_key);
-                self.sse_read_state.pop(&evicted_key);
-                // `idle_snapshotted` is a one-shot marker ("this connection's
-                // in-flight call already has a pending row") and a kernel-reused
-                // `(pid, ssl_ptr)` key would inherit it, so the next call on that
-                // key is skipped by `snapshot_idle_connections` and never gets
-                // its pending row. `last_activity` is stale for the same reason.
-                self.idle_snapshotted.pop(&evicted_key);
-                self.last_activity.pop(&evicted_key);
-                // The side caches are keyed by connection as well. Their own LRU
-                // would eventually drop these entries, but until then they hold
-                // up to 1 MiB of continuation buffer per evicted connection.
-                log::warn!(
-                    "[HttpAggregator] LRU evicted conn={:?} state={} | capacity={}",
-                    evicted_key,
-                    match evicted_state {
-                        ConnectionState::Idle => "Idle",
-                        ConnectionState::RequestPending { .. } => "RequestPending",
-                        ConnectionState::ResponsePending { .. } => "ResponsePending",
-                        ConnectionState::RequestBodyPending { .. } => "RequestBodyPending",
-                        ConnectionState::SseActive { .. } => "SseActive",
-                    },
-                    self.connections.cap(),
-                );
-            }
-        }
-    }
-
-    /// Evict discardable connections that have been idle for longer than
-    /// `self.idle_timeout` or whose buffered body exceeds `self.max_body_bytes`.
-    ///
-    /// In-flight calls retain request evidence for interruption snapshots and
-    /// can still complete if more response bytes arrive after the idle timeout.
+    /// Run periodic inactivity and byte-limit maintenance.
     pub fn evict_idle_and_oversized(&mut self) {
-        let now = Instant::now();
-        let timeout = self.idle_timeout;
-        let max_bytes = self.max_body_bytes;
-
-        // Collect keys to evict (cannot mutate while iterating).
-        let to_evict: Vec<ConnectionId> = self
-            .last_activity
-            .iter()
-            .filter_map(|(k, ts)| {
-                if now.duration_since(*ts) > timeout {
-                    Some(*k)
-                } else {
-                    None
-                }
-            })
-            .collect();
-
-        let mut evicted_idle = 0usize;
-        for key in &to_evict {
-            if matches!(
-                self.connections.peek(key),
-                Some(
-                    ConnectionState::Idle | ConnectionState::ResponsePending { request: None, .. }
-                )
-            ) {
-                if matches!(
-                    self.connections.peek(key),
-                    Some(ConnectionState::ResponsePending { .. })
-                ) {
-                    log::warn!(
-                        "[HttpAggregator] discarded incomplete idle response | conn={key:?}"
-                    );
-                }
-                self.connections.pop(key);
-                self.sse_continuation_buffers.pop(key);
-                self.sse_read_state.pop(key);
-                self.last_activity.pop(key);
-                self.idle_snapshotted.pop(key);
-                evicted_idle += 1;
-            }
-        }
-        if evicted_idle > 0 {
-            self.eviction_count = self.eviction_count.saturating_add(evicted_idle as u64);
-            log::info!(
-                "[HttpAggregator] evicted {} idle connections (timeout={}s)",
-                evicted_idle,
-                timeout.as_secs()
-            );
-        }
-
-        // Also evict oversized body buffers. `buffered_bytes` covers a pending
-        // request body and an active SSE stream alike (parsed events plus any
-        // still-encoded compressed buffer), so an endless SSE response cannot
-        // retain events for the process lifetime. Merely idle in-flight states
-        // are deliberately kept: `snapshot_idle_connections` persists them as
-        // interruption evidence and a stream that resumes must still complete.
-        let oversized: Vec<ConnectionId> = self
-            .connections
-            .iter()
-            .filter_map(|(k, state)| {
-                let body_len = match state {
-                    ConnectionState::RequestBodyPending { .. }
-                    | ConnectionState::SseActive { .. } => state.buffered_bytes(),
-                    _ => 0,
-                };
-                if body_len > max_bytes { Some(*k) } else { None }
-            })
-            .collect();
-
-        for key in &oversized {
-            self.connections.pop(key);
-            self.sse_continuation_buffers.pop(key);
-            self.sse_read_state.pop(key);
-            self.last_activity.pop(key);
-            self.idle_snapshotted.pop(key);
-        }
-        if !oversized.is_empty() {
-            self.eviction_count = self.eviction_count.saturating_add(oversized.len() as u64);
-            log::warn!(
-                "[HttpAggregator] evicted {} oversized connections (max_body={}B)",
-                oversized.len(),
-                max_bytes
-            );
-        }
-    }
-
-    /// Snapshot non-idle connections that exceeded `idle_timeout`.
-    ///
-    /// These states can represent manually interrupted or abandoned LLM
-    /// streams. Returning cloned states lets the caller persist a pending GenAI
-    /// row while keeping the live connection available if the stream resumes.
-    pub(crate) fn snapshot_idle_connections(&mut self) -> Vec<(ConnectionId, ConnectionState)> {
-        let now = Instant::now();
-        let timeout = self.idle_timeout;
-        let keys: Vec<ConnectionId> = self
-            .last_activity
-            .iter()
-            .filter_map(|(k, ts)| {
-                if now.duration_since(*ts) > timeout {
-                    Some(*k)
-                } else {
-                    None
-                }
-            })
-            .collect();
-
-        let mut result = Vec::new();
-        for key in keys {
-            if self.idle_snapshotted.peek(&key).is_some() {
-                continue;
-            }
-            if let Some(state) = self.connections.peek(&key) {
-                match state.clone() {
-                    ConnectionState::Idle => {}
-                    state => {
-                        self.idle_snapshotted.push(key, ());
-                        result.push((key, state));
-                    }
-                }
-            }
-        }
-
-        if !result.is_empty() {
-            log::info!(
-                "[HttpAggregator] snapshotted {} idle in-flight connection(s) (timeout={}s)",
-                result.len(),
-                timeout.as_secs()
-            );
-        }
-
-        result
-    }
-
-    /// Backward-compatible alias for idle snapshots.
-    ///
-    /// No in-crate caller today; kept (dead_code-allowed) because narrowing
-    /// visibility for review F3 must not silently drop API surface that the
-    /// alias was published for.
-    #[allow(dead_code)]
-    pub(crate) fn drain_idle_connections(&mut self) -> Vec<(ConnectionId, ConnectionState)> {
-        self.snapshot_idle_connections()
+        self.tick(Instant::now());
     }
 
     /// Record activity timestamp for a connection.
     fn touch(&mut self, key: &ConnectionId) {
+        self.connections.promote(key);
         self.last_activity.push(*key, Instant::now());
     }
 
@@ -557,6 +384,9 @@ impl HttpConnectionAggregator {
         connection_id: &ConnectionId,
         response_headers: &ParsedResponse,
     ) {
+        if self.sse_streams.contains(connection_id) {
+            return;
+        }
         const MAX_CONTINUATION_BYTES: usize = 1 << 20; // 1 MiB cap
         let body = response_headers.body();
         if body.is_empty() {
@@ -585,11 +415,6 @@ impl HttpConnectionAggregator {
         zstd_decoder: Option<&RefCell<ZstdStreamDecoder>>,
         src: &SslEvent,
     ) -> Vec<ParsedSseEvent> {
-        let body = if is_chunked {
-            crate::utils::decompress::dechunk_body(raw_buffer)
-        } else {
-            raw_buffer.to_vec()
-        };
         // Prefer the incremental decoder output: it recovers every block the
         // gateway flushed even when the zstd frame never closed, which
         // whole-buffer decompression cannot (#2267). Empty output means the
@@ -599,7 +424,14 @@ impl HttpConnectionAggregator {
         let decoder_output = zstd_decoder.map(|d| d.borrow_mut().decoded_output());
         let decompressed = match decoder_output {
             Some(out) if !out.is_empty() => out,
-            _ => crate::utils::decompress::decompress_body(&body, content_encoding),
+            _ => {
+                let body = if is_chunked {
+                    std::borrow::Cow::Owned(crate::utils::decompress::dechunk_body(raw_buffer))
+                } else {
+                    std::borrow::Cow::Borrowed(raw_buffer)
+                };
+                crate::utils::decompress::decompress_body(&body, content_encoding)
+            }
         };
         let synthetic = std::rc::Rc::new(SslEvent {
             source: src.source,
@@ -640,7 +472,14 @@ impl HttpConnectionAggregator {
         sse_events: Vec<ParsedSseEvent>,
     ) -> AggregatedResult {
         let mut response = AggregatedResponse::from_parsed(response_headers);
-        response.set_sse_events(sse_events);
+        if let Some(stream) = self.sse_streams.pop(&connection_id) {
+            let (events, count, timestamp) = stream.into_events();
+            response.set_sse_events(events);
+            response.captured_sse_event_count = Some(count);
+            response.completion_timestamp_ns = Some(timestamp);
+        } else {
+            response.set_sse_events(sse_events);
+        }
         response.sse_continuation_bytes = self.sse_continuation_buffers.pop(&connection_id);
         self.sse_read_state.pop(&connection_id);
 
@@ -704,8 +543,16 @@ impl HttpConnectionAggregator {
     }
 
     /// Process HTTP Request (from HTTP Parser)
-    pub fn process_request(&mut self, request: ParsedRequest) {
+    pub fn process_request(&mut self, mut request: ParsedRequest) {
         let connection_id = ConnectionId::from_ssl_event(&request.source_event);
+        if self.connections.contains(&connection_id) {
+            self.abandon(&connection_id, crate::aggregator::RemoveReason::Replaced);
+        }
+        self.retired_sse.pop(&connection_id);
+        if !self.ensure_room(&connection_id) {
+            self.reject_capacity(connection_id, ConnectionState::RequestPending { request });
+            return;
+        }
         self.idle_snapshotted.pop(&connection_id);
 
         if matches!(
@@ -722,6 +569,15 @@ impl HttpConnectionAggregator {
             .headers
             .get("content-length")
             .and_then(|v| v.parse().ok());
+
+        if request.body().len() > self.max_body_bytes
+            || content_length.is_some_and(|len| len > self.max_body_bytes)
+        {
+            lifecycle::metadata_request(&mut request);
+            self.insert(connection_id, ConnectionState::RequestPending { request });
+            self.abandon(&connection_id, crate::aggregator::RemoveReason::OverBudget);
+            return;
+        }
 
         let body_complete = match content_length {
             Some(cl) => request.body_len >= cl,
@@ -749,6 +605,17 @@ impl HttpConnectionAggregator {
         };
 
         if body_complete {
+            // One TLS read can carry the declared body plus the next
+            // pipelined request (or simply more bytes than Content-Length).
+            // Keeping the surplus makes `json_body` reject the whole body as
+            // trailing garbage, silently dropping the request view; the
+            // split-read path already truncates to the declared length.
+            if let Some(content_length) = content_length.filter(|length| request.body_len > *length)
+            {
+                let body = request.body()[..content_length].to_vec();
+                request.set_reassembled_body(body);
+                request.source_event = Rc::new(request.source_event.metadata_only());
+            }
             log::trace!(
                 "[HttpAggregator] State transition: -> RequestPending | conn={:?} | method={} | path={}",
                 connection_id,
@@ -765,7 +632,27 @@ impl HttpConnectionAggregator {
                 request.body_len,
                 content_length,
             );
-            let initial_body = request.body().to_vec();
+            let mut initial_body = Vec::with_capacity(
+                content_length
+                    .unwrap_or(request.body().len())
+                    .min(self.max_body_bytes),
+            );
+            initial_body.extend_from_slice(request.body());
+            let mut framing_error = false;
+            if content_length.is_none() {
+                let mut chunks = super::chunk_stream::ChunkStream::default();
+                if let Err(error) = chunks.feed(&initial_body, |_| Ok(())) {
+                    log::warn!(
+                        "Cannot frame initial request body | conn={connection_id:?}: {error}"
+                    );
+                    framing_error = true;
+                }
+                self.request_chunks.put(connection_id, chunks);
+            }
+            request.source_event = Rc::new(request.source_event.metadata_only());
+            request.body_offset = 0;
+            request.body_len = 0;
+            request.reassembled_body = None;
             self.insert(
                 connection_id,
                 ConnectionState::RequestBodyPending {
@@ -774,30 +661,67 @@ impl HttpConnectionAggregator {
                     body_buffer: initial_body,
                 },
             );
+            if framing_error {
+                self.abandon(
+                    &connection_id,
+                    crate::aggregator::RemoveReason::ProtocolError,
+                );
+            }
         }
     }
 
     /// Process HTTP Response (from HTTP Parser)
     /// Returns completed HttpPair or SSE started signal
-    pub fn process_response(&mut self, mut response: ParsedResponse) -> Option<AggregatedResult> {
+    pub fn process_response(&mut self, response: ParsedResponse) -> Option<AggregatedResult> {
+        let result = self.process_response_inner(response);
+        self.record_completed(result.as_ref());
+        result
+    }
+
+    fn process_response_inner(&mut self, mut response: ParsedResponse) -> Option<AggregatedResult> {
         let connection_id = ConnectionId::from_ssl_event(&response.source_event);
+        if self
+            .retired_sse
+            .peek(&connection_id)
+            .is_some_and(|(_, reason)| *reason == crate::aggregator::RemoveReason::CapacityRejected)
+        {
+            return None;
+        }
+        self.retired_sse.pop(&connection_id);
 
         while is_informational(response.status_code) {
             if response.body().is_empty() {
                 return None;
             }
-            let mut event = (*response.source_event).clone();
+            let mut event = response.source_event.metadata_only();
             event.buf = response.body().to_vec();
             event.len = event.buf.len() as u32;
-            // Re-parse the response that follows an interim 1xx with the same
-            // configured header cap as the first parse, so a raised
-            // `max_headers` is not silently reverted to the default here.
-            match HttpParser::with_max_headers(self.max_headers).parse(Rc::new(event.clone())) {
+            let event = Rc::new(event);
+            match HttpParser::with_max_headers(self.max_headers).parse(Rc::clone(&event)) {
                 Ok(ParsedHttpMessage::Response(next)) => response = next,
                 _ => return self.process_response_bytes(&event),
             }
         }
-        let state = self.connections.pop(&connection_id)?;
+        let state = self
+            .connections
+            .pop(&connection_id)
+            .unwrap_or(ConnectionState::Idle);
+        if !self.ensure_room(&connection_id) {
+            let end_timestamp_ns = response.source_event.timestamp_ns;
+            self.reject_capacity(
+                connection_id,
+                ConnectionState::ResponsePending {
+                    request: None,
+                    assembly: PendingResponse::Body {
+                        response,
+                        framing: pending_response::Framing::Length(0),
+                        end_timestamp_ns,
+                    },
+                },
+            );
+            return None;
+        }
+        self.touch(&connection_id);
 
         match state {
             ConnectionState::RequestBodyPending {
@@ -815,12 +739,16 @@ impl HttpConnectionAggregator {
                     body_buffer.truncate(cl);
                 }
                 let mut completed_request = request;
-                completed_request.reassembled_body = Some(body_buffer);
+                completed_request.set_reassembled_body(body_buffer);
 
                 if response.is_sse() {
                     let mut response_headers = response;
-                    let (sse_events, compressed_buffer, content_encoding, zstd_decoder) =
-                        Self::sse_entry_state(&response_headers);
+                    let (sse_events, compressed_buffer, content_encoding, zstd_decoder) = self
+                        .sse_entry_state_for_connection(
+                            connection_id,
+                            &response_headers,
+                            Some(&completed_request),
+                        );
                     // Seed before `body_len` is zeroed: `body()` indexes the
                     // response's own read, which no later continuation
                     // producer ever sees again.
@@ -831,6 +759,11 @@ impl HttpConnectionAggregator {
                         );
                     }
                     response_headers.body_len = 0;
+                    if self.sse_streams.contains(&connection_id) {
+                        response_headers.body_offset = 0;
+                        response_headers.source_event =
+                            Rc::new(response_headers.source_event.metadata_only());
+                    }
                     // The whole compressed body arrived with the headers, so
                     // the response's own event is the completing read.
                     let completion_event = response_headers.source_event.clone();
@@ -886,8 +819,12 @@ impl HttpConnectionAggregator {
                         response.status_code,
                     );
                     let mut response_headers = response;
-                    let (sse_events, compressed_buffer, content_encoding, zstd_decoder) =
-                        Self::sse_entry_state(&response_headers);
+                    let (sse_events, compressed_buffer, content_encoding, zstd_decoder) = self
+                        .sse_entry_state_for_connection(
+                            connection_id,
+                            &response_headers,
+                            Some(&request),
+                        );
                     // See the RequestBodyPending branch: seed the first read's
                     // body before `body_len` is zeroed.
                     if compressed_buffer.is_none() {
@@ -897,6 +834,11 @@ impl HttpConnectionAggregator {
                         );
                     }
                     response_headers.body_len = 0;
+                    if self.sse_streams.contains(&connection_id) {
+                        response_headers.body_offset = 0;
+                        response_headers.source_event =
+                            Rc::new(response_headers.source_event.metadata_only());
+                    }
                     // The whole compressed body arrived with the headers, so
                     // the response's own event is the completing read.
                     let completion_event = response_headers.source_event.clone();
@@ -958,7 +900,7 @@ impl HttpConnectionAggregator {
                     );
                     let mut response_headers = response;
                     let (sse_events, compressed_buffer, content_encoding, zstd_decoder) =
-                        Self::sse_entry_state(&response_headers);
+                        self.sse_entry_state_for_connection(connection_id, &response_headers, None);
                     // See the RequestBodyPending branch: seed the first read's
                     // body before `body_len` is zeroed.
                     if compressed_buffer.is_none() {
@@ -968,6 +910,11 @@ impl HttpConnectionAggregator {
                         );
                     }
                     response_headers.body_len = 0;
+                    if self.sse_streams.contains(&connection_id) {
+                        response_headers.body_offset = 0;
+                        response_headers.source_event =
+                            Rc::new(response_headers.source_event.metadata_only());
+                    }
                     // The whole compressed body arrived with the headers, so
                     // the response's own event is the completing read.
                     let completion_event = response_headers.source_event.clone();
@@ -1030,6 +977,18 @@ impl HttpConnectionAggregator {
 
     /// Process raw body data (continuation bytes for an in-progress request)
     pub fn process_raw_body_data(&mut self, ssl_event: &SslEvent) -> Option<AggregatedResult> {
+        if self.discard_retired_sse(ssl_event) {
+            return None;
+        }
+        let result = self.process_raw_body_data_inner(ssl_event);
+        self.record_completed(result.as_ref());
+        result
+    }
+
+    fn process_raw_body_data_inner(&mut self, ssl_event: &SslEvent) -> Option<AggregatedResult> {
+        if self.accepts_compact_sse_bytes(ssl_event) {
+            return self.process_compact_sse_bytes(ssl_event);
+        }
         let connection_id = ConnectionId::from_ssl_event(ssl_event);
         if self.accepts_response_bytes(ssl_event) || self.starts_response(ssl_event) {
             return self.process_response_bytes(ssl_event);
@@ -1042,19 +1001,56 @@ impl HttpConnectionAggregator {
                 expected_body_len,
                 mut body_buffer,
             } => {
-                // Append new data to buffer
                 let data = &ssl_event.buf[..ssl_event.buf_size() as usize];
-                body_buffer.extend_from_slice(data);
+                let remaining = self.max_body_bytes.saturating_sub(body_buffer.len());
+                let take = remaining.min(data.len());
+                body_buffer.reserve_exact(take);
+                body_buffer.extend_from_slice(&data[..take]);
+                if take != data.len() {
+                    self.insert(
+                        connection_id,
+                        ConnectionState::RequestBodyPending {
+                            request,
+                            expected_body_len,
+                            body_buffer,
+                        },
+                    );
+                    self.abandon(&connection_id, crate::aggregator::RemoveReason::OverBudget);
+                    return None;
+                }
 
                 // Check if body is now complete
+                let mut framing_error = false;
                 let complete = match expected_body_len {
                     Some(cl) => body_buffer.len() >= cl,
                     None => {
                         // chunked: same framed check as process_request
-                        crate::utils::decompress::chunked_stream_complete(&body_buffer)
+                        self.request_chunks.get_mut(&connection_id).is_some_and(|chunks| {
+                            if let Err(error) = chunks.feed(data, |_| Ok(())) {
+                                log::warn!("Cannot frame request continuation | conn={connection_id:?}: {error}");
+                                framing_error = true;
+                                return false;
+                            }
+                            chunks.done()
+                        })
                     }
                 };
 
+                if framing_error {
+                    self.insert(
+                        connection_id,
+                        ConnectionState::RequestBodyPending {
+                            request,
+                            expected_body_len,
+                            body_buffer,
+                        },
+                    );
+                    self.abandon(
+                        &connection_id,
+                        crate::aggregator::RemoveReason::ProtocolError,
+                    );
+                    return None;
+                }
                 if complete {
                     log::debug!(
                         "[HttpAggregator] State transition: RequestBodyPending -> RequestPending (body complete) | conn={:?} | total_body={}",
@@ -1064,8 +1060,14 @@ impl HttpConnectionAggregator {
                     if let Some(cl) = expected_body_len {
                         body_buffer.truncate(cl);
                     }
+                    self.request_chunks.pop(&connection_id);
+                    if body_buffer.capacity()
+                        > body_buffer.len().saturating_add(body_buffer.len() / 4)
+                    {
+                        body_buffer.shrink_to_fit();
+                    }
                     let mut completed_request = request;
-                    completed_request.reassembled_body = Some(body_buffer);
+                    completed_request.set_reassembled_body(body_buffer);
                     self.insert(
                         connection_id,
                         ConnectionState::RequestPending {
@@ -1105,23 +1107,29 @@ impl HttpConnectionAggregator {
                 // (HTTP/2, missing terminator) still yields its events (#2267).
                 // The raw buffer is kept in parallel: it feeds the chunked
                 // completion check and the whole-buffer fallback.
+                let limit = MAX_COMPRESSED_SSE_BUFFER.min(self.max_sse_retained_bytes);
+                let take = data.len().min(limit.saturating_sub(buf.len()));
                 if let Some(decoder) = &zstd_decoder {
-                    decoder.borrow_mut().feed(data);
+                    decoder.borrow_mut().feed(&data[..take]);
                 }
-                buf.extend_from_slice(data);
-                if buf.len() > MAX_COMPRESSED_SSE_BUFFER {
+                buf.extend_from_slice(&data[..take]);
+                if take != data.len() {
                     log::warn!(
                         "[HttpAggregator] compressed SSE buffer exceeded {MAX_COMPRESSED_SSE_BUFFER} bytes, finalizing best-effort | conn={connection_id:?}"
                     );
-                    return Some(Self::finish_compressed_sse(
+                    self.insert(
                         connection_id,
-                        request,
-                        response_headers,
-                        content_encoding,
-                        buf,
-                        zstd_decoder,
-                        ssl_event,
-                    ));
+                        ConnectionState::SseActive {
+                            request,
+                            response_headers,
+                            sse_events,
+                            content_encoding,
+                            compressed_buffer: Some(buf),
+                            zstd_decoder,
+                        },
+                    );
+                    self.abandon(&connection_id, crate::aggregator::RemoveReason::OverBudget);
+                    return None;
                 }
                 if crate::utils::decompress::chunked_stream_complete(&buf) {
                     Some(Self::finish_compressed_sse(
@@ -1209,6 +1217,16 @@ impl HttpConnectionAggregator {
         connection_id: &ConnectionId,
         sse_event: ParsedSseEvent,
     ) -> Option<AggregatedResult> {
+        let result = self.process_sse_event_inner(connection_id, sse_event);
+        self.record_completed(result.as_ref());
+        result
+    }
+
+    fn process_sse_event_inner(
+        &mut self,
+        connection_id: &ConnectionId,
+        mut sse_event: ParsedSseEvent,
+    ) -> Option<AggregatedResult> {
         let state = self.connections.pop(connection_id)?;
 
         match state {
@@ -1270,7 +1288,7 @@ impl HttpConnectionAggregator {
                 // event, which we always append because its source chunk
                 // carries usage data that must not be lost to dedup.
                 const MAX_CONTINUATION_BYTES: usize = 1 << 20; // 1 MiB cap
-                let src = sse_event.source_event();
+                let src = sse_event.capture_event();
                 let src_ptr = src as *const _ as usize;
                 let src_buf_len = src.buf_size() as usize;
                 let read_state = self
@@ -1295,6 +1313,7 @@ impl HttpConnectionAggregator {
                 }
 
                 let prefix_source = (!read_state.bom_checked).then(|| sse_event.clone());
+                sse_event.release_capture_source();
                 sse_events.push(sse_event);
                 let recovered_done = prefix_source.is_some_and(|source| {
                     self.sse_continuation_buffers
@@ -1347,33 +1366,6 @@ impl HttpConnectionAggregator {
         self.connections.len()
     }
 
-    /// Return current connection-cache gauges and cumulative evictions.
-    pub(crate) fn metrics(&self) -> ConnectionMetrics {
-        let pending_connection_count = self
-            .connections
-            .iter()
-            .filter(|(_, state)| !matches!(state, ConnectionState::Idle))
-            .count();
-        let pending_connection_bytes: usize = self
-            .connections
-            .iter()
-            .filter_map(|(_, state)| {
-                (!matches!(state, ConnectionState::Idle)).then_some(state.buffered_bytes())
-            })
-            .sum();
-        let continuation_bytes = self
-            .sse_continuation_buffers
-            .iter()
-            .map(|(_, bytes)| bytes.len())
-            .sum::<usize>();
-        ConnectionMetrics {
-            connection_cache_bytes: pending_connection_bytes.saturating_add(continuation_bytes),
-            pending_connection_count,
-            pending_connection_bytes,
-            eviction_count: self.eviction_count,
-        }
-    }
-
     /// Check if connection has pending request
     pub fn has_pending_request(&self, connection_id: &ConnectionId) -> bool {
         matches!(
@@ -1400,38 +1392,29 @@ impl HttpConnectionAggregator {
         self.connections.clear();
         self.sse_continuation_buffers.clear();
         self.sse_read_state.clear();
+        self.sse_streams.clear();
+        self.sse_errors.clear();
+        self.retired_sse.clear();
+        self.recently_completed.clear();
+        self.request_chunks.clear();
         self.last_activity.clear();
         self.idle_snapshotted.clear();
+        self.ready.clear();
+        self.retained.clear();
+        self.retained_metrics = ConnectionMetrics::default();
     }
 
-    /// Drain all connections (for force complete)
+    /// Complete a live-tracked pid's partially-assembled responses (#7553).
     ///
-    /// No in-crate caller today; kept (dead_code-allowed) through the review
-    /// F3 visibility narrowing for force-complete tooling.
-    #[allow(dead_code)]
-    pub(crate) fn drain_connections(&mut self) -> Vec<(ConnectionId, ConnectionState)> {
-        self.connections
-            .iter_mut()
-            .map(|(k, v)| (*k, v.clone()))
-            .collect::<Vec<_>>()
-            .into_iter()
-            .map(|(k, _)| {
-                self.last_activity.pop(&k);
-                self.idle_snapshotted.pop(&k);
-                (k, self.connections.pop(&k).unwrap())
-            })
-            .collect()
-    }
-
-    /// Drain all connections belonging to a specific PID.
-    ///
-    /// Returns `(ConnectionId, ConnectionState)` for entries that were in
-    /// `RequestPending` or `SseActive` state.  `Idle` entries are silently
-    /// discarded.  Used by crash detection on `ProcMon::Exit`.
-    pub(crate) fn drain_connections_for_pid(
-        &mut self,
-        pid: u32,
-    ) -> Vec<(ConnectionId, ConnectionState)> {
+    /// Called when the owning process exits cleanly: an application that
+    /// never reads its declared response body (or whose body bytes were
+    /// never captured) leaves the connection `ResponsePending` forever; on
+    /// a clean exit the pair is completed from whatever bytes arrived so
+    /// the call lands as a usable `complete` row instead of degrading into
+    /// a pending row that the stale scan later flips to `interrupted`.
+    /// Crashed processes keep the interrupted-evidence drain path. Entries
+    /// whose header block is unusable stay on the request-evidence path.
+    pub(crate) fn complete_pid_partial_responses(&mut self, pid: u32) -> Vec<AggregatedResult> {
         let keys: Vec<ConnectionId> = self
             .connections
             .iter()
@@ -1439,106 +1422,55 @@ impl HttpConnectionAggregator {
             .map(|(k, _)| *k)
             .collect();
 
-        if keys.is_empty() {
-            return vec![];
-        }
-
-        let mut result = Vec::new();
+        let mut completed = Vec::new();
         for key in keys {
-            if let Some(state) = self.connections.pop(&key) {
-                self.sse_continuation_buffers.pop(&key);
-                self.sse_read_state.pop(&key);
-                self.last_activity.pop(&key);
-                self.idle_snapshotted.pop(&key);
-                match state {
-                    ConnectionState::Idle => {}
-                    _ => {
-                        log::debug!(
-                            "[HttpAggregator] Draining connection for exited PID: pid={} ssl_ptr={:#x}",
-                            key.pid,
-                            key.ssl_ptr,
-                        );
-                        result.push((key, state));
-                    }
-                }
+            let Some(state) = self.connections.pop(&key) else {
+                continue;
+            };
+            let ConnectionState::ResponsePending { request, assembly } = state else {
+                // Not a partially-assembled response (in-flight request,
+                // active SSE stream, …): keep it so the exit drain below can
+                // persist it as pending/interrupted evidence. Dropping it
+                // here would silently discard that evidence (#7716 review).
+                self.connections.put(key, state);
+                continue;
+            };
+            let mut assembly = assembly;
+            if let Some((response, end_timestamp_ns)) =
+                assembly.finish_partial(self.max_body_bytes, self.max_headers)
+            {
+                // Side tables are only dropped once the connection is known
+                // completed; a put-back arm (unusable headers) must keep them
+                // so the evidence path stays intact (#7716 review).
+                self.cleanup_completed(&key);
+                log::debug!(
+                    "[HttpAggregator] completed partial response on clean exit: \
+                     pid={} ssl_ptr={:#x}",
+                    key.pid,
+                    key.ssl_ptr,
+                );
+                let mut aggregated = AggregatedResponse::from_parsed(response);
+                aggregated.completion_timestamp_ns = Some(end_timestamp_ns);
+                completed.push(match request {
+                    Some(request) => AggregatedResult::HttpComplete(HttpPair {
+                        connection_id: key,
+                        request,
+                        response: aggregated,
+                    }),
+                    None => AggregatedResult::ResponseOnly {
+                        connection_id: key,
+                        response: aggregated,
+                    },
+                });
+            } else {
+                // Unusable headers: keep the entry (with its side tables) on
+                // the request-evidence path (crash/exit persistence).
+                self.connections
+                    .put(key, ConnectionState::ResponsePending { request, assembly });
+                self.refresh_retained(&key);
             }
         }
-
-        if !result.is_empty() {
-            log::info!(
-                "[HttpAggregator] Drained {} connection(s) for exited pid={}",
-                result.len(),
-                pid,
-            );
-        }
-
-        result
-    }
-
-    /// Drain connections whose PID is no longer alive.
-    ///
-    /// Checks `/proc/{pid}` for each unique PID in the connection pool.
-    /// Returns `(ConnectionId, ConnectionState)` for dead-PID entries that
-    /// were in `RequestPending` or `SseActive` state.  `Idle` entries are
-    /// silently discarded.  This allows the caller to persist orphaned
-    /// in-flight requests before they are lost.
-    pub(crate) fn drain_dead_pid_connections(&mut self) -> Vec<(ConnectionId, ConnectionState)> {
-        use std::collections::HashSet;
-
-        // 1. Collect unique PIDs
-        let pids: HashSet<u32> = self.connections.iter().map(|(k, _)| k.pid).collect();
-
-        // 2. Determine which PIDs are dead
-        let dead_pids: HashSet<u32> = pids
-            .into_iter()
-            .filter(|pid| !crate::utils::procfs::proc_pid(pid).exists())
-            .collect();
-
-        if dead_pids.is_empty() {
-            return vec![];
-        }
-
-        // 3. Collect keys for dead PIDs (can't mutate while iterating)
-        let dead_keys: Vec<ConnectionId> = self
-            .connections
-            .iter()
-            .filter(|(k, _)| dead_pids.contains(&k.pid))
-            .map(|(k, _)| *k)
-            .collect();
-
-        // 4. Pop dead entries and return non-Idle ones
-        let mut result = Vec::new();
-        for key in dead_keys {
-            if let Some(state) = self.connections.pop(&key) {
-                self.sse_continuation_buffers.pop(&key);
-                self.sse_read_state.pop(&key);
-                self.last_activity.pop(&key);
-                self.idle_snapshotted.pop(&key);
-                match state {
-                    ConnectionState::Idle => {
-                        // Silently discard idle entries
-                    }
-                    _ => {
-                        log::debug!(
-                            "[HttpAggregator] Draining dead-PID connection: pid={} ssl_ptr={:#x}",
-                            key.pid,
-                            key.ssl_ptr,
-                        );
-                        result.push((key, state));
-                    }
-                }
-            }
-        }
-
-        if !result.is_empty() {
-            log::info!(
-                "[HttpAggregator] Drained {} connection(s) for dead PIDs: {:?}",
-                result.len(),
-                dead_pids,
-            );
-        }
-
-        result
+        completed
     }
 }
 
@@ -1947,6 +1879,9 @@ mod tests {
             // Since total buffer (17) < content_length (100), truncate does nothing
             let body = pair.request.body();
             assert_eq!(body, b"partial_more_data");
+            // `body_len` describes the same body the reassembly installed; a
+            // zero here makes every `body_len`-gated reader skip the prompt.
+            assert_eq!(pair.request.body_len, body.len());
         } else {
             panic!("Expected HttpComplete result");
         }
@@ -2050,6 +1985,72 @@ mod tests {
             ssl_ptr: 0x4000,
         };
         assert!(aggregator.has_pending_request(&conn_id));
+    }
+
+    /// A single TLS read can carry the declared body and the next pipelined
+    /// request. The surplus bytes must not become part of the body: JSON
+    /// parsing rejects trailing data, so the request view (model, messages,
+    /// tools) disappeared while the split-read path kept it.
+    #[test]
+    fn test_request_body_truncated_to_content_length_in_one_read() {
+        let mut aggregator = HttpConnectionAggregator::new();
+
+        let full_request = b"POST /v1/chat/completions HTTP/1.1\r\nContent-Length: 2\r\n\r\n{}GET /next HTTP/1.1\r\nHost: x\r\n\r\n";
+        let event = create_mock_ssl_event_with_buf(1234, 0x4100, full_request.to_vec(), 1);
+        let header_end = full_request
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .unwrap()
+            + 4;
+
+        let request = ParsedRequest {
+            method: "POST".to_string(),
+            path: "/v1/chat/completions".to_string(),
+            version: 1,
+            headers: HashMap::from([("content-length".to_string(), "2".to_string())]),
+            body_offset: header_end,
+            body_len: full_request.len() - header_end,
+            source_event: event,
+            reassembled_body: None,
+        };
+        aggregator.process_request(request);
+
+        let conn_id = ConnectionId {
+            pid: 1234,
+            ssl_ptr: 0x4100,
+        };
+        assert!(aggregator.has_pending_request(&conn_id));
+
+        let resp_event = create_mock_ssl_event_with_buf(
+            1234,
+            0x4100,
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK".to_vec(),
+            0,
+        );
+        let response = ParsedResponse {
+            version: 1,
+            status_code: 200,
+            reason: "OK".to_string(),
+            headers: HashMap::from([("content-length".into(), "2".into())]),
+            body_offset: 38,
+            body_len: 2,
+            source_event: resp_event,
+        };
+
+        match aggregator.process_response(response) {
+            Some(AggregatedResult::HttpComplete(pair)) => {
+                assert_eq!(pair.request.body(), b"{}");
+                assert_eq!(pair.request.body_len, 2);
+                // The consumer that used to fail on the surplus bytes: a
+                // body with a trailing pipelined request is not valid JSON.
+                assert_eq!(
+                    pair.request.json_body(),
+                    Some(serde_json::json!({})),
+                    "the request view must parse after truncation"
+                );
+            }
+            other => panic!("expected a completed exchange, got {other:?}"),
+        }
     }
 
     #[test]
@@ -2282,7 +2283,7 @@ mod tests {
             path: "/v1/responses".to_string(),
             version: 11,
             headers: req_headers,
-            body_offset: 51,
+            body_offset: 50,
             body_len: 2,
             source_event: req_event,
             reassembled_body: None,
@@ -2594,11 +2595,19 @@ mod tests {
         enter_compressed_sse_active(&mut aggregator, 10, 0xA00);
 
         let over = vec![b'x'; MAX_COMPRESSED_SSE_BUFFER + 1024]; // over cap, no terminator
-        let result = aggregator.process_raw_body_data(&raw_frag(10, 0xA00, over));
         assert!(
-            result.is_some(),
-            "over-cap compressed buffer must finalize early, not keep buffering"
+            aggregator
+                .process_raw_body_data(&raw_frag(10, 0xA00, over))
+                .is_none()
         );
+        assert!(matches!(
+            aggregator.take_ready().as_slice(),
+            [AggregatedResult::Abandoned {
+                reason: crate::aggregator::RemoveReason::OverBudget,
+                ..
+            }]
+        ));
+        assert!(!aggregator.has_pending());
     }
 
     #[test]
@@ -2620,11 +2629,11 @@ mod tests {
     }
 
     #[test]
-    fn test_compressed_sse_no_prior_state_returns_none() {
+    fn test_compressed_sse_no_prior_state_emits_response_only() {
         let mut aggregator = HttpConnectionAggregator::new();
         let (_, chunked) = make_zstd_chunked_sse();
 
-        // Response for a connection not in the cache → pop returns None → result is None
+        // Captured response evidence survives a missing or evicted request.
         let resp_event = create_mock_ssl_event_with_buf(1, 0x201, chunked.clone(), 0);
         let mut headers = HashMap::new();
         headers.insert("content-type".to_string(), "text/event-stream".to_string());
@@ -2641,7 +2650,11 @@ mod tests {
         };
 
         let result = aggregator.process_response(response);
-        assert!(result.is_none(), "no prior state → None");
+        let Some(AggregatedResult::ResponseOnly { response, .. }) = result else {
+            panic!("unmatched response must be observable");
+        };
+        assert!(!response.sse_events.is_empty());
+        assert!(!aggregator.has_pending());
     }
 
     #[test]
@@ -3626,10 +3639,14 @@ mod tests {
         assert!(agg.process_response(response).is_none());
 
         std::thread::sleep(Duration::from_millis(60));
-        let snapshots = agg.snapshot_idle_connections();
+        let snapshots =
+            agg.snapshot_idle_connections(|id, request| Some((*id, request.body().as_ptr())));
 
         assert_eq!(snapshots.len(), 1);
-        assert!(matches!(snapshots[0].1, ConnectionState::SseActive { .. }));
+        assert!(matches!(
+            agg.connections.peek(&snapshots[0].0),
+            Some(ConnectionState::SseActive { .. })
+        ));
 
         let done_event = create_mock_ssl_event_with_buf(
             conn_id.pid,
@@ -3892,15 +3909,15 @@ mod tests {
         );
         agg.sse_continuation_buffers.push(conn_id, vec![b'y'; 128]);
 
+        agg.refresh_retained(&conn_id);
+        let metrics = agg.metrics();
+        assert_eq!(metrics.pending_connection_count, 1);
+        assert!(metrics.pending_connection_bytes >= 640);
         assert_eq!(
-            agg.metrics(),
-            ConnectionMetrics {
-                connection_cache_bytes: 768,
-                pending_connection_count: 1,
-                pending_connection_bytes: 640,
-                eviction_count: 0,
-            }
+            metrics.connection_cache_bytes,
+            metrics.pending_connection_bytes + 128
         );
+        assert_eq!(metrics.eviction_count, 0);
 
         agg.connections.push(
             conn_id,
@@ -3914,7 +3931,8 @@ mod tests {
                 )),
             },
         );
-        assert_eq!(agg.metrics().pending_connection_bytes, 512);
+        agg.refresh_retained(&conn_id);
+        assert!(agg.metrics().pending_connection_bytes >= 512);
     }
 
     #[test]
@@ -3932,6 +3950,12 @@ mod tests {
                 reassembled_body: None,
             };
             agg.process_request(request);
+            if ssl_ptr == 0x7300 {
+                agg.last_activity.put(
+                    ConnectionId { pid: 1234, ssl_ptr },
+                    Instant::now() - crate::aggregator::result::ACTIVE_CONNECTION_GRACE,
+                );
+            }
         }
 
         let metrics = agg.metrics();

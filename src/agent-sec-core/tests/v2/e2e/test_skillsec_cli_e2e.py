@@ -2,6 +2,7 @@
 
 import json
 import os
+import socket
 from pathlib import Path
 from typing import Any
 
@@ -17,6 +18,8 @@ def test_installed_skillsec_lifecycle_and_safe_audit(
     script = skill / "run.sh"
     script.write_text("echo initial\n")
     path = str(skill)
+    config = daemon.socket_path.with_suffix(".skillsec.json")
+    config_before = config.read_bytes()
 
     def run(*args: str) -> dict[str, Any]:
         return daemon.request("skill-ledger", *args)
@@ -67,13 +70,38 @@ def test_installed_skillsec_lifecycle_and_safe_audit(
     run("activate", path)
 
     old_fingerprint = run("status")["keys"]["fingerprint"]
-    rotation = run("rotate-keys")
-    assert rotation["keyFingerprint"] != old_fingerprint
-    assert rotation["previousKeyRetained"] is False
-    invalidated = daemon.cli("skill-ledger", "check", path)
-    assert invalidated.returncode == 1
-    assert json.loads(invalidated.stdout)["status"] == "tampered"
-    run("scan", path)
+    key = daemon.socket_path.with_suffix(".state") / "signing-key.pk8"
+    key_before = key.read_bytes()
+    manifest = skill / ".skill-meta/latest.json"
+    manifest_before = manifest.read_bytes()
+    for arguments in (("rotate-keys",), ("init", "--force-keys")):
+        rejected = daemon.cli("skill-ledger", *arguments)
+        assert rejected.returncode != 0
+        assert "not supported" in rejected.stderr
+    for params in (
+        {"command": "rotate-keys"},
+        {"command": "init", "forceKeys": True, "baseline": False},
+        {"command": "init", "forceKeys": True, "skillDirs": [path]},
+    ):
+        with socket.socket(socket.AF_UNIX) as client:
+            client.settimeout(5)
+            client.connect(str(daemon.socket_path))
+            client.sendall(
+                json.dumps({"method": "action.skill_sec", "params": params}).encode()
+                + b"\n"
+            )
+            with client.makefile("rb") as response:
+                rejected = json.loads(response.readline())["result"]
+        assert rejected["success"] is False
+        assert rejected["exitCode"] == 1
+        assert rejected["errorType"] == "NotImplementedError"
+        assert "not supported" in rejected["error"]
+    assert run("status")["keys"]["fingerprint"] == old_fingerprint
+    assert key.read_bytes() == key_before
+    assert manifest.read_bytes() == manifest_before
+    assert config.read_bytes() == config_before
+    assert config.stat().st_uid == 0
+    assert config.stat().st_mode & 0o777 == 0o600
     assert run("check", path)["status"] == "pass"
     assert run("status", "--verbose")["skills"]["discovered"] == 1
 

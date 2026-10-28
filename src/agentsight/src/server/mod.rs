@@ -17,6 +17,7 @@ mod secret;
 pub(crate) mod storage_status;
 mod system_audit;
 mod token_savings;
+mod tokenless;
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -283,6 +284,9 @@ fn configure_routes(cfg: &mut web::ServiceConfig) {
                 )
                 .service(handlers::get_interruption)
                 .service(token_savings::get_token_savings)
+                .service(tokenless::refresh)
+                .service(tokenless::get_records)
+                .service(tokenless::get_record)
                 .service(token_savings::get_session_savings)
                 // AgentSight local security and system-audit API routes
                 .service(handlers::security_status)
@@ -831,8 +835,10 @@ fn server_maintenance_jobs(
         let interval = Duration::from_secs(policy.check_interval_secs);
         let budget = Arc::clone(&budget);
         let job = match id {
-            DatabaseId::GenAi => stores.genai.as_ref().map(|store| {
-                let store = Arc::clone(store);
+            DatabaseId::GenAi => stores.genai.as_ref().map(|capture| {
+                let store = manager.open_read_write(id, |path| {
+                    GenAISqliteStore::open_maintenance_existing(path, policy, capture)
+                })?;
                 manager.maintenance_job(id, interval, move || {
                     let limit_mb = budget.effective_limit_mb(id, policy.max_db_size_mb);
                     store
@@ -952,6 +958,9 @@ pub async fn run_server(
     config_path: Option<PathBuf>,
 ) -> std::io::Result<()> {
     let security_observability = SecurityObservabilityConfig::default();
+    let tokenless_client = tokenless::QueryClient::from_config_path(config_path.as_deref())
+        .map_err(|error| std::io::Error::other(error.to_string()))?
+        .map(web::Data::new);
     let storage_base = storage_data_dir(&storage_path);
     let database_manager = Arc::new(
         DatabaseManager::new(
@@ -1107,10 +1116,13 @@ pub async fn run_server(
     };
     let optimize_state = optimize::OptimizeState::init(storage_base, optimization_store);
 
-    let storage_budget = Arc::new(crate::storage_budget::StorageBudget::new(
-        config_path.clone(),
-        &storage_config,
-    ));
+    let storage_budget = Arc::new(
+        crate::storage_budget::StorageBudget::new(config_path.clone(), &storage_config)
+            // `--db` names the GenAI database; the config-derived path always
+            // carries the default name, so the override keeps the served file
+            // inside the combined cap.
+            .with_genai_path(&storage_path),
+    );
     let maintenance_jobs = server_maintenance_jobs(
         &database_manager,
         &storage_config,
@@ -1196,7 +1208,7 @@ pub async fn run_server(
             .allowed_headers(vec!["Content-Type", "Authorization"])
             .max_age(3600);
 
-        App::new()
+        let mut app = App::new()
             .wrap(cors)
             .wrap(AuthMiddleware::new(dashboard_auth.clone()))
             .app_data(data.clone())
@@ -1205,7 +1217,11 @@ pub async fn run_server(
             .app_data(json_extractor_config())
             .app_data(path_extractor_config())
             .app_data(query_extractor_config())
-            .configure(configure_routes)
+            .configure(configure_routes);
+        if let Some(client) = &tokenless_client {
+            app = app.app_data(client.clone());
+        }
+        app
     })
     .bind((host, port))
     {

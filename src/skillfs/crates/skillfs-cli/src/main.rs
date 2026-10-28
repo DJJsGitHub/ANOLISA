@@ -663,11 +663,17 @@ async fn run(
             if managed {
                 // Managed mode: spawn a detached supervisor and return once
                 // the mount is ready. The supervisor re-invokes this binary
-                // as a foreground worker using the preserved raw arguments.
+                // as a foreground worker, freezing resolved config inputs.
                 // Log this public mount invocation too — the detached worker's
                 // own mount record is separate.
-                let result = utf8_args(&raw_args)
-                    .and_then(|args| managed::run_client(&args, &source, &mountpoint));
+                let mount_config = sources.map(|sources| managed::ManagedMountConfig {
+                    sources,
+                    allow_other,
+                    read_only,
+                });
+                let result = utf8_args(&raw_args).and_then(|args| {
+                    managed::run_client(&args, &source, &mountpoint, mount_config)
+                });
                 finish_sls(guard, err_reason(&result));
                 return result;
             }
@@ -813,7 +819,7 @@ fn escape_ctl(s: &str) -> String {
             '\n' => escaped.push_str("\\n"),
             '\r' => escaped.push_str("\\r"),
             '\t' => escaped.push_str("\\t"),
-            c if (c as u32) < 0x20 || c as u32 == 0x7f => {
+            c if c.is_control() => {
                 escaped.push_str(&format!("\\x{:02x}", c as u32));
             }
             c => escaped.push(c),
@@ -2535,6 +2541,7 @@ async fn cmd_mount(
                     std::time::Duration::from_millis(ms),
                     daemon_root.clone(),
                     post_publish_controller.clone(),
+                    config.max_skill_size,
                 )
             }),
         _ => None,
@@ -2928,7 +2935,7 @@ fn escape_ctl_stderr(s: &str) -> String {
             '\n' => escaped.push_str("\\n"),
             '\r' => escaped.push_str("\\r"),
             '\t' => escaped.push_str("\\t"),
-            c if (c as u32) < 0x20 || c as u32 == 0x7f => {
+            c if c.is_control() => {
                 escaped.push_str(&format!("\\x{:02x}", c as u32));
             }
             c => escaped.push(c),
@@ -3454,11 +3461,14 @@ mod tests {
         );
         assert_eq!(escape_ctl_stderr("\u{7f}"), "\\x7f");
         assert_eq!(escape_ctl_stderr("a\u{0}b"), "a\\x00b");
-        // No raw control byte survives.
+        // C1 controls (NEL, the 8-bit CSI/OSC introducers) become \xNN too.
+        assert_eq!(escape_ctl_stderr("a\u{85}b"), "a\\x85b");
+        assert_eq!(escape_ctl_stderr("\u{9b}31m\u{9d}"), "\\x9b31m\\x9d");
+        // No raw control character survives.
         assert!(
-            !escape_ctl_stderr("\u{1}\u{2}\n\u{1b}\u{7f}")
+            !escape_ctl_stderr("\u{1}\u{2}\n\u{1b}\u{7f}\u{85}\u{9b}")
                 .chars()
-                .any(|c| (c as u32) < 0x20 || c as u32 == 0x7f)
+                .any(|c| c.is_control())
         );
         // Visible text — including multi-byte characters — passes through.
         assert_eq!(
@@ -3820,12 +3830,15 @@ mod tests {
             "ansi\\x1b]777;id\\x07"
         );
         assert_eq!(escape_ctl("\u{7f}"), "\\x7f");
-        // Other C0 controls get \xNN; nothing raw below 0x20 survives.
+        // Other C0 controls get \xNN; nothing raw survives.
         assert_eq!(escape_ctl("a\u{0}b"), "a\\x00b");
+        // C1 controls (NEL, the 8-bit CSI/OSC introducers) become \xNN too.
+        assert_eq!(escape_ctl("a\u{85}b"), "a\\x85b");
+        assert_eq!(escape_ctl("\u{9b}31m\u{9d}"), "\\x9b31m\\x9d");
         assert!(
-            !escape_ctl("\u{1}\u{2}\n\u{1b}")
+            !escape_ctl("\u{1}\u{2}\n\u{1b}\u{85}\u{9b}")
                 .chars()
-                .any(|c| (c as u32) < 0x20)
+                .any(|c| c.is_control())
         );
     }
 

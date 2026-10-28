@@ -7,13 +7,37 @@ use rustix::fs::{AtFlags, FileType, statat};
 use std::collections::BTreeSet;
 use std::time::Instant;
 
+pub(crate) struct DefaultBudget {
+    entries: usize,
+    skills: usize,
+    pub exhausted: bool,
+}
+
+impl Default for DefaultBudget {
+    fn default() -> Self {
+        Self {
+            entries: 10_000,
+            skills: 1024,
+            exhausted: false,
+        }
+    }
+}
+
+fn limit_error() -> SkillSecError {
+    SkillSecError::Invalid(
+        "default Skill discovery exceeds directory limits; coverage is incomplete".into(),
+    )
+}
+
 pub(crate) fn discover(
     pattern: &ManagedSkillDir,
     deadline: Instant,
     mounted: impl Fn(&SkillIdentity) -> bool,
-) -> Result<BTreeSet<SkillIdentity>, SkillSecError> {
+    found: &mut BTreeSet<SkillIdentity>,
+    mut budget: Option<&mut DefaultBudget>,
+) -> Result<(), SkillSecError> {
     check_deadline(deadline)?;
-    let mut found = BTreeSet::new();
+    let mut truncated = false;
     let mut pending = vec![(pattern.root.path().to_owned(), 0)];
     while let Some((path, depth)) = pending.pop() {
         check_deadline(deadline)?;
@@ -26,7 +50,17 @@ pub(crate) fn discover(
         if (pattern.scope != Scope::Children || depth == 1)
             && entry_type(&directory, "SKILL.md")? == Some(FileType::RegularFile)
         {
-            found.insert(SkillIdentity::new(&directory.path)?);
+            let identity = SkillIdentity::new(&directory.path)?;
+            if !found.contains(&identity) {
+                if let Some(budget) = budget.as_deref_mut() {
+                    if budget.skills == 0 {
+                        budget.exhausted = true;
+                        return Err(limit_error());
+                    }
+                    budget.skills -= 1;
+                }
+                found.insert(identity);
+            }
         }
         if pattern.scope == Scope::Exact || (pattern.scope == Scope::Children && depth == 1) {
             continue;
@@ -36,7 +70,14 @@ pub(crate) fn discover(
                 "managed Skill discovery exceeds 128 directory levels".into(),
             ));
         }
-        for name in directory.names(deadline)? {
+        let names = if let Some(budget) = budget.as_deref_mut() {
+            let (names, limited) = directory.bounded_names(deadline, &mut budget.entries)?;
+            truncated |= limited;
+            names
+        } else {
+            directory.names(deadline)?
+        };
+        for name in names {
             check_deadline(deadline)?;
             if !name.starts_with('.') && entry_type(&directory, &name)? == Some(FileType::Directory)
             {
@@ -48,7 +89,13 @@ pub(crate) fn discover(
             }
         }
     }
-    Ok(found)
+    if truncated {
+        if let Some(budget) = budget {
+            budget.exhausted = true;
+        }
+        return Err(limit_error());
+    }
+    Ok(())
 }
 
 fn entry_type(directory: &Directory, name: &str) -> Result<Option<FileType>, SkillSecError> {
@@ -56,5 +103,48 @@ fn entry_type(directory: &Directory, name: &str) -> Result<Option<FileType>, Ski
         Ok(stat) => Ok(Some(FileType::from_raw_mode(stat.st_mode))),
         Err(rustix::io::Errno::NOENT) => Ok(None),
         Err(error) => Err(io_error(directory.path.join(name), error)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::time::Duration;
+
+    #[test]
+    fn directory_budget_is_shared_and_applied_before_collecting_names() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().canonicalize().unwrap();
+        for n in 0..5 {
+            fs::write(base.join(format!("entry-{n}")), "").unwrap();
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let directory = Directory::open(&base).unwrap();
+        let mut remaining = 3;
+        let (names, truncated) = directory.bounded_names(deadline, &mut remaining).unwrap();
+        assert_eq!(names.len(), 3);
+        assert!(truncated);
+        assert_eq!(remaining, 0);
+        let (names, truncated) = directory.bounded_names(deadline, &mut remaining).unwrap();
+        assert!(names.is_empty());
+        assert!(truncated);
+        let mut budget = DefaultBudget {
+            entries: 3,
+            skills: 1024,
+            exhausted: false,
+        };
+        let mut found = BTreeSet::new();
+        assert!(
+            discover(
+                &ManagedSkillDir::new(base.join("*")).unwrap(),
+                deadline,
+                |_| false,
+                &mut found,
+                Some(&mut budget)
+            )
+            .is_err()
+        );
+        assert!(budget.exhausted);
     }
 }

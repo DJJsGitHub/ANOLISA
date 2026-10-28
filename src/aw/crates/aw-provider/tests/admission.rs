@@ -14,7 +14,15 @@ fn document() -> Value {
         .unwrap()
         .as_value()
         .clone();
-    for adapter in ["qoder", "openclaw", "hermes", "qwenpaw"] {
+    for adapter in [
+        "qoder",
+        "openclaw",
+        "hermes",
+        "qwenpaw",
+        "pi",
+        "claude-sdk",
+        "agentscope",
+    ] {
         document["spec"]["agents"][adapter] = json!({
             "adapter": adapter,
             "argv": ["/does-not-exist/agent", "--fixture"]
@@ -48,6 +56,7 @@ fn configuration(document: &Value) -> Configuration {
 fn capabilities(adapter: &str) -> AdapterCapabilities {
     // Synthetic evidence exercises admission; this is not a real version matrix.
     AdapterCapabilities {
+        failure_actions: Default::default(),
         adapter: adapter.into(),
         version: "fixture-1".into(),
         entrypoint: "fixture-tool-hooks".into(),
@@ -129,7 +138,15 @@ fn one_policy_admits_four_explicit_adapter_boundaries_without_running_programs()
     let document = document();
     let config = configuration(&document);
     let providers = providers(&document);
-    for adapter in ["qoder", "openclaw", "hermes", "qwenpaw"] {
+    for adapter in [
+        "qoder",
+        "openclaw",
+        "hermes",
+        "qwenpaw",
+        "pi",
+        "claude-sdk",
+        "agentscope",
+    ] {
         let steps = admit(&config, adapter, &capabilities(adapter), &providers).unwrap();
         assert_eq!(
             preflight(&config, adapter, &capabilities(adapter)).unwrap(),
@@ -189,7 +206,15 @@ fn default_and_explicit_boolean_hooks_admit_without_provider_evidence() {
         document["spec"]["events"]["tool.before"]["steps"][0]["reason_code"] =
             json!("rule_matched");
         let config = configuration(&document);
-        for adapter in ["qoder", "openclaw", "hermes", "qwenpaw"] {
+        for adapter in [
+            "qoder",
+            "openclaw",
+            "hermes",
+            "qwenpaw",
+            "pi",
+            "claude-sdk",
+            "agentscope",
+        ] {
             let steps = admit(&config, adapter, &capabilities(adapter), &BTreeMap::new()).unwrap();
             assert_eq!(
                 steps,
@@ -229,6 +254,12 @@ fn target_and_trusted_adapter_evidence_must_agree() {
     let providers = providers(&document);
     assert!(admit(&config, "missing", &capabilities("qoder"), &providers).is_err());
     assert!(admit(&config, "qoder", &capabilities("openclaw"), &providers).is_err());
+    assert!(preflight(&config, "qoder", &capabilities("unknown-adapter")).is_err());
+    let mut unknown = document.clone();
+    unknown["spec"]["agents"]["qoder"]["adapter"] = json!("unknown-adapter");
+    assert!(CONFIGURATION
+        .parse(&serde_json::to_vec(&unknown).unwrap())
+        .is_err());
     for (version, entrypoint) in [("", "fixture"), ("fixture", ""), (" ", "fixture")] {
         let mut adapter = capabilities("qoder");
         adapter.version = version.into();
@@ -431,7 +462,7 @@ fn replace_effects_and_result_withholding_remain_explicitly_unsupported() {
 }
 
 #[test]
-fn all_tools_is_accepted_while_exact_selectors_and_guards_are_rejected() {
+fn tool_selectors_are_admitted_while_guards_are_rejected() {
     let mut document = document();
     document["spec"]["events"]["tool.before"]["match"] = json!({"tools": ["*"]});
     let adapter = capabilities("qoder");
@@ -439,7 +470,7 @@ fn all_tools_is_accepted_while_exact_selectors_and_guards_are_rejected() {
     assert!(admit(&configuration(&document), "qoder", &adapter, &providers).is_ok());
     for tool in ["bash", "native:qoder:custom_tool"] {
         document["spec"]["events"]["tool.before"]["match"] = json!({"tools": [tool]});
-        assert!(admit(&configuration(&document), "qoder", &adapter, &providers).is_err());
+        assert!(admit(&configuration(&document), "qoder", &adapter, &providers).is_ok());
     }
     document["spec"]["events"]["tool.before"]["match"] = json!({"tools": ["*"]});
     document["spec"]["events"]["tool.before"]["guard"] = json!("security.violation");
@@ -504,7 +535,15 @@ fn native_hooks_require_no_fabricated_provider_evidence() {
             {"id": "raw", "provider": "policy", "native": {}, "on_error": "report"}
         ]);
     }
-    for adapter in ["qoder", "openclaw", "hermes", "qwenpaw"] {
+    for adapter in [
+        "qoder",
+        "openclaw",
+        "hermes",
+        "qwenpaw",
+        "pi",
+        "claude-sdk",
+        "agentscope",
+    ] {
         let steps = admit(
             &configuration(&document),
             adapter,
@@ -557,4 +596,42 @@ fn result_replacement_requires_adapter_evidence_and_is_the_final_enabled_step() 
     document["spec"]["events"]["tool.after"]["steps"][1]["enabled"] = json!(false);
     document["spec"]["events"]["tool.after"]["steps"][0]["effects"] = json!(["replace_result"]);
     assert!(preflight(&configuration(&document), "qoder", &caps).is_ok());
+}
+
+#[test]
+fn withholding_requires_explicit_event_scoped_adapter_evidence() {
+    let mut document = document();
+    document["spec"]["events"]["tool.after"]["steps"][0]["on_error"] = json!("withhold_result");
+    let config = configuration(&document);
+    for adapter in [
+        "qoder",
+        "openclaw",
+        "hermes",
+        "qwenpaw",
+        "pi",
+        "claude-sdk",
+        "agentscope",
+    ] {
+        assert!(preflight(&config, adapter, &capabilities(adapter)).is_err());
+    }
+    let mut caps = capabilities("qwenpaw");
+    caps.failure_actions
+        .insert("tool.after".into(), vec!["withhold_result".into()]);
+    let steps = preflight(&config, "qwenpaw", &caps).unwrap();
+    assert_eq!(
+        steps
+            .iter()
+            .find(|step| step.event == "tool.after")
+            .unwrap()
+            .on_error,
+        "withhold_result"
+    );
+    for (event, action) in [
+        ("tool.before", "withhold_result"),
+        ("tool.after", "block"),
+        ("unknown", "withhold_result"),
+    ] {
+        caps.failure_actions = BTreeMap::from([(event.into(), vec![action.into()])]);
+        assert!(preflight(&config, "qwenpaw", &caps).is_err());
+    }
 }

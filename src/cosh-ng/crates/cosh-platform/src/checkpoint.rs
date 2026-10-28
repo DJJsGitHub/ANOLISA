@@ -1078,6 +1078,10 @@ fn ws_error_to_cosh(code: WsCkptErrorCode, message: String) -> CoshError {
             Some("Leave the workspace before retrying the restore"),
         ),
         WsCkptErrorCode::CwdScanFailed => (ErrorCode::CheckpointRestoreFailed, None),
+        WsCkptErrorCode::UnsupportedWorkspacePath => (
+            ErrorCode::CheckpointRestoreFailed,
+            Some("This is not retryable until the filename is fixed. Inspect the operation and escaped path token in the diagnostic and use a valid UTF-8 filename."),
+        ),
     };
 
     let mut err = CoshError::new(error_code, message, "checkpoint");
@@ -1130,6 +1134,11 @@ fn guarded_rollback_evidence_matches(
 
 fn guarded_rollback_rejection_to_cosh(code: GuardedRollbackRejectionCodeV2) -> CoshError {
     let (error_code, message, recoverable) = match code {
+        GuardedRollbackRejectionCodeV2::UnsupportedWorkspacePath => (
+            ErrorCode::CheckpointRestoreFailed,
+            "ws-ckpt cannot represent a workspace diff path as UTF-8; inspect the ws-ckpt diff diagnostic and correct the filename encoding before requesting a new preview",
+            false,
+        ),
         GuardedRollbackRejectionCodeV2::DaemonNotReady => (
             ErrorCode::CheckpointDaemonUnavailable,
             "ws-ckpt daemon is not ready for guarded rollback",
@@ -1178,6 +1187,11 @@ fn guarded_rollback_rejection_to_cosh(code: GuardedRollbackRejectionCodeV2) -> C
             "ws-ckpt rejected the guarded rollback binding",
             false,
         ),
+        GuardedRollbackRejectionCodeV2::InsufficientSpace => (
+            ErrorCode::CheckpointRestoreFailed,
+            "ws-ckpt backend space or metadata usage reached the guard threshold; delete old checkpoints and retry",
+            true,
+        ),
     };
 
     CoshError::new(error_code, message, "checkpoint")
@@ -1207,6 +1221,8 @@ fn guarded_rollback_rejection_name(code: GuardedRollbackRejectionCodeV2) -> &'st
         GuardedRollbackRejectionCodeV2::EvidenceCapacityReached => "evidence_capacity_reached",
         GuardedRollbackRejectionCodeV2::CwdOccupied => "cwd_occupied",
         GuardedRollbackRejectionCodeV2::CwdScanFailed => "cwd_scan_failed",
+        GuardedRollbackRejectionCodeV2::UnsupportedWorkspacePath => "unsupported_workspace_path",
+        GuardedRollbackRejectionCodeV2::InsufficientSpace => "insufficient_space",
     }
 }
 
@@ -1248,6 +1264,11 @@ fn guarded_rejection_to_cosh(code: GuardedCheckpointRejectionCodeV2) -> CoshErro
             "ws-ckpt rejected the guarded checkpoint binding",
             false,
         ),
+        GuardedCheckpointRejectionCodeV2::InsufficientSpace => (
+            ErrorCode::CheckpointCreateFailed,
+            "ws-ckpt backend space or metadata usage reached the guard threshold; delete old checkpoints and retry",
+            true,
+        ),
     };
 
     CoshError::new(error_code, message, "checkpoint")
@@ -1273,6 +1294,7 @@ fn guarded_rejection_name(code: GuardedCheckpointRejectionCodeV2) -> &'static st
         GuardedCheckpointRejectionCodeV2::WriteLockConflict => "write_lock_conflict",
         GuardedCheckpointRejectionCodeV2::CallerMismatch => "caller_mismatch",
         GuardedCheckpointRejectionCodeV2::EvidenceCapacityReached => "evidence_capacity_reached",
+        GuardedCheckpointRejectionCodeV2::InsufficientSpace => "insufficient_space",
     }
 }
 
@@ -1611,6 +1633,7 @@ mod tests {
             GuardedCheckpointRejectionCodeV2::WriteLockConflict,
             GuardedCheckpointRejectionCodeV2::CallerMismatch,
             GuardedCheckpointRejectionCodeV2::EvidenceCapacityReached,
+            GuardedCheckpointRejectionCodeV2::InsufficientSpace,
         ] {
             let (_dir, socket_path, daemon) =
                 spawn_one_shot_daemon(WsCkptResponse::GuardedCheckpointV2Rejected {
@@ -1682,6 +1705,99 @@ mod tests {
 
         assert_eq!(failure.effect, CkptRequestEffect::KnownNoEffect);
         assert!(!failure.error.message.contains("daemon-private"));
+    }
+
+    #[test]
+    fn guarded_rollback_path_encoding_rejection_is_not_recoverable() {
+        for (code, expected_code, recoverable, reason) in [
+            (
+                GuardedRollbackRejectionCodeV2::UnsupportedWorkspacePath,
+                ErrorCode::CheckpointRestoreFailed,
+                false,
+                "unsupported_workspace_path",
+            ),
+            (
+                GuardedRollbackRejectionCodeV2::DaemonNotReady,
+                ErrorCode::CheckpointDaemonUnavailable,
+                true,
+                "daemon_not_ready",
+            ),
+            (
+                GuardedRollbackRejectionCodeV2::InsufficientSpace,
+                ErrorCode::CheckpointRestoreFailed,
+                true,
+                "insufficient_space",
+            ),
+        ] {
+            for execute in [false, true] {
+                let (_dir, socket_path, daemon) =
+                    spawn_one_shot_daemon(WsCkptResponse::GuardedRollbackV2Rejected {
+                        code,
+                        message: "daemon-private detail".to_owned(),
+                    });
+                let client = trusted_client(&socket_path);
+                let error = if execute {
+                    let failure = client
+                        .guarded_rollback_v2(
+                            "/workspace",
+                            "ws-abc123",
+                            WorkspaceGenerationTokenV2::from_bytes([7; 32]),
+                            "ckp_1",
+                            [6; 32],
+                            GUARDED_ROLLBACK_OPERATION_ID,
+                            [9; 32],
+                        )
+                        .unwrap_err();
+                    assert_eq!(failure.effect, CkptRequestEffect::KnownNoEffect);
+                    failure.error
+                } else {
+                    client
+                        .guarded_rollback_preview_v2(
+                            "/workspace",
+                            "ws-abc123",
+                            WorkspaceGenerationTokenV2::from_bytes([7; 32]),
+                            "ckp_1",
+                        )
+                        .unwrap_err()
+                };
+                daemon.join().unwrap();
+                assert_eq!(error.code, expected_code);
+                assert_eq!(error.recoverable, recoverable);
+                assert!(!error.message.contains("daemon-private"));
+                let json = serde_json::to_value(&error).unwrap();
+                assert_eq!(json["recoverable"], recoverable);
+                assert_eq!(json["details"]["guarded_rollback_rejection"], reason);
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_diff_path_encoding_rejection_is_not_recoverable() {
+        let diagnostic = r#"mkfile path cannot be represented as UTF-8: "./snap/bad\\377""#;
+        for preview in [false, true] {
+            let (_dir, socket_path, daemon) = spawn_one_shot_daemon(WsCkptResponse::Error {
+                code: WsCkptErrorCode::UnsupportedWorkspacePath,
+                message: diagnostic.to_string(),
+            });
+            let client = trusted_client(&socket_path);
+            let error = if preview {
+                client
+                    .rollback_preview_trusted("/workspace", "ckp_1")
+                    .unwrap_err()
+            } else {
+                client.diff("/workspace", "ckp_1", "ckp_2").unwrap_err()
+            };
+            daemon.join().unwrap();
+            assert_eq!(error.code, ErrorCode::CheckpointRestoreFailed);
+            assert_eq!(error.message, diagnostic);
+            assert!(!error.recoverable);
+            assert!(error
+                .hint
+                .as_ref()
+                .unwrap()
+                .contains("not retryable until the filename is fixed"));
+            assert_eq!(serde_json::to_value(&error).unwrap()["recoverable"], false);
+        }
     }
 
     #[test]
@@ -1899,6 +2015,7 @@ mod tests {
             WsCkptErrorCode::ConfirmationRequired,
             WsCkptErrorCode::CwdOccupied,
             WsCkptErrorCode::CwdScanFailed,
+            WsCkptErrorCode::UnsupportedWorkspacePath,
         ] {
             let daemon_message = format!(
                 "/secret/workspace\n\u{1b}[31m{}",

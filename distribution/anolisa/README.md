@@ -67,10 +67,10 @@ or authorize an unsafe-install bypass.
 
 Enable the Tokenless local plugin with `anolisa adapter enable tokenless opencode`.
 ANOLISA manages its plugin link; restart OpenCode after enabling or disabling it.
-See the [adapter reference](../../docs/user-guide/en/user-entrypoint/anolisa-cli.md#adapter)
+See the [adapter reference](../../docs/user-guide/en/getting-started/anolisa-cli.md#adapter)
 for custom configuration directories and existing-installation ownership.
 
-Enable Tokenless in QwenWorkCN macOS local mode with
+Enable Tokenless in QwenWorkCN native Bash and macOS workspace Shell sessions with
 `anolisa adapter enable tokenless qwenwork`. Restart the desktop application and
 check activation there; CLI status verifies files but reports activation as
 `unknown`. Existing script installations must be uninstalled before CLI enable.
@@ -100,11 +100,16 @@ installation even when the same component is already installed system-wide.
 | `-q, --quiet` | Suppress non-error output |
 | `--no-color` | Disable colored output |
 
-See the [full CLI guide](../../docs/user-guide/en/user-entrypoint/anolisa-cli.md)
+See the [full CLI guide](../../docs/user-guide/en/getting-started/anolisa-cli.md)
 for command forms, scope behavior, and recovery workflows.
 
 RPM installs support Yum 3 and DNF 4. Use `sudo` with RPM `--dry-run`
 to check dependencies and conflicts before installing.
+
+For raw installs, `anolisa install <component> --backend raw --no-deps`
+skips runtime dependency checks and installation. It also works with `--all`;
+ensure the required dependencies are available before use. Successful installs
+print a reminder to stderr unless `--quiet` is set. RPM rejects this option.
 
 ## Architecture
 

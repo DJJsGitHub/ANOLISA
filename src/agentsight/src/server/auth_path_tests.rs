@@ -77,6 +77,47 @@ async fn case_review_mutation_fails_closed_without_credentials() {
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 }
 
+/// The storage setting rewrites the runtime configuration file and is
+/// re-read by every maintenance pass; zero disables the disk cap. It is a host
+/// mutation like the enforcement bindings, so loopback is not enough.
+#[actix_web::test]
+async fn storage_config_mutation_fails_closed_without_credentials() {
+    let fixture = AuthFixture::new();
+    let app = awtest::init_service(
+        App::new()
+            .wrap(AuthMiddleware::new(Arc::clone(&fixture.auth)))
+            .route(
+                "/api/storage/config",
+                web::post().to(|| async { HttpResponse::Ok().finish() }),
+            ),
+    )
+    .await;
+    let loopback = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 12345);
+
+    let response = awtest::call_service(
+        &app,
+        awtest::TestRequest::post()
+            .uri("/api/storage/config")
+            .peer_addr(loopback)
+            .to_request(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+    // The credential still reaches the route: the gate is additive.
+    let token = fixture.auth.token().unwrap_or_default().to_string();
+    let response = awtest::call_service(
+        &app,
+        awtest::TestRequest::post()
+            .uri("/api/storage/config")
+            .peer_addr(loopback)
+            .insert_header(("Authorization", format!("Bearer {token}")))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
 #[actix_web::test]
 async fn authenticated_encoded_mutations_only_reach_matching_routes() {
     let fixture = AuthFixture::new();
@@ -141,6 +182,10 @@ async fn privileged_mutations_fail_closed_without_credentials() {
         App::new()
             .wrap(AuthMiddleware::new(Arc::clone(&fixture.auth)))
             .route(
+                "/api/tokenless/refresh",
+                web::post().to(|| async { HttpResponse::Ok().finish() }),
+            )
+            .route(
                 "/api/optimize/config",
                 web::post().to(|| async { HttpResponse::Ok().finish() }),
             )
@@ -156,7 +201,11 @@ async fn privileged_mutations_fail_closed_without_credentials() {
     .await;
     let loopback = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 12345);
 
-    for uri in ["/api/optimize/config", "/api/agent-health/4242/restart"] {
+    for uri in [
+        "/api/optimize/config",
+        "/api/agent-health/4242/restart",
+        "/api/tokenless/refresh",
+    ] {
         let response = awtest::call_service(
             &app,
             awtest::TestRequest::post()
@@ -198,6 +247,10 @@ async fn privileged_mutations_accept_a_valid_credential() {
         App::new()
             .wrap(AuthMiddleware::new(Arc::clone(&fixture.auth)))
             .route(
+                "/api/tokenless/refresh",
+                web::post().to(|| async { HttpResponse::Ok().finish() }),
+            )
+            .route(
                 "/api/optimize/config",
                 web::post().to(|| async { HttpResponse::Ok().finish() }),
             )
@@ -209,7 +262,11 @@ async fn privileged_mutations_accept_a_valid_credential() {
     .await;
     let loopback = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 12345);
 
-    for uri in ["/api/optimize/config", "/api/agent-health/4242/restart"] {
+    for uri in [
+        "/api/optimize/config",
+        "/api/agent-health/4242/restart",
+        "/api/tokenless/refresh",
+    ] {
         let response = awtest::call_service(
             &app,
             awtest::TestRequest::post()
@@ -221,6 +278,83 @@ async fn privileged_mutations_accept_a_valid_credential() {
         .await;
         assert_eq!(response.status(), StatusCode::OK, "{uri} did not route");
     }
+}
+
+/// Endpoints that spend the stored LLM credential are host actions too: a
+/// loopback caller must not be able to run up the configured account without
+/// ever holding the dashboard credential.
+#[actix_web::test]
+async fn llm_spending_mutations_fail_closed_without_credentials() {
+    let fixture = AuthFixture::new();
+    let token = fixture
+        .auth
+        .read_token_from_file()
+        .expect("the fixture writes a token file");
+    let app = awtest::init_service(
+        App::new()
+            .wrap(AuthMiddleware::new(Arc::clone(&fixture.auth)))
+            .route(
+                "/api/sessions/search",
+                web::post().to(|| async { HttpResponse::Ok().finish() }),
+            )
+            .route(
+                "/api/causal-attribution",
+                web::post().to(|| async { HttpResponse::Ok().finish() }),
+            )
+            .route(
+                "/api/reuse/judge",
+                web::post().to(|| async { HttpResponse::Ok().finish() }),
+            )
+            .route(
+                "/api/optimize/sessions/{session_id}/{dimension}",
+                web::post().to(|| async { HttpResponse::Ok().finish() }),
+            ),
+    )
+    .await;
+    let loopback = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 12345);
+
+    for uri in [
+        "/api/sessions/search",
+        "/api/causal-attribution",
+        "/api/reuse/judge",
+        "/api/optimize/sessions/session-1/perf",
+    ] {
+        let response = awtest::call_service(
+            &app,
+            awtest::TestRequest::post()
+                .uri(uri)
+                .peer_addr(loopback)
+                .to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{uri}");
+
+        let response = awtest::call_service(
+            &app,
+            awtest::TestRequest::post()
+                .uri(uri)
+                .peer_addr(loopback)
+                .insert_header(("Authorization", format!("Bearer {token}")))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK, "{uri} did not route");
+    }
+
+    // A path with the wrong number of segments is not the spending route.
+    let response = awtest::call_service(
+        &app,
+        awtest::TestRequest::post()
+            .uri("/api/optimize/sessions/session-1")
+            .peer_addr(loopback)
+            .to_request(),
+    )
+    .await;
+    assert_eq!(
+        response.status(),
+        StatusCode::NOT_FOUND,
+        "an unregistered shape must not be gated as the spending route"
+    );
 }
 
 #[actix_web::test]
@@ -267,5 +401,104 @@ impl AuthFixture {
 impl Drop for AuthFixture {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.directory);
+    }
+}
+
+#[actix_web::test]
+async fn tokenless_record_routes_require_a_dashboard_credential() {
+    let fixture = AuthFixture::new();
+    let app = awtest::init_service(
+        App::new()
+            .wrap(AuthMiddleware::new(Arc::clone(&fixture.auth)))
+            .route(
+                "/api/tokenless/records",
+                web::get().to(|| async { HttpResponse::Ok().finish() }),
+            )
+            .route(
+                "/api/tokenless/records/{id}",
+                web::get().to(|| async { HttpResponse::Ok().finish() }),
+            ),
+    )
+    .await;
+    let loopback = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 12345);
+    let token = fixture.auth.read_token_from_file().unwrap();
+    for uri in [
+        "/api/tokenless/records",
+        "/%61pi/tokenless/records",
+        "/api/tokenless/%72ecords",
+        "/api/tokenless/records/1",
+        "/%61pi/tokenless/records/1",
+    ] {
+        let request = awtest::TestRequest::get()
+            .uri(uri)
+            .peer_addr(loopback)
+            .to_request();
+        assert_eq!(
+            awtest::call_service(&app, request).await.status(),
+            StatusCode::UNAUTHORIZED
+        );
+        let request = awtest::TestRequest::get()
+            .uri(uri)
+            .peer_addr(loopback)
+            .insert_header(("Authorization", format!("Bearer {token}")))
+            .to_request();
+        assert_eq!(
+            awtest::call_service(&app, request).await.status(),
+            StatusCode::OK
+        );
+    }
+}
+
+#[actix_web::test]
+async fn configured_tokenless_savings_queries_require_credentials() {
+    let fixture = AuthFixture::new();
+    let credential = fixture.directory.join("service-token");
+    std::fs::write(&credential, "service-fixture").unwrap();
+    let config = fixture.directory.join("query.json");
+    std::fs::write(
+        &config,
+        serde_json::json!({"tokenless_api":{
+            "url":"http://127.0.0.1:7397", "credential_file":credential
+        }})
+        .to_string(),
+    )
+    .unwrap();
+    let client = super::super::tokenless::QueryClient::from_config_path(Some(&config))
+        .unwrap()
+        .unwrap();
+    let app = awtest::init_service(
+        App::new()
+            .app_data(web::Data::new(client))
+            .wrap(AuthMiddleware::new(Arc::clone(&fixture.auth)))
+            .default_service(web::to(|| async { HttpResponse::Ok().finish() })),
+    )
+    .await;
+    let token = fixture.auth.read_token_from_file().unwrap();
+    let loopback = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 12345);
+    for uri in [
+        "/api/token-savings",
+        "/api/token-savings/session/fixture",
+        "/%61pi/token-savings",
+        "/api/token-savings/%73ession/fixture",
+    ] {
+        let request = awtest::TestRequest::get()
+            .uri(uri)
+            .peer_addr(loopback)
+            .to_request();
+        assert_eq!(
+            awtest::call_service(&app, request).await.status(),
+            StatusCode::UNAUTHORIZED,
+            "{uri}"
+        );
+        let request = awtest::TestRequest::get()
+            .uri(uri)
+            .peer_addr(loopback)
+            .insert_header(("Authorization", format!("Bearer {token}")))
+            .to_request();
+        assert_eq!(
+            awtest::call_service(&app, request).await.status(),
+            StatusCode::OK,
+            "{uri}"
+        );
     }
 }

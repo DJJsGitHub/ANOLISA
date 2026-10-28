@@ -143,6 +143,7 @@ mod tests {
         let service = Arc::new(
             SkillSecService::new(
                 SkillSecConfig {
+                    default_skill_dirs: Vec::new(),
                     state_dir: state,
                     managed_skill_dirs: Vec::new(),
                 },
@@ -165,7 +166,7 @@ mod tests {
             json!({"command":"rotate-keys"}),
         ))
         .unwrap();
-        assert_eq!(rotation["result"]["errorType"], "PermissionDenied");
+        assert_eq!(rotation["result"]["errorType"], "NotImplementedError");
         let invalid = serde_json::to_value(handler.handle(
             id(),
             peer,
@@ -198,6 +199,7 @@ mod tests {
         let service = Arc::new(
             SkillSecService::new(
                 SkillSecConfig {
+                    default_skill_dirs: Vec::new(),
                     state_dir: directory.path().canonicalize().unwrap(),
                     managed_skill_dirs: Vec::new(),
                 },
@@ -251,6 +253,7 @@ mod tests {
         let service = Arc::new(
             SkillSecService::new(
                 SkillSecConfig {
+                    default_skill_dirs: Vec::new(),
                     state_dir: directory.path().canonicalize().unwrap(),
                     managed_skill_dirs: Vec::new(),
                 },

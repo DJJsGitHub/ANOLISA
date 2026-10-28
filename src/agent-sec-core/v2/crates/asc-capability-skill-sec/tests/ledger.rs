@@ -33,6 +33,7 @@ impl Fixture {
         let service = Arc::new(
             SkillSecService::new(
                 SkillSecConfig {
+                    default_skill_dirs: Vec::new(),
                     state_dir: state.clone(),
                     managed_skill_dirs: vec![],
                 },
@@ -261,21 +262,13 @@ fn parallel_certifiers_and_canonical_aliases_share_one_write_boundary() {
 }
 
 #[test]
-fn exact_registration_persists_without_registering_siblings() {
+fn processing_a_skill_does_not_create_an_independent_registry() {
     let f = Fixture::new();
     f.certify("fixture", &json!([]));
+    assert!(!f.state.join("managed-skills.json").exists());
     let sibling = f.root.io_dir.with_file_name("sibling");
     fs::create_dir(&sibling).unwrap();
     fs::write(sibling.join("SKILL.md"), SKILL).unwrap();
-    let restarted = SkillSecService::new(
-        SkillSecConfig {
-            state_dir: f.state.clone(),
-            managed_skill_dirs: vec![],
-        },
-        ScannerRegistry::default(),
-    )
-    .unwrap();
-    assert_eq!(restarted.managed_skills().unwrap(), vec![f.root.identity]);
     assert!(!sibling.join(".skill-meta").exists());
 }
 

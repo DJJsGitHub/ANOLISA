@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use anyhow::Result;
 
 use agentsight_atif::{
-    same_call_id, Agent, AtifTrajectory, FinalMetrics, Metrics, Observation, ObservationResult,
+    resolve_call_id, Agent, AtifTrajectory, FinalMetrics, Metrics, Observation, ObservationResult,
     Step, StepSource, ToolCall, ATIF_SCHEMA_VERSION, EXTRA_IS_ERROR,
 };
 
@@ -440,7 +440,11 @@ fn extract_agent_info(
 /// it into a user step's message would leak tool output into the
 /// `first/last_user_message` previews, preference rules and LLM prompts that
 /// read the message as the human's own words.
-fn extract_text_from_content(content: &serde_json::Value) -> String {
+///
+/// The ATIF `message` union (`String | Array<ContentPart>`) is the same shape
+/// under another name, so the preview projection reuses this flattener and
+/// accepts the documents the schema's typed readers already accept.
+pub(crate) fn extract_text_from_content(content: &serde_json::Value) -> String {
     match content {
         serde_json::Value::String(s) => s.clone(),
         serde_json::Value::Array(blocks) => {
@@ -582,15 +586,24 @@ fn merge_tool_results_into_agent_steps(
 ) -> Vec<ExtractedToolResult> {
     let mut unmatched = Vec::new();
     for tr in tool_results {
-        // Most recent owner wins: each call is issued by exactly one step, and
-        // searching backwards also covers results arriving after an
-        // intervening user turn.
-        let Some(idx) = steps.iter().rposition(|step| {
-            step.source == StepSource::Agent
-                && step.tool_calls.as_ref().is_some_and(|tcs| {
-                    tcs.iter()
-                        .any(|tc| same_call_id(&tc.tool_call_id, &tr.tool_use_id))
-                })
+        let owner = resolve_call_id(
+            &tr.tool_use_id,
+            steps
+                .iter()
+                .filter(|step| step.source == StepSource::Agent)
+                .flat_map(|step| step.tool_calls.iter().flatten())
+                .map(|call| call.tool_call_id.as_str()),
+        )
+        .map(String::from);
+        let Some(idx) = owner.as_ref().and_then(|id| {
+            steps.iter().rposition(|step| {
+                step.source == StepSource::Agent
+                    && step
+                        .tool_calls
+                        .iter()
+                        .flatten()
+                        .any(|call| &call.tool_call_id == id)
+            })
         }) else {
             // The mixed-event caller can retain replayed context on its user
             // step; result-only carriers keep the existing discard policy.
@@ -603,7 +616,7 @@ fn merge_tool_results_into_agent_steps(
             if let Some(tcs) = step.tool_calls.as_mut() {
                 for tc in tcs
                     .iter_mut()
-                    .filter(|tc| same_call_id(&tc.tool_call_id, &tr.tool_use_id))
+                    .filter(|tc| Some(&tc.tool_call_id) == owner.as_ref())
                 {
                     let mut extra = tc.extra.take().unwrap_or_default();
                     extra.insert(

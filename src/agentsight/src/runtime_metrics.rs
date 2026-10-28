@@ -40,6 +40,8 @@ pub(crate) struct RuntimeMetrics {
     pub connection_cache_bytes: u64,
     pub pending_genai_count: u64,
     pub pending_genai_bytes: u64,
+    pub completion_queue_count: u64,
+    pub completion_queue_bytes: u64,
     pub pending_connection_count: u64,
     pub pending_connection_bytes: u64,
     pub eviction_count: u64,
@@ -133,6 +135,34 @@ impl std::fmt::Debug for MetricsFileExporter {
     }
 }
 
+/// Process-global Prometheus recorder installed by the first exporter.
+///
+/// `metrics` allows one global recorder per process, while the FFI supports
+/// repeated `AgentSight` construction (`agentsight_new`/`start`/`stop`/`free`
+/// cycles). Building and installing a fresh recorder on every cycle made the
+/// second `start` fail; the handle is kept so later exporters reuse the
+/// existing recorder instead.
+static RECORDER: std::sync::OnceLock<std::sync::Mutex<Option<PrometheusHandle>>> =
+    std::sync::OnceLock::new();
+
+/// Installs the Prometheus recorder on first use and returns a handle to it.
+fn prometheus_handle() -> Result<PrometheusHandle> {
+    let slot = RECORDER.get_or_init(|| std::sync::Mutex::new(None));
+    let mut installed = slot
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(handle) = installed.as_ref() {
+        return Ok(handle.clone());
+    }
+    let recorder = PrometheusBuilder::new().build_recorder();
+    let handle = recorder.handle();
+    metrics::set_global_recorder(recorder).map_err(|_| {
+        anyhow!("cannot install AgentSight metrics recorder: a global recorder is already set")
+    })?;
+    *installed = Some(handle.clone());
+    Ok(handle)
+}
+
 impl MetricsFileExporter {
     /// Builds and installs an exporter when [`METRICS_FILE_ENV`] names a non-empty path.
     pub(crate) fn from_env() -> Result<Option<Self>> {
@@ -149,12 +179,11 @@ impl MetricsFileExporter {
             Err(std::env::VarError::NotPresent) => DEFAULT_EXPORT_INTERVAL,
             Err(error) => return Err(anyhow!("invalid {METRICS_INTERVAL_ENV}: {error}")),
         };
-        let recorder = PrometheusBuilder::new().build_recorder();
-        let handle = recorder.handle();
+        // Validate before touching the process-global recorder so a bad path
+        // leaves the process without a half-installed exporter.
+        validate_output_path(&path)?;
+        let handle = prometheus_handle()?;
         let exporter = Self::new(path, handle, export_interval)?;
-        metrics::set_global_recorder(recorder).map_err(|_| {
-            anyhow!("cannot install AgentSight metrics recorder: a global recorder is already set")
-        })?;
         describe_metrics();
         OBSERVABILITY_ENABLED.store(true, Ordering::Relaxed);
 
@@ -211,6 +240,10 @@ impl MetricsFileExporter {
         metrics::gauge!("agentsight_pending_connection_bytes")
             .set(snapshot.pending_connection_bytes as f64);
 
+        metrics::gauge!("agentsight_completion_queue_count")
+            .set(snapshot.completion_queue_count as f64);
+        metrics::gauge!("agentsight_completion_queue_bytes")
+            .set(snapshot.completion_queue_bytes as f64);
         let current = CounterSnapshot::from(snapshot);
         increment_counter(
             "agentsight_channel_dropped_total",
@@ -267,6 +300,26 @@ fn increment_counter(name: &'static str, current: u64, previous: u64) {
 }
 
 fn describe_metrics() {
+    metrics::describe_gauge!(
+        "agentsight_completion_queue_count",
+        "Raw completed captures awaiting CPU admission"
+    );
+    metrics::describe_gauge!(
+        "agentsight_completion_queue_bytes",
+        "Retained bytes in the bounded raw completion queue"
+    );
+    metrics::describe_histogram!(
+        "agentsight_completion_wait_seconds",
+        "Time a completed capture waits before analysis and persistence"
+    );
+    metrics::describe_counter!(
+        "agentsight_cpu_budget_deferred_total",
+        "Heavy jobs deferred by the shared process CPU budget"
+    );
+    metrics::describe_counter!(
+        "agentsight_cpu_budget_work_nanoseconds_total",
+        "Process CPU nanoseconds while a heavy job is admitted"
+    );
     metrics::describe_counter!(
         "agentsight_events_received_total",
         "Events received by the AgentSight userspace pipeline"
@@ -286,6 +339,18 @@ fn describe_metrics() {
     metrics::describe_counter!(
         "agentsight_connection_evictions_total",
         "HTTP connections or streams evicted from correlation caches"
+    );
+    metrics::describe_counter!(
+        "agentsight_http_conn_removed_total",
+        "HTTP connection removals by reason and retained state"
+    );
+    metrics::describe_counter!(
+        "agentsight_http_abandoned_emitted_total",
+        "Incomplete HTTP records emitted after connection removal"
+    );
+    metrics::describe_counter!(
+        "agentsight_ffi_dropped_total",
+        "FFI events rejected by count or byte limits"
     );
     metrics::describe_counter!(
         "agentsight_stage_calls_total",
@@ -316,8 +381,24 @@ fn describe_metrics() {
         "Logical payload bytes retained for connection correlation"
     );
     metrics::describe_gauge!(
+        "agentsight_http_conn_active",
+        "HTTP connections or streams with retained in-flight state"
+    );
+    metrics::describe_gauge!(
+        "agentsight_http_conn_retained_bytes",
+        "Estimated retained HTTP allocation capacity"
+    );
+    metrics::describe_gauge!(
+        "agentsight_ffi_inflight_bytes",
+        "Estimated FFI payload bytes retained through callback completion"
+    );
+    metrics::describe_gauge!(
         "agentsight_pending_genai_count",
-        "GenAI events waiting for session correlation"
+        "GenAI batches waiting for session correlation or a local SQLite write"
+    );
+    metrics::describe_counter!(
+        "agentsight_genai_sqlite_retry_total",
+        "Local SQLite completion retry outcomes under the shared pending budget"
     );
     metrics::describe_gauge!(
         "agentsight_pending_genai_bytes",
@@ -669,6 +750,49 @@ mod tests {
     }
 
     #[test]
+    fn connection_removals_report_incomplete_evidence_and_release_gauges() {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            describe_metrics();
+            let parser = Parser::new();
+            let mut aggregator = Aggregator::with_limits(1, &Default::default());
+            for id in 1..=2 {
+                let mut event = ssl_event(
+                    http_message("POST /v1/chat/completions HTTP/1.1", "{}"),
+                    1,
+                    1_000,
+                );
+                event.ssl_ptr = id;
+                let results = aggregator.process_result(parser.parse_event(Event::Ssl(event)));
+                if id == 2 {
+                    assert!(matches!(
+                        results.as_slice(),
+                        [crate::aggregator::AggregatedResult::Abandoned {
+                            reason: crate::aggregator::RemoveReason::CapacityRejected,
+                            ..
+                        }]
+                    ));
+                }
+            }
+            assert_eq!(aggregator.drain_pending().len(), 1);
+            assert_eq!(aggregator.connection_metrics().connection_cache_bytes, 0);
+        });
+        let snapshot = handle.render();
+        assert!(snapshot.contains(
+            "agentsight_http_conn_removed_total{reason=\"capacity_rejected\",state=\"admission\"} 1"
+        ));
+        assert!(
+            snapshot.contains(
+                "agentsight_http_abandoned_emitted_total{reason=\"capacity_rejected\"} 1"
+            )
+        );
+        assert!(snapshot.contains("agentsight_http_conn_active 0"));
+        assert!(snapshot.contains("agentsight_http_conn_retained_bytes 0"));
+        assert!(snapshot.contains("# HELP agentsight_http_conn_removed_total HTTP connection removals by reason and retained state"));
+    }
+
+    #[test]
     fn exporter_rejects_a_path_without_a_file_name() {
         let recorder = PrometheusBuilder::new().build_recorder();
         let error =
@@ -734,5 +858,56 @@ mod tests {
         fs::remove_file(path).expect("remove published snapshot");
         fs::remove_file(foreign).expect("remove seeded foreign temporary");
         fs::remove_dir(directory).expect("remove test directory");
+    }
+
+    /// The FFI supports repeated `AgentSight` construction in one process.
+    /// Installing a fresh Prometheus recorder on every cycle failed the
+    /// second start after its auxiliary threads had already been spawned,
+    /// leaving them running against a permanently-true flag.
+    #[test]
+    fn prometheus_recorder_is_installed_once_and_reused() {
+        let first = prometheus_handle().expect("first install");
+        let second =
+            prometheus_handle().expect("a later AgentSight must reuse the existing recorder");
+
+        metrics::counter!("agentsight_test_recorder_reuse_total").increment(1);
+        let rendered = second.render();
+        assert!(
+            rendered.contains("agentsight_test_recorder_reuse_total"),
+            "the reused handle must observe the shared recorder: {rendered}"
+        );
+        first.run_upkeep();
+    }
+
+    /// A second `AgentSight` lifecycle must be able to build its exporter from
+    /// the same environment; this is the path that failed before the recorder
+    /// was made process-global.
+    #[test]
+    fn from_env_builds_an_exporter_on_a_second_lifecycle() {
+        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let directory = test_directory();
+        fs::create_dir_all(&directory).expect("create metrics directory");
+        let path = directory.join("metrics.prom");
+
+        // SAFETY: only this module reads the variable, and ENV_LOCK serializes
+        // the tests that mutate it.
+        unsafe {
+            std::env::set_var(METRICS_FILE_ENV, &path);
+            std::env::remove_var(METRICS_INTERVAL_ENV);
+        }
+        let first = MetricsFileExporter::from_env();
+        let second = MetricsFileExporter::from_env();
+        unsafe { std::env::remove_var(METRICS_FILE_ENV) };
+
+        assert!(first.expect("first lifecycle").is_some());
+        assert!(
+            second
+                .expect("second lifecycle must reuse the installed recorder")
+                .is_some()
+        );
+        std::fs::remove_dir_all(&directory).ok();
     }
 }

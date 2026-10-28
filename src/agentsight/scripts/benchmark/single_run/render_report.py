@@ -7,13 +7,13 @@ import argparse
 import csv
 import gzip
 import json
-from collections.abc import Iterable
 from itertools import pairwise
 from pathlib import Path
 from typing import Any
 
 from benchmark_stats import linear_slope, numeric, rolling_max_increase, stats
 from h2load_stats import summarize_h2load
+from validate_results import json_lines
 
 LOAD_METRICS = {
     "benchmark_latency": "custom latency (ms)",
@@ -63,19 +63,6 @@ REGRESSION_CHECKS = (
 )
 
 
-def json_lines(path: Path) -> Iterable[dict[str, Any]]:
-    """Yield valid JSON objects from a line-oriented k6 output file."""
-    opener = gzip.open if path.suffix == ".gz" else Path.open
-    with opener(path, mode="rt", encoding="utf-8") as handle:
-        for line in handle:
-            try:
-                item = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if isinstance(item, dict):
-                yield item
-
-
 def summarize_load(path: Path | None) -> dict[str, Any]:
     """Summarize counters and latency points from k6 JSON output."""
     result: dict[str, Any] = {
@@ -98,6 +85,8 @@ def summarize_load(path: Path | None) -> dict[str, Any]:
         data = item.get("data")
         if not isinstance(data, dict):
             continue
+        if metric == "http_req_duration" and latency["benchmark_latency"]:
+            continue
         value = numeric(data.get("value"))
         if metric == "benchmark_requests" and value is not None:
             result["requests"] += int(value)
@@ -107,10 +96,10 @@ def summarize_load(path: Path | None) -> dict[str, Any]:
             result["timeouts"] += int(value)
         elif metric in LOAD_METRICS and value is not None:
             latency[metric].append(value)
+            if metric == "benchmark_latency":
+                latency["http_req_duration"].clear()
 
-    chosen = (
-        "benchmark_latency" if latency["benchmark_latency"] else "http_req_duration"
-    )
+    chosen = "benchmark_latency" if latency["benchmark_latency"] else "http_req_duration"
     result["latency_metric"] = chosen
     result["latency_label"] = LOAD_METRICS[chosen]
     result["latency"] = stats(latency[chosen])
@@ -118,23 +107,33 @@ def summarize_load(path: Path | None) -> dict[str, Any]:
 
 
 def summarize_resources(path: Path | None) -> dict[str, dict[str, float | None]]:
-    """Summarize numeric columns from the process metrics CSV."""
-    samples: dict[str, list[tuple[float, float]]] = {
-        name: [] for name in RESOURCE_METRICS
-    }
-    for row in metric_rows(path):
-        timestamp = numeric(row.get("timestamp"))
-        if timestamp is None:
-            continue
+    """Keep point statistics, deriving trends only from a valid elapsed timeline."""
+    return _summarize_resource_rows(metric_rows(path))
+
+
+def _summarize_resource_rows(
+    rows: list[dict[str, str]],
+) -> dict[str, dict[str, float | None]]:
+    clock = (
+        "monotonic_timestamp" if any("monotonic_timestamp" in row for row in rows) else "timestamp"
+    )
+    timestamps = [numeric(row.get(clock)) for row in rows]
+    valid_timeline = all(value is not None for value in timestamps) and all(
+        current > previous for previous, current in pairwise(timestamps)
+    )
+    samples: dict[str, list[tuple[float, float]]] = {name: [] for name in RESOURCE_METRICS}
+    for row, timestamp in zip(rows, timestamps):
         for name in RESOURCE_METRICS:
             value = numeric(row.get(name))
             if value is not None:
-                samples[name].append((timestamp, value))
+                samples[name].append((timestamp if timestamp is not None else 0, value))
     result: dict[str, dict[str, float | None]] = {}
     for name, metric_samples in samples.items():
         summary = stats([value for _, value in metric_samples])
-        summary["slope_per_hour"] = linear_slope(metric_samples)
-        summary["rolling_5m_max_increase"] = rolling_max_increase(metric_samples)
+        summary["slope_per_hour"] = linear_slope(metric_samples) if valid_timeline else None
+        summary["rolling_5m_max_increase"] = (
+            rolling_max_increase(metric_samples) if valid_timeline else None
+        )
         result[name] = summary
     return result
 
@@ -164,8 +163,12 @@ def qps_sort_key(value: str) -> tuple[bool, float, str]:
 
 def summarize_qps_resources(path: Path | None) -> dict[str, Any]:
     """Group CPU and RSS samples by the input QPS recorded in the CSV."""
+    return _summarize_qps_resource_rows(metric_rows(path))
+
+
+def _summarize_qps_resource_rows(rows: list[dict[str, str]]) -> dict[str, Any]:
     grouped: dict[str, dict[str, Any]] = {}
-    for row in metric_rows(path):
+    for row in rows:
         key = qps_key(row.get("input_qps"))
         group = grouped.setdefault(key, {"samples": 0, "cpu_pct": [], "rss_mb": []})
         group["samples"] += 1
@@ -202,36 +205,44 @@ def summarize_drops(
     path: Path | None, load_requests: int
 ) -> dict[str, int | float | None]:
     """Summarize dropped events and derive a measurable drop rate."""
+    return _summarize_drop_rows(metric_rows(path), load_requests)
+
+
+def _summarize_drop_rows(
+    rows: list[dict[str, str]], load_requests: int
+) -> dict[str, int | float | None]:
     values = {name: [] for name in DROP_METRICS}
-    for row in metric_rows(path):
+    invalid: set[str] = set()
+    for row in rows:
         for name in DROP_METRICS:
             value = numeric(row.get(name))
-            if value is not None:
+            if value is None or value < 0 or not value.is_integer():
+                invalid.add(name)
+            else:
                 values[name].append(value)
-    ring_dropped = counter_delta(values["ring_buffer_dropped"])
-    channel_dropped = counter_delta(values["channel_dropped"])
-    completed = counter_delta(values["completed"])
-    total_dropped = ring_dropped + channel_dropped
-    available = any(
-        len(values[name]) >= 2
-        for name in ("ring_buffer_dropped", "channel_dropped")
+    deltas = {
+        name: counter_delta(samples) if len(samples) >= 2 and name not in invalid else None
+        for name, samples in values.items()
+    }
+    # A missing counter can hide drops even when the other source is zero.
+    ring, channel = deltas["ring_buffer_dropped"], deltas["channel_dropped"]
+    total_dropped = ring + channel if ring is not None and channel is not None else None
+    completed = deltas["completed"]
+    denominator = (
+        (completed + total_dropped or load_requests)
+        if completed is not None and total_dropped is not None
+        else load_requests
     )
-    denominator = completed + total_dropped or load_requests
     return {
-        "ring_buffer_dropped": (
-            ring_dropped if len(values["ring_buffer_dropped"]) >= 2 else None
-        ),
-        "channel_dropped": (
-            channel_dropped if len(values["channel_dropped"]) >= 2 else None
-        ),
-        "completed": completed if len(values["completed"]) >= 2 else None,
-        "total_dropped": (
-            total_dropped if available else None
-        ),
+        **deltas,
+        "total_dropped": total_dropped,
         "drop_rate": (
-            total_dropped / denominator * 100 if available and denominator else None
+            total_dropped / denominator * 100
+            if total_dropped is not None and denominator > 0
+            else None
         ),
     }
+
 
 
 def build_summary(
@@ -254,8 +265,12 @@ def build_summary(
         drops["drop_rate"] / 100 if drops["drop_rate"] is not None else None
     )
     completeness = numeric(validation.get("completeness_ratio")) if validation else None
-    expected_tokens = numeric(validation.get("expected_total_tokens")) if validation else None
-    captured_tokens = numeric(validation.get("captured_total_tokens")) if validation else None
+    expected_tokens = (
+        numeric(validation.get("expected_total_tokens")) if validation else None
+    )
+    captured_tokens = (
+        numeric(validation.get("captured_total_tokens")) if validation else None
+    )
     capture_loss_rate = (
         max(0.0, 1.0 - completeness) if completeness is not None else None
     )
@@ -336,8 +351,12 @@ def render_markdown(
 ) -> str:
     """Build a human-readable report from benchmark summaries."""
     completeness = numeric(validation.get("completeness_ratio")) if validation else None
-    expected_tokens = numeric(validation.get("expected_total_tokens")) if validation else None
-    captured_tokens = numeric(validation.get("captured_total_tokens")) if validation else None
+    expected_tokens = (
+        numeric(validation.get("expected_total_tokens")) if validation else None
+    )
+    captured_tokens = (
+        numeric(validation.get("captured_total_tokens")) if validation else None
+    )
     capture_loss_percent = (
         max(0.0, 1.0 - completeness) * 100 if completeness is not None else None
     )
@@ -534,6 +553,7 @@ def main() -> int:
     parser.add_argument("--metrics", type=Path)
     parser.add_argument("--validation-report", type=Path)
     parser.add_argument("--summary-output", type=Path)
+    parser.add_argument("--agent-summary", type=Path)
     args = parser.parse_args()
     validation = None
     if args.validation_report and args.validation_report.exists():
@@ -551,24 +571,46 @@ def main() -> int:
         else summarize_load(args.load_results)
     )
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    resources = summarize_resources(args.metrics)
-    drops = summarize_drops(args.metrics, load["requests"])
-    args.output.write_text(
-        render_markdown(
-            protocol=args.protocol,
-            qps=args.qps,
-            duration=args.duration,
-            load=load,
-            resources=resources,
-            qps_resources=summarize_qps_resources(args.metrics),
-            drops=drops,
-            validation=validation,
-            load_artifact=args.load_results,
-            load_log_artifact=args.load_log,
-            metrics_artifact=args.metrics,
-        ),
-        encoding="utf-8",
+    rows = metric_rows(args.metrics)
+    resources = _summarize_resource_rows(rows)
+    drops = _summarize_drop_rows(rows, load["requests"])
+    report = render_markdown(
+        protocol=args.protocol,
+        qps=args.qps,
+        duration=args.duration,
+        load=load,
+        resources=resources,
+        qps_resources=_summarize_qps_resource_rows(rows),
+        drops=drops,
+        validation=validation,
+        load_artifact=args.load_results,
+        load_log_artifact=args.load_log,
+        metrics_artifact=args.metrics,
     )
+    agent_load = None
+    if args.agent_summary:
+        agent_load = json.loads(args.agent_summary.read_text(encoding="utf-8"))
+        lines = [
+            "\n## Independent agent load\n",
+            f"Load verification: {'PASS' if agent_load['passed'] else 'FAIL'}\n",
+            f"Agents: {agent_load['distinct_agent_pids']} distinct client PIDs; "
+            f"target: {agent_load['requested_agents']}.",
+            f"Active streams: peak {agent_load['peak_active_streams']}, "
+            f"average {agent_load['average_active_streams']:.2f}.",
+            f"Received output: {agent_load['received_output_tokens_per_second']:.2f} tokens/s; "
+            f"target per agent: {agent_load['target_tokens_per_second_per_agent']:.2f} tokens/s.",
+            "Fixture: ` x` verified with `cl100k_base`. Output rates cover the measurement window; "
+            "token reconciliation above includes synthetic input usage and drained responses.",
+            "\n| Agent | PID | Measured output tok/s | Error |",
+            "| ---: | ---: | ---: | --- |",
+        ]
+        for agent in agent_load["agents"]:
+            error = str(agent.get("error", "")).replace("|", "\\|").replace("\n", " ")
+            lines.append(
+                f"| {agent['agent']} | {agent['pid']} | {agent['tokens_per_second']:.2f} | {error} |"
+            )
+        report += "\n".join(lines) + "\n"
+    args.output.write_text(report, encoding="utf-8")
     if args.summary_output:
         args.summary_output.parent.mkdir(parents=True, exist_ok=True)
         summary = build_summary(
@@ -580,6 +622,8 @@ def main() -> int:
             drops=drops,
             validation=validation,
         )
+        if agent_load is not None:
+            summary["agent_load"] = agent_load
         args.summary_output.write_text(
             json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8"
         )

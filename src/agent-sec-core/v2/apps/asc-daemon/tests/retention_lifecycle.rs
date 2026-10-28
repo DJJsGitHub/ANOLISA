@@ -468,7 +468,8 @@ fn configured_command(directory: &Path) -> Command {
     std::fs::write(
         &config,
         serde_json::to_vec(&serde_json::json!({
-            "stateDir": directory.join("state")
+            "stateDir": directory.join("state"),
+            "enableDefaultSkillDirs": false
         }))
         .unwrap(),
     )

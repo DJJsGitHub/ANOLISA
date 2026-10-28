@@ -131,7 +131,13 @@ fn resolve_domains(domain_patterns: &[String]) -> IpDomainCache {
             Ok(addrs) => {
                 for addr in addrs {
                     log::debug!("Connection scan: resolved {} → {}", pattern, addr.ip());
-                    cache.insert(addr.ip(), pattern.clone());
+                    // Key a v4-mapped literal (`::ffff:a.b.c.d`) by its IPv4
+                    // address: a plain AF_INET connection to that peer is
+                    // listed only in /proc/net/tcp under the IPv4 form, so the
+                    // IPv6 key would never match it. The scan already looks a
+                    // dual-stack peer up in canonical form, so both directions
+                    // meet on the same key.
+                    cache.insert(addr.ip().to_canonical(), pattern.clone());
                 }
             }
             Err(e) => {
@@ -169,7 +175,17 @@ fn scan_tcp_connections(ip_cache: &IpDomainCache) -> Vec<(u64, IpAddr, u16, Stri
                         continue;
                     }
                     let remote_ip = entry.remote_address.ip();
-                    if let Some(domain) = ip_cache.get(&remote_ip) {
+                    // An AF_INET6 (dual-stack) socket connected to an IPv4
+                    // peer is listed with the v4-mapped form `::ffff:a.b.c.d`,
+                    // while the cache holds the IPv4 address the rule resolved
+                    // to. Look the peer up in canonical form as well, or that
+                    // established connection never matches and the agent is
+                    // never attached. The wire form stays in the result.
+                    let canonical_ip = remote_ip.to_canonical();
+                    let domain = ip_cache
+                        .get(&remote_ip)
+                        .or_else(|| ip_cache.get(&canonical_ip));
+                    if let Some(domain) = domain {
                         results.push((
                             entry.inode,
                             remote_ip,
@@ -258,6 +274,16 @@ mod tests {
         let cache = resolve_domains(&patterns);
         // All patterns are wildcards, so cache should be empty
         assert!(cache.is_empty());
+    }
+
+    #[test]
+    fn resolve_domains_keys_a_v4_mapped_literal_by_its_ipv4_address() {
+        // A plain AF_INET connection to 127.0.0.1 is listed only in
+        // /proc/net/tcp under its IPv4 address, so a rule written in the
+        // v4-mapped form must be keyed by that address to ever match.
+        let cache = resolve_domains(&["::ffff:127.0.0.1".to_string()]);
+        let v4: IpAddr = "127.0.0.1".parse().expect("ipv4 literal");
+        assert_eq!(cache.get(&v4).map(String::as_str), Some("::ffff:127.0.0.1"));
     }
 
     #[test]
@@ -374,5 +400,35 @@ mod tests {
             results.iter().any(|r| r.remote_ip.is_ipv6()),
             "the matched entry must come from the IPv6 table"
         );
+    }
+
+    #[test]
+    fn scan_finds_a_v4_mapped_ipv6_connection() {
+        // An AF_INET6 (dual-stack) socket connected to an IPv4 peer is listed
+        // in `/proc/net/tcp6` with the v4-mapped peer `::ffff:a.b.c.d`, not in
+        // `/proc/net/tcp`. The cache holds the IPv4 address the rule resolved
+        // to, so a lookup keyed on the wire form can never match it and an
+        // already-running agent on a dual-stack socket is never attached.
+        // 127.0.0.2 keeps this test independent of the other loopback tests.
+        let https_rules = vec![crate::config::HttpsRule {
+            pattern: "127.0.0.2".to_string(),
+        }];
+        let agent_scanner = AgentScanner::from_rules(&[], &https_rules);
+        let scanner = ConnectionScanner::new(&agent_scanner);
+
+        let listener = std::net::TcpListener::bind("127.0.0.2:0").expect("bind listener");
+        let port = listener.local_addr().expect("listener addr").port();
+        let peer: std::net::SocketAddr = format!("[::ffff:127.0.0.2]:{port}")
+            .parse()
+            .expect("v4-mapped loopback address");
+        let _stream = match std::net::TcpStream::connect(peer) {
+            Ok(stream) => stream,
+            // No IPv6 support in this environment: nothing to observe.
+            Err(_) => return,
+        };
+        let _accepted = listener.accept().expect("accept");
+
+        let results = scanner.scan(&HashSet::new());
+        assert!(results.iter().any(|r| r.pid == std::process::id()));
     }
 }

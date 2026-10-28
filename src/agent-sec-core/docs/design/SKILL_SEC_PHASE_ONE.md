@@ -5,7 +5,15 @@
 SkillSec separates Skill scanning, content authentication, version storage and activation inside
 one `asc-capability-skill-sec` crate. `SkillSecService` coordinates these modules in the
 system daemon. This document records the migration contract, implementation batches and Linux
-acceptance boundaries.
+acceptance boundaries. The current contract does not support key rotation and uses the system
+`managedSkillDirs` configuration as its only persisted discovery set. Earlier dated rotation and
+private-registry acceptance results below are historical, not current capability claims.
+
+The current Rust CLI entry point is `agent-sec-cli skillsec`. `skill-ledger` remains a
+compatibility alias for the same command tree, request parameters, output and exit codes.
+This naming transition does not change `action.skill_sec`, audit event types, capability IDs,
+environment variables or persistent data. Existing Hook callers remain compatible. CLI contract
+tests cover both spellings; the core workflow and discovery process tests use `skillsec`.
 
 ## Delivery and acceptance
 
@@ -43,7 +51,7 @@ independently. Earlier Linux/RPM results below remain bound to their recorded re
 CLI / RPC -> Handler -> ActionService -> ActionRuntime -> SkillSecExecutor -> SkillSecService
 SkillFS notify -> authenticated queue / worker -> ActionService
 Configured ordinary Skills -> startup discovery / same worker -> ActionService
-Startup recovery ---------------------------> ActionService
+Startup scan -------------------------------> ActionService
 ```
 
 `asc-action-types` owns the shared command, canonical identity and decision types. Invocation input
@@ -55,12 +63,13 @@ unavailable-root representation preserves per-Skill errors in aggregate operatio
 
 The daemon composition root owns one Service, the executors, projectors, runtimes and shared
 Finalizer. SkillFS lives in `asc-daemon::skillfs`, using the existing dispatcher/session ports.
-Startup prepares resolver and queue resources, registers ActionService, runs recovery, starts the
-daemon-owned worker, then opens the socket. The worker performs bounded discovery and scanning in
+Startup prepares resolver and queue resources, registers ActionService, starts the daemon-owned
+worker, then opens the socket. The worker performs bounded discovery and scanning in
 its background thread even without SkillFS. The Executor retains resolver/health resources, not the worker.
 Configuration, private-state or bridge initialization and worker-start failures prevent admission.
-Unfinished rotation recovery retains its fence and permits status/admin retry; individual reconcile
-failures are diagnosed while other items continue.
+The worker uses normal per-Skill operations, including their existing rollback recovery; failures
+are diagnosed while other items continue. Startup coverage
+comes from configuration discovery; it is not supplemented by a private history registry.
 
 Ordinary requests use main's top-level OTel carrier, compatibility labels and request scope.
 UID/GID/PID come from kernel credentials; Agent baggage is correlation metadata, never authority.
@@ -74,7 +83,7 @@ SkillFS keeps its HMAC/notify wire contract. Authentication is selected before o
 retains its bounded five-second exchange; the SkillSec execution override remains 60 seconds by
 default, capped at 120 seconds. Other methods retain their configured limits. Shutdown stops UDS
 admission and drains requests, joins the SkillSec worker (65 seconds) and PAP (30 seconds) in parallel, then closes
-the outer runtime, durable sinks and OTel. Waiting notifications are recovered from registered Skills
+the outer runtime, durable sinks and OTel. Waiting notifications are recovered from configured Skills
 on restart; this is not a durable queue or an exactly-once guarantee.
 
 Backing mounts are cloned while detached, made private through `/proc/self/fd`, then published with
@@ -262,10 +271,9 @@ consumer fields, results and exit codes remain migration acceptance requirements
    uses compact UTF-8, excludes `manifestHash` and `signature`, and is hashed with SHA-256. Ed25519
    signs the UTF-8 `sha256:<hex>` hash string. This is a new record contract, not a claim of V1
    byte compatibility. SkillFS protocol versions are independent and remain unchanged.
-3. **Rotation:** only an administrator may rotate the system key. No old public-key fallback is
-   retained, including for earlier V2 records. Rotation must withdraw old activation before trust
-   is rebuilt by scanning, signing and activating again. Rotation is not implemented by the
-   batch-one key initialization API.
+3. **Key lifetime:** system-key initialization is idempotent; V2 does not support key rotation.
+   `rotate-keys` and `init --force-keys` remain recognizable inputs but fail before side effects.
+   No rotation transaction or compatibility handling for the unreleased private registry is kept.
 4. **Authorization:** every local caller may operate every managed Skill. Managed-directory
    configuration bounds the managed set; it is not an ownership ACL. User isolation is an explicit
    TODO. Arbitrary bytes cannot be submitted to a generic signing endpoint.
@@ -318,14 +326,13 @@ notify contract is adapted; other V1 RPC methods are not enabled by that adapter
 
 For `init`, `scan` and `certify`, Service owns argument validation and the subsequent key operation.
 Executor delegates these commands through the public runtime; invalid scanner names, and invalid
-findings for certification, fail before key creation or rotation. Public Service and standalone
+findings for certification, fail before key creation. Public Service and standalone
 Scanner entries validate their inputs. Internal per-Skill scans consume explicit selections without
 repeating name validation, including when a baseline processes multiple Skills.
 
-Existing-key initialization takes a shared generation lock. Only a missing key requires releasing
-that lock, acquiring the exclusive lock and checking again before creation. Rotation retains its
-exclusive boundary; per-Skill mutations retain their own lock. Key permissions, rotation state and
-content identity are still checked at use time.
+Key initialization is serialized and checks the existing key before creating a missing one;
+per-Skill mutations retain their own lock. Key permissions and content identity are still checked
+at use time. There is no key-replacement generation lock or rotation fence.
 
 ## Rollback boundary
 
@@ -378,9 +385,9 @@ writes. Fixture generation is a developer tool; the deployed Rust binary never i
 ## Ledger and Service boundary in batch three
 
 `SkillSecService` owns one lock per canonical Skill identity, shared by direct and resolved
-paths. Unused lock entries are discarded. A generation read lock protects operations against
-system key replacement; rotation will take the write side in batch five. Registration stores
-exact roots in private daemon state and never discovers siblings from a user-selected parent.
+paths. Unused lock entries are discarded. Successful scan/certify operations remember canonical
+exact roots in the active system configuration, not in a second private registry, and never discover
+siblings from a user-selected parent.
 Business roots cannot be inside `.skill-meta`, including authenticated physical mappings; internal
 snapshot verification does not use this business-root entry point.
 
@@ -402,11 +409,12 @@ Without any Ledger artifacts, `check` returns `none` and an empty `audit` succee
 initialization. These read-only queries do not create a key or Ledger; existing artifacts still
 require authentication.
 
-Registration follows the signed commit and precedes activation. If the first registration fails,
-the request fails without publishing activation, although its version may already be committed.
-Startup recovery only enumerates registered roots and rejects those outside the current configured scope. After correcting the reported failure, retrying
-`scan` on unchanged content reuses the authenticated version and completes registration. No durable
-discovery queue is promised for an unacknowledged first request.
+Configuration persistence follows successful processing, including an unchanged-content no-op.
+A persistence failure appends a warning without discarding findings or blocking activation; retrying
+`scan` can complete the save. Existing `managedSkillDirs` patterns need no duplicate ordinary entry;
+mapped Skills always persist a canonical exact entry for resolver-based startup discovery. No durable
+discovery queue or registry-based recovery for undiscoverable roots is promised. Per-Skill rollback
+recovery and its validation order are unchanged.
 
 Export reads an authenticated snapshot and writes `snapshot/`, `manifest.json` and `findings.json`.
 The caller must first create an empty, caller-owned output directory outside Skill/state roots;
@@ -434,6 +442,8 @@ source consistency, findings and bounded review messages separate.
 
 Publication writes the minimal schema-1 `activation.json` and directory xattr consumed by SkillFS.
 It exposes a verified snapshot, a safe pending-review stub, or a null target for an explicit block.
+The pending stub preserves the directory name as a YAML string, escaping characters that YAML
+treats as line breaks or rejects when literal; its description and review instructions remain fixed.
 `contractWritten`, `activationXattr.written` and `activationPending` distinguish committed business
 state from incomplete publication. An xattr failure never undoes a signed decision; activation or
 startup reconcile retries it. This is publication evidence, not proof of an observed FUSE effect.
@@ -465,8 +475,9 @@ reads the daemon key, executes Python, or scans locally. Client-side path expans
 reading/deletion and export-directory creation run with the caller's own permissions.
 
 Supported commands are `init`, `check`, `analyze`, `scan`, `certify`, `status`, `audit`,
-`list-scanners`, `decide`, `show`, `export`, `rotate-keys`, and publication retry `activate`.
-`init --no-baseline` creates only keys; `init --force-keys` and `rotate-keys` require kernel UID 0.
+`list-scanners`, `decide`, `show`, `export`, and publication retry `activate`.
+`init --no-baseline` creates only keys. `init --force-keys` and `rotate-keys` return unsupported
+before CLI discovery or server-side root resolution; RPC returns `NotImplementedError` and exit 1.
 The retired `init-keys` and per-user `--passphrase` are not part of the system-key contract.
 `scan`, `certify` and `decide` create the initial key when absent, but never replace a corrupt current key.
 `check` returns exit 1 for deny/tampered/error; scan/certify and complete analyze return exit 0 for
@@ -482,7 +493,7 @@ These focused lifecycle changes align with the open system-service proposal #321
 they do not imply that proposal has merged or that its service identity is adopted.
 
 Root-owned `/etc/agent-sec/skillsec.json` (or `--skillsec-config`) configures `stateDir`,
-`managedSkillDirs`, scanner overrides and parsers. The default state is
+`managedSkillDirs`, `enableDefaultSkillDirs`, scanner overrides and parsers. The default state is
 `/var/lib/agent-sec/skillsec`, owned by root with mode 0700; the current key remains 0600.
 No user config, history or keyring is imported. `managedSkillDirs` retains exact, terminal `/*`
 and terminal `/**` forms. It is parsed separately from exact request identities; no additional
@@ -490,37 +501,35 @@ and terminal `/**` forms. It is parsed separately from exact request identities;
 root has `SKILL.md`, skips hidden descendants, refuses symlink traversal and expands on each
 aggregate request so new children do not require a restart. Paths are absolute; no HOME expansion.
 
-The Executor rejects caller paths outside configured patterns or authenticated SkillFS mounts
+The Executor rejects caller paths outside default/configured patterns or authenticated SkillFS mounts
 before physical resolution and business side effects. All commands share this boundary, including
 analyze, export, background work and ordinary startup reconcile. Aggregate discovery combines
-configured patterns and still-authorized registration; caller discovery does not expand authority.
-One out-of-range caller path rejects the whole batch before processing any Skill. Empty
-`check/scan --all` remains an execution failure without creating keys. Caller discovery is bounded
-to 1024 roots. Registration is operational history, never an authorization source. Status uses the
-current configuration and authorized history independently of caller HOME. Configured mount trees
-are not walked through FUSE; authenticated notifications and the existing registry supply their roots.
+default/configured patterns; caller inputs do not expand authority. One out-of-range caller path
+rejects the whole batch before processing any Skill. Empty `check/scan --all` remains an execution
+failure without creating keys. Explicit caller input is bounded to 1024 roots. Status uses the same
+configuration independently of caller HOME. Exact mounted entries go directly through the
+authenticated resolver; configured mount trees are not walked through FUSE.
 
-Root must restore a removed scope before a new rotation can withdraw its historical exposure.
-An already authorized private rotation intent can still finish withdrawal after reconfiguration;
-this exception only permits root rotation recovery, not a new baseline scan outside current scope.
+Successful scan/certify/no-op processing remembers paths in the actual daemon configuration file,
+preserving unrelated settings and safe file permissions. A saved exact path is ordinary authorization,
+including after its SkillFS mount is removed or default-directory discovery is disabled; administrators
+must remove the saved entry and restart the daemon to revoke it.
+A save error appends to business `warnings` without hiding scan findings or activation results.
+Startup, status and aggregate requests share this one configured discovery set.
 
-The shared CLI discovery includes direct Skill children of `$XDG_DATA_HOME/anolisa/skills`.
-It follows the installer's syntax rules: unset/empty/relative overrides or raw `.`/`..` segments
-fall back to `$HOME/.local/share/anolisa/skills`; a valid but absent directory is simply skipped.
-An unset or empty `HOME` resolves through the CLI user's system account home directory.
-Only the CLI reads this caller environment. `init --no-baseline` and explicit-path requests bypass
-discovery, and hidden/snapshot directory filtering remains in effect.
+Default scope is enabled by `enableDefaultSkillDirs` (also true when omitted). Daemon startup
+reads local `/etc/passwd` homes and adds the system and standard user patterns documented in the
+[V2 guide](../../../../docs/user-guide/en/agent-sec-core/skillsec-v2.md#system-configuration-and-trust).
+No caller environment or CLI discovery participates. Default-only discovery is bounded to 10,000
+entries and 1,024 additional Skills; explicit patterns remain intact. Per-directory failures retain
+discoveries with `discoveryErrors` and a failed outcome. Account/configuration changes require a restart.
 
-Rotation takes the service generation write lock, records a private intent, and withdraws every
-registered exposure before replacing the key. A pending rollback must first reconcile. A failed
-withdrawal retains the old key and fences ordinary Ledger operations until administrator retry or
-startup recovery succeeds. A changed fingerprint during recovery proves replacement already
-committed and permits intent cleanup without resolving mappings or rotating again. The intent stores
-only the previous fingerprint and canonical Skill identities. Startup, `rotate-keys`, and
-`init --force-keys` resolve current physical mappings and inodes again before withdrawal; the service
-requires exactly the recorded Skill set. Resolver failure retains the intent and old key for retry.
-Startup recovery uses the public Action Runtime; failed
-Skill recovery is visible without disabling unrelated daemon methods.
+`managed-skills.json` and `key-rotation.json` are not read, written, detected, migrated or deleted.
+There is no key-rotation transaction, restart replay or previous-key fallback. Existing single-Skill
+rollback intents and verification remain in place. Startup recovers only roots found by current
+configuration; a missing or otherwise undiscoverable root needs an explicit authorized retry once
+it is available again. Recovery runs through the public Action Runtime, and one failed Skill does
+not disable unrelated daemon methods.
 
 The public Finalizer/Sink receives controlled command, counts, verdict/status, version and execution
 failure class. `result.verdict` retains the V1 command-specific verdict and worst-result batch
@@ -534,7 +543,7 @@ no committed mutation is undone. Findings import is bounded to 2 MiB.
 
 `v2/fixtures/skillsec/consumer.json` records normal, risk, uninitialized, timeout, execution-error
 and incomplete-activation examples. CLI rendering tests consume these examples; runtime and real
-CLI tests independently exercise execution, caller identity, rotation and safe audit. They do not
+CLI tests independently exercise execution, caller identity, unsupported rotation and safe audit. They do not
 establish Agent Hook integration or SkillFS effects. Historical batch-five acceptance (before the current alignment) passed strict
 workspace Clippy, all workspace tests and rustdoc. The cross-UID CLI workflow runs with normal
 root DAC permissions; other permission-sensitive cases retain reduced DAC. A separate daemon
@@ -565,8 +574,8 @@ An unexpected worker exit closes admission and reports unhealthy status until da
 The authenticated SkillFS client accepts its existing private endpoint or a root-owned parent
 mode `0755` plus socket mode `0666`. It verifies ancestor ownership, symlinks, writable parents,
 endpoint type/owner and the connected kernel UID before the HMAC handshake. The HMAC key remains
-an owner-only `0600` regular file. Public socket access does not grant administrative key rotation
-or change PAP authorization. All local users may operate managed Skills under the phase-one
+an owner-only `0600` regular file. Public socket access does not change PAP authorization or make
+unsupported key rotation available. All local users may operate managed Skills under the phase-one
 access contract.
 
 The root-owned `--skillsec-config` file accepts the optional binding below. Paths must be
@@ -574,7 +583,7 @@ absolute and normalized. One mount's canonical/live roots may be identical for a
 non-in-place mount; otherwise they must be disjoint. Prefixes belonging to different mounts cannot
 overlap. The daemon and each SkillFS
 process receive private copies of the same raw HMAC secret. This secret is separate from
-`stateDir/signing-key.pk8`; neither signing-key rotation nor user HOME selects the HMAC key.
+`stateDir/signing-key.pk8`; user HOME does not select the HMAC key.
 
 ```json
 {
@@ -598,8 +607,8 @@ response must match both configured prefixes, the exact relative Skill ID and `s
 Source/live aliases map to one canonical lock identity. The returned device/inode is checked when
 opening the backing directory and again inside the service boundary. Failed resolution inside a
 configured mount never falls back to reading the FUSE view. Aggregate commands retain per-Skill
-mapping failures; `status` still returns key readiness. Rotation persists physical identity pins
-in its private recovery intent and refuses unresolved mappings before starting replacement.
+mapping failures; `status` still returns key readiness. `show` authenticates existing Ledger state and
+reports its risk even for mapped Skills; remembering a path does not bypass validation.
 
 One worker coalesces notifications per canonical Skill with a 500 ms debounce and a two-second
 maximum delay under continuous edits. It invokes public Action Runtime scan, then activation even
@@ -608,10 +617,11 @@ within the execution deadline; unknown post-commit failures are not replayed. Ea
 30-second budget. Failures remain visible in the audit, stderr and `status`'s `skillfs` counters.
 Shutdown stops queue admission and waits for the current pair of bounded operations.
 
-After synchronous rollback/latest/activation recovery, the daemon-owned worker discovers ordinary
-Skills from current exact/`/*`/`/**` configuration and authorized history, including unregistered Skills.
-It also schedules registered mount Skills without requiring SkillFS to restart. Discovery uses the
-same bounded no-symlink traversal as RPC and skips mount subtrees. The deduplicated startup list
+The daemon-owned worker discovers Skills from enabled default directories and current
+exact/`/*`/`/**` configuration. It also schedules exact configured mount Skills without requiring SkillFS
+to restart. Discovery uses the same bounded
+no-symlink traversal as RPC, skips mount subtrees and passes exact mount roots directly to the resolver.
+Per-Skill recovery remains part of processing; no separate registry supplies missing roots. The deduplicated startup list
 feeds the same scan/activation loop; slow scans do not delay socket admission. Live notifications allow up to 256
 pending distinct Skills, and queue overflow returns a signed rejection. This is an explicit Rust
 resource bound beyond the unbounded Python pending map; it is not durable acceptance. Mount
@@ -655,7 +665,7 @@ configuration preservation, absence of automatic activation/key creation and V1 
 The installed Python V2 E2E fixtures isolate daemon state/audit and exercise ordinary-UID PAP
 denial against a root process. These checks remain distinct from actual systemd lifecycle and
 real FUSE evidence. The
-[core guide](../../../../docs/user-guide/en/agent-security/agent-sec-core/skillsec-v2.md) gives
+[core guide](../../../../docs/user-guide/en/agent-sec-core/skillsec-v2.md) gives
 source/RPM commands, shared-volume requirements and state-matched upgrade/rollback instructions.
 
 Historical delivery acceptance (before the current alignment) passed on Alibaba Cloud Linux 4, x86_64. After alignment with the upstream system daemon, the
@@ -685,7 +695,7 @@ instead of a distribution-specific `Result` string. Earlier failed fixture attem
 The follow-up keeps the `skill-ledger` command and capability IDs, host languages, matching rules,
 policy defaults and enablement. It changes daemon-owned initialization and validation of command-specific results. Cosh receives
 a 10-second host deadline for sequential initialization (3 seconds) and querying (5 seconds). It does not introduce a shared Hook framework or a second policy layer.
-The [user guide](../../../../docs/user-guide/en/agent-security/agent-sec-core/skillsec-v2.md#agent-hook-integration)
+The [user guide](../../../../docs/user-guide/en/agent-sec-core/skillsec-v2.md#agent-hook-integration)
 defines the six adapters' behavior and execution-error boundaries.
 
 The work is delivered as four logical commits: initialization; result handling; real Rust CLI/daemon

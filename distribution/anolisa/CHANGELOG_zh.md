@@ -9,6 +9,71 @@
 
 ## [未发布]
 
+## [0.3.19] - 2026-10-25
+
+### 变更
+
+- 遥测和 `anolisa register status` 将容器部署识别为 `container`，避免继承宿主机的
+  云产品类型。读取 `product_type` 的程序需接受此新增值。`/etc/anolisa-release` 中
+  显式声明的 `PRODUCT_TYPE` 仍优先；构建容器镜像时需更新或移除过期声明
+  （[#8206](https://github.com/agentic-os-org/ANOLISA/pull/8206)）。
+- 组件目录更新至 Agent Memory `0.2.10`、AgentSight `0.14.3`、cosh-ng `0.28.0`、
+  Copilot Shell `2.8.0`、OS Skills `0.6.3`、SkillFS `0.5.3`、Tokenless `0.8.8`
+  和 ws-ckpt `0.6.0`。
+
+### 修复
+
+- 禁用 OpenClaw 和 Hermes skills 时保留用户新增或修改的文件；启用时拒绝写入
+  ANOLISA 不拥有的已有目录。祖先目录被重定向或成为悬空链接时停止清理并保留安装
+  记录，恢复原路径后可重试。没有逐文件归属信息的旧记录在通过相同路径检查后，
+  仍按整个目录清理
+  （[#6221](https://github.com/agentic-os-org/ANOLISA/pull/6221)）。
+- 移动包含平台依赖的完整 npm 安装目录后，启动器仍可运行。已有安装可通过重新
+  执行 postinstall 获得相对路径启动器
+  （[#8278](https://github.com/agentic-os-org/ANOLISA/pull/8278)）。
+- 遥测 enable、disable、link、unlink、upload 和 init 操作成功后遵循 `--json`，
+  同时支持 `--quiet --json`。标准响应包含对应操作的状态，警告仍写入 stderr
+  （[#8706](https://github.com/agentic-os-org/ANOLISA/pull/8706)）。
+- Raw 安装或更新遇到 CLI 无法执行的 hook 阶段时给出提示：非严格 hook 允许操作
+  继续，`strict = true` hook 则在下载或替换文件前拒绝操作。含不受支持 hook 声明
+  的旧安装仍可执行修复
+  （[#6447](https://github.com/agentic-os-org/ANOLISA/pull/6447)）。
+
+## [0.3.18] - 2026-10-15
+
+### 新增
+
+- 通过 `anolisa adapter enable tokenless qwenwork` 管理 QwenWorkCN macOS 本地模式的
+  Tokenless 插件。支持 QwenWorkCN `1.2.5`，保留操作中断后的归属记录；已有脚本安装
+  需先卸载再由 CLI 接管。完成后重启桌面应用并在应用内检查激活状态；CLI 验证文件，
+  但加载与激活状态均报告为 `unknown`
+  （[#7368](https://github.com/agentic-os-org/ANOLISA/pull/7368)）。
+
+### 变更
+
+- 组件目录中的 Tokenless 版本更新至 `0.8.7`。
+- 组件目录中的 Agent Memory 版本更新至 `0.2.9`。
+- 组件目录中的 SkillFS 版本更新至 `0.5.2`，可在兼容制品可用时识别 Linux ARM64 发布包。
+- 识别 ws-ckpt 的 Linux ARM64 发布包，并按预构建包布局查找 OpenClaw 和 Hermes 插件。
+
+### 修复
+
+- Raw 更新在替换文件前拒绝与已安装组件冲突的新版本，保留原版本及其管理记录
+  （[#7635](https://github.com/agentic-os-org/ANOLISA/pull/7635)）。
+- Raw 组件文件移除后仍可执行包内的 post-uninstall hooks；共享 hooks 保持原路径，
+  成功或失败后均清理临时 hook 副本，且不跟随暂存路径中的符号链接
+  （[#6450](https://github.com/agentic-os-org/ANOLISA/pull/6450)）。
+- OpenClaw 安装在修改宿主前被拒绝，或已确认插件不存在时，可正常禁用并重试；
+  宿主状态无法核实时保留清理记录，重试中断后也能继续恢复
+  （[#7197](https://github.com/agentic-os-org/ANOLISA/pull/7197)）。
+- 即使在 `umask 077` 下，新建安装目录也使用 `0755` 权限；保留已有目录及符号链接
+  目标的权限。
+- `--repo` 覆盖在获取仓库元数据前拒绝未展开的变量引用，并提示传入已解析的 URL。
+- sandbox 安装与 dry-run 预览执行相同的内核要求检查，保留显式 `--force` 预览，
+  并在报告计划成功前拒绝无效的要求格式
+  （[#7294](https://github.com/agentic-os-org/ANOLISA/pull/7294)）。
+- 拒绝未知的旧版注册记录版本，保留原记录与同意状态，避免执行不受支持的迁移。
+
 ## [0.3.17] - 2026-10-11
 
 ### 新增

@@ -165,7 +165,11 @@
                     "qoder",
                     "openclaw",
                     "hermes",
-                    "qwenpaw"
+                    "qwenpaw",
+                    "pi",
+                    "claude-sdk",
+                    "qoder-sdk",
+                    "agentscope"
                   ]
                 },
                 "binding_id": {

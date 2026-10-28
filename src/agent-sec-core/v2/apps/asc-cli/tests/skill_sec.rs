@@ -31,7 +31,7 @@ async fn invoke(socket: &Path, arguments: &[&str]) -> (i32, Value, String) {
     let mut args: Vec<std::ffi::OsString> = vec![
         "--socket".into(),
         socket.as_os_str().into(),
-        "skill-ledger".into(),
+        "skillsec".into(),
     ];
     args.extend(arguments.iter().map(Into::into));
     let output = tokio::task::spawn_blocking(move || common::run(&args))
@@ -67,6 +67,7 @@ async fn cli_runs_full_core_workflow_and_emits_safe_public_audit() {
     let service = Arc::new(
         SkillSecService::new(
             SkillSecConfig {
+                default_skill_dirs: Vec::new(),
                 state_dir: state.clone(),
                 managed_skill_dirs: vec![
                     asc_capability_skill_sec::ManagedSkillDir::new(&skill).unwrap(),
@@ -147,12 +148,9 @@ fn assert_public_audit(events: &Events) {
         "decide",
         "list-scanners",
     ];
-    if rustix::process::geteuid().as_raw() == 0 {
-        expected.extend(["rotate-keys", "check", "scan"]);
-    }
     expected.push("activate");
     if rustix::process::geteuid().as_raw() == 0 {
-        expected.extend(["check", "rotate-keys", "export", "scan", "decide"]);
+        expected.extend(["check", "export", "scan", "decide"]);
     }
     expected.push("status");
     // Each accepted RPC finalizes once; local CLI validation emits no daemon event.
@@ -288,13 +286,13 @@ async fn assert_decision_and_export_contract(socket: &Path, path: &str, director
 }
 
 async fn assert_root_identity_contract(socket: &Path, path: &str, directory: &Path) {
-    if rustix::process::geteuid().as_raw() == 0 {
-        assert_eq!(invoke(socket, &["rotate-keys"]).await.0, 0);
-        assert_eq!(
-            invoke(socket, &["check", path]).await.1["status"],
-            "tampered"
-        );
-        assert_eq!(invoke(socket, &["scan", path]).await.0, 0);
+    for arguments in [
+        vec!["rotate-keys"],
+        vec!["init", "--force-keys", "--no-baseline"],
+    ] {
+        let (code, _, error) = invoke(socket, &arguments).await;
+        assert_eq!(code, 1);
+        assert!(error.contains("not supported"), "{error}");
     }
     assert_eq!(invoke(socket, &["activate", path]).await.0, 0);
     if rustix::process::geteuid().as_raw() == 0 {
@@ -311,13 +309,13 @@ async fn assert_root_identity_contract(socket: &Path, path: &str, directory: &Pa
             vec!["rotate-keys"],
             vec!["export", path, "--output", export_parent.to_str().unwrap()],
         ] {
-            let expected = i32::from(arguments[0] == "rotate-keys");
+            let expected = i32::from(arguments[0] != "export");
             let output = std::process::Command::new(env!("CARGO_BIN_EXE_agent-sec-cli"))
                 .arg("--socket")
                 .arg(socket)
                 .arg("--timeout-ms")
                 .arg("5000")
-                .arg("skill-ledger")
+                .arg("skillsec")
                 .args(&arguments)
                 .uid(1001)
                 .gid(1001)
@@ -326,12 +324,22 @@ async fn assert_root_identity_contract(socket: &Path, path: &str, directory: &Pa
             assert_eq!(
                 output.status.code(),
                 Some(expected),
-                "{:?}: {}",
+                "{:?}: stdout={} stderr={}",
                 arguments,
+                String::from_utf8_lossy(&output.stdout),
                 String::from_utf8_lossy(&output.stderr)
             );
+            if arguments[0] == "check" {
+                let checked: Value = serde_json::from_slice(&output.stdout).unwrap();
+                assert_eq!(checked["status"], "deny");
+                assert!(
+                    checked["findings"]
+                        .to_string()
+                        .contains("PRIVATE_FINDING_MARKER")
+                );
+            }
             if arguments[0] == "rotate-keys" {
-                assert!(String::from_utf8_lossy(&output.stderr).contains("root administrator"));
+                assert!(String::from_utf8_lossy(&output.stderr).contains("not supported"));
             }
         }
         assert_user_can_edit_after_rollback(socket, directory).await;
@@ -371,7 +379,7 @@ async fn assert_user_can_edit_after_rollback(socket: &Path, directory: &Path) {
         .arg("--socket")
         .arg(socket)
         .args([
-            "skill-ledger",
+            "skillsec",
             "decide",
             skill.to_str().unwrap(),
             "--action",
@@ -464,7 +472,7 @@ fn certify_cleanup_is_projected_before_output_and_never_changes_certification_st
         command
             .arg("--socket")
             .arg(&socket)
-            .args(["skill-ledger", "certify", "/fixture/skill", "--findings"])
+            .args(["skillsec", "certify", "/fixture/skill", "--findings"])
             .arg(&findings);
         if case != "retained" {
             command.arg("--delete-findings");

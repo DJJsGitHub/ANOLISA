@@ -1,4 +1,5 @@
 use std::io::Write;
+use std::os::unix::fs::MetadataExt;
 use tracing_subscriber::EnvFilter;
 
 /// Per-user log retention: today and the preceding two UTC dates. Approved by the user as a per-user total
@@ -10,14 +11,6 @@ const LOG_RETENTION_DAYS: u64 = 3;
 const LOG_BUDGET_BYTES: u64 = 20 * 1024 * 1024;
 /// Log file prefixes managed by the per-user budget.
 const LOG_PREFIXES: &[&str] = &["cosh-shell.log.", "cosh-core.log."];
-
-#[cfg(debug_assertions)]
-static FILE_SINK_READY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-#[cfg(debug_assertions)]
-pub(crate) fn file_sink_is_ready() -> bool {
-    FILE_SINK_READY.load(std::sync::atomic::Ordering::Acquire)
-}
 
 pub(crate) fn init_logging(config_log_level: &str) {
     let log_dir = log_directory();
@@ -71,8 +64,6 @@ pub(crate) fn init_logging(config_log_level: &str) {
             .with_ansi(false)
             .with_target(true)
             .init();
-        #[cfg(debug_assertions)]
-        FILE_SINK_READY.store(true, std::sync::atomic::Ordering::Release);
     } else {
         tracing_subscriber::fmt()
             .with_env_filter(filter)
@@ -208,13 +199,25 @@ fn open_log_file(dir: &std::path::Path, prefix: &str) -> std::io::Result<std::fs
         .mode(0o600)
         .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK)
         .open(dir.join(format!("{prefix}.{}", today_suffix())))?;
-    if !file.metadata()?.is_file() {
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "log is not a regular file",
         ));
     }
+    ensure_log_owner(&metadata)?;
     Ok(file)
+}
+
+fn ensure_log_owner(metadata: &std::fs::Metadata) -> std::io::Result<()> {
+    if metadata.uid() != nix::unistd::geteuid().as_raw() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "log belongs to another user",
+        ));
+    }
+    Ok(())
 }
 
 fn acquire_budget_lock(
@@ -465,6 +468,7 @@ fn reclaim_log_file(path: &std::path::Path) -> std::io::Result<()> {
                     "managed log is not a regular file",
                 ));
             }
+            ensure_log_owner(&metadata)?;
             #[cfg(unix)]
             {
                 use std::os::unix::fs::MetadataExt;
@@ -523,7 +527,7 @@ fn managed_logs(
             continue;
         };
         let meta = std::fs::symlink_metadata(&path)?;
-        if meta.file_type().is_file() {
+        if meta.file_type().is_file() && meta.uid() == nix::unistd::geteuid().as_raw() {
             logs.push((path, date, meta.modified()?, meta.len()));
         }
     }

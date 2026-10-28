@@ -19,6 +19,9 @@ use serde::Serialize;
 
 use agentsight_atif::{AtifTrajectory, Step, StepCategory};
 
+// 将采集用的轻量状态查询与详情查询分离。
+mod source_state;
+
 /// A row of `collected_trajectories` ready for upsert.
 #[derive(Debug, Clone)]
 pub struct TrajectoryRecord {
@@ -250,6 +253,7 @@ impl TrajectoryStore {
             [],
         )?;
         migrate_schema(&conn)?;
+        source_state::initialize(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
             db_path: path.to_path_buf(),
@@ -277,18 +281,17 @@ impl TrajectoryStore {
 
     /// Returns `(file_size, file_mtime_ns)` recorded for `file_path`, if any.
     /// Drives the incremental scan: unchanged files are skipped.
-    /// Checks the successfully ingested trajectory row first and the per-path
-    /// scan bookkeeping (failed conversions, and ingested paths the session
-    /// row no longer points at) second.
+    /// Per-path scan bookkeeping takes precedence: a failed update may differ
+    /// from the last successful trajectory. Falls back to that trajectory
+    /// when its redundant bookkeeping has been removed by maintenance.
     ///
     /// # Errors
     /// Returns an error on SQL failure or poisoned mutex.
     pub fn get_file_state(&self, file_path: &str) -> Result<Option<(i64, i64)>> {
         let conn = self.lock_conn()?;
-        // First check successfully ingested files.
         let state = conn
             .query_row(
-                "SELECT file_size, file_mtime_ns FROM collected_trajectories
+                "SELECT file_size, file_mtime_ns FROM skipped_files
                  WHERE file_path = ?1",
                 params![file_path],
                 |row| Ok((row.get(0)?, row.get(1)?)),
@@ -297,16 +300,15 @@ impl TrajectoryStore {
         if state.is_some() {
             return Ok(state);
         }
-        // Then check skipped (corrupted) files.
-        let skipped = conn
+        let trajectory = conn
             .query_row(
-                "SELECT file_size, file_mtime_ns FROM skipped_files
+                "SELECT file_size, file_mtime_ns FROM collected_trajectories
                  WHERE file_path = ?1",
                 params![file_path],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()?;
-        Ok(skipped)
+        Ok(trajectory)
     }
 
     /// Records the file state for a file that failed conversion, preventing
@@ -336,8 +338,9 @@ impl TrajectoryStore {
     /// Returns an error on SQL failure or poisoned mutex.
     pub fn upsert_trajectory(&self, record: &TrajectoryRecord) -> Result<()> {
         let now_ns = now_ns();
-        let conn = self.lock_conn()?;
-        conn.execute(
+        let mut conn = self.lock_conn()?;
+        let transaction = conn.transaction()?;
+        transaction.execute(
             "INSERT INTO collected_trajectories (
                 session_id, schema_version, agent_name, model_name, num_steps,
                 total_prompt_tokens, total_completion_tokens, start_time, end_time,
@@ -382,13 +385,18 @@ impl TrajectoryStore {
         // the row would miss the incremental check and be fully re-read and
         // re-upserted (collected_at_ns churn) on every scan round. Maintenance
         // purges the bookkeeping row again once the trajectory row itself
-        // carries the same path (it serves the check directly).
-        conn.execute(
-            "INSERT INTO skipped_files (file_path, file_size, file_mtime_ns)
-             VALUES (?1, ?2, ?3)
-             ON CONFLICT(file_path) DO UPDATE SET file_size = ?2, file_mtime_ns = ?3",
-            params![record.file_path, record.file_size, record.file_mtime_ns],
-        )?;
+        // carries the same path and file version (it serves the check directly).
+        if record.source == "hermes" {
+            source_state::record(&transaction, record)?;
+        } else {
+            transaction.execute(
+                "INSERT INTO skipped_files (file_path, file_size, file_mtime_ns)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT(file_path) DO UPDATE SET file_size = ?2, file_mtime_ns = ?3",
+                params![record.file_path, record.file_size, record.file_mtime_ns],
+            )?;
+        }
+        transaction.commit()?;
         Ok(())
     }
 
@@ -605,6 +613,55 @@ impl TrajectoryStore {
         Ok(out)
     }
 
+    /// Returns collected children for a captured session, retaining exact-ID
+    /// precedence and resolving a bare UUID to a unique Codex rollout parent.
+    ///
+    /// Children can exist before their collected parent, so the alias is read
+    /// from child IDs. Non-Codex sources and ambiguous rollout parents are not
+    /// aliases. Existing exact-ID lookup and deletion semantics stay literal.
+    ///
+    /// # Errors
+    /// Returns an error on SQL failure or poisoned mutex.
+    pub fn get_captured_session_subagents(&self, session_id: &str) -> Result<Vec<String>> {
+        let exact = self.get_subagent_atif_jsons(session_id)?;
+        let is_uuid = session_id.len() == 36
+            && session_id.bytes().enumerate().all(|(index, byte)| {
+                if matches!(index, 8 | 13 | 18 | 23) {
+                    byte == b'-'
+                } else {
+                    byte.is_ascii_hexdigit()
+                }
+            });
+        if !exact.is_empty() || !is_uuid {
+            return Ok(exact);
+        }
+        let aliases = {
+            let conn = self.lock_conn()?;
+            let mut stmt = conn.prepare(
+                "WITH parents AS (
+                    SELECT DISTINCT substr(session_id, 1, instr(session_id, ':subagent:') - 1) AS id
+                    FROM collected_trajectories
+                    WHERE source = 'codex' AND is_subagent = 1
+                      AND instr(session_id, ':subagent:') > 0
+                 )
+                 SELECT id FROM parents
+                 WHERE substr(id, 1, 8) = 'rollout-' AND length(id) > 45
+                   AND substr(id, -37) = '-' || ?1
+                 LIMIT 2",
+            )?;
+            let rows = stmt.query_map(params![session_id], |row| row.get::<_, String>(0))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        if let [parent] = aliases.as_slice() {
+            self.get_subagent_atif_jsons(parent)
+        } else {
+            if aliases.len() > 1 {
+                log::warn!("multiple collected Codex parents for captured session {session_id}");
+            }
+            Ok(Vec::new())
+        }
+    }
+
     /// Deletes the subagent rows of `parent_session_id` whose session ids are
     /// not listed in `keep`, returning how many rows were removed.
     ///
@@ -709,12 +766,16 @@ impl TrajectoryStore {
             )
         };
         let removed_skipped_files = self.remove_stale_skipped_files(cutoff_ns)?;
+        let removed_source_states = self.remove_stale_source_session_states(cutoff_ns)?;
         let expired_trajectories = match cutoff_ns {
             Some(cutoff) => self.delete_trajectories_before(cutoff)?,
             None => 0,
         };
         let limit_bytes = policy.max_db_size_mb.saturating_mul(1024 * 1024);
-        if (expired_trajectories > 0 || removed_skipped_files > 0 || limit_bytes > 0)
+        if (expired_trajectories > 0
+            || removed_skipped_files > 0
+            || removed_source_states > 0
+            || limit_bytes > 0)
             && self.checkpoint()? == CheckpointOutcome::Busy
         {
             let snapshot = self.size_snapshot()?;
@@ -755,8 +816,9 @@ impl TrajectoryStore {
     fn delete_trajectories_before(&self, cutoff_ns: i64) -> Result<usize> {
         let mut conn = self.lock_conn()?;
         let transaction = conn.transaction()?;
+        // Evicting the last good trajectory must not overwrite a later failed scan.
         transaction.execute(
-            "INSERT OR REPLACE INTO skipped_files (file_path, file_size, file_mtime_ns)
+            "INSERT OR IGNORE INTO skipped_files (file_path, file_size, file_mtime_ns)
              SELECT file_path, file_size, file_mtime_ns FROM collected_trajectories
              WHERE collected_at_ns < ?1",
             params![cutoff_ns],
@@ -780,8 +842,9 @@ impl TrajectoryStore {
         }
         let limit = ((count as f64 * fraction.clamp(0.0, 1.0)) as i64).max(1);
         let transaction = conn.transaction()?;
+        // Preserve the latest per-path observation while removing old payloads.
         transaction.execute(
-            "INSERT OR REPLACE INTO skipped_files (file_path, file_size, file_mtime_ns)
+            "INSERT OR IGNORE INTO skipped_files (file_path, file_size, file_mtime_ns)
              SELECT file_path, file_size, file_mtime_ns FROM collected_trajectories
              WHERE session_id IN (
                  SELECT session_id FROM collected_trajectories
@@ -806,7 +869,9 @@ impl TrajectoryStore {
             let mut statement = conn.prepare(
                 "SELECT skipped.file_path, skipped.file_mtime_ns,
                         EXISTS(SELECT 1 FROM collected_trajectories AS trajectories
-                               WHERE trajectories.file_path = skipped.file_path)
+                               WHERE trajectories.file_path = skipped.file_path
+                                 AND trajectories.file_size = skipped.file_size
+                                 AND trajectories.file_mtime_ns = skipped.file_mtime_ns)
                  FROM skipped_files AS skipped",
             )?;
             let rows = statement
@@ -1153,10 +1218,15 @@ pub fn extract_user_message_previews(atif_json: &str) -> (Option<String>, Option
         if step.get("source").and_then(|s| s.as_str()) != Some("user") {
             continue;
         }
-        let Some(msg) = step.get("message").and_then(|m| m.as_str()) else {
+        let Some(message) = step.get("message") else {
             continue;
         };
-        let cleaned = strip_system_context(msg);
+        // ATIF v1.6+ types `message` as `String | Array<ContentPart>`, the
+        // array form being a multimodal step's text and attachments. Reading
+        // it with `as_str()` dropped such a turn from the previews while the
+        // typed readers in this crate answered for the same document, so the
+        // projection flattens the union the way the converters do.
+        let cleaned = strip_system_context(&crate::atif::extract_text_from_content(message));
         if cleaned.is_empty() {
             continue;
         }
@@ -1168,6 +1238,10 @@ pub fn extract_user_message_previews(atif_json: &str) -> (Option<String>, Option
     }
     (first, last)
 }
+
+#[cfg(test)]
+#[path = "captured_subagents_tests.rs"]
+mod captured_subagents_tests;
 
 /// SELECT DISTINCT on a fixed column name (hard-coded, never user input).
 fn distinct_column(conn: &Connection, column: &str) -> Result<Vec<String>> {
@@ -1208,14 +1282,14 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
-    fn tmp_db(tag: &str) -> PathBuf {
+    pub(super) fn tmp_db(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("traj-store-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir.join("trajectories.db")
     }
 
-    fn sample_record() -> TrajectoryRecord {
+    pub(super) fn sample_record() -> TrajectoryRecord {
         TrajectoryRecord {
             session_id: "s-1".into(),
             schema_version: "ATIF-v1.7".into(),
@@ -1597,6 +1671,32 @@ mod tests {
         // Unterminated tag swallows the rest of the block.
         let atif2 = r#"{"steps":[{"step_id":1,"source":"user","message":"<local-command-caveat>Caveat: truncated"}]}"#;
         assert_eq!(extract_user_message_previews(atif2), (None, None));
+    }
+
+    /// ATIF v1.6+ types `message` as `String | Array<ContentPart>`, the array
+    /// form being how a multimodal turn carries its text and attachments. The
+    /// projection read the message with `as_str()`, so such a turn produced no
+    /// preview at all — a session whose first user turn was an array showed an
+    /// empty preview in the list while the typed readers answered for the same
+    /// document. The union is flattened the way the converters flatten it, so
+    /// a text block still previews as the text and attachments stay out of it.
+    #[test]
+    fn test_extract_user_message_previews_reads_content_part_messages() {
+        let atif = r#"{"steps":[
+            {"step_id":1,"source":"user","message":[
+                {"type":"text","text":"What is in this image?"},
+                {"type":"image","source":{"path":"a.png"}}
+            ]},
+            {"step_id":2,"source":"agent","message":"looking"},
+            {"step_id":3,"source":"user"}
+        ]}"#;
+        let (first, last) = extract_user_message_previews(atif);
+        assert_eq!(first.as_deref(), Some("What is in this image?"));
+        assert_eq!(
+            last.as_deref(),
+            Some("What is in this image?"),
+            "the message-less step carries no preview"
+        );
     }
 
     #[test]

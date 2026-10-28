@@ -70,6 +70,7 @@ fn analyze_audits_once_without_ledger_writes_despite_independent_output_failures
         let service = Arc::new(
             SkillSecService::new(
                 SkillSecConfig {
+                    default_skill_dirs: Vec::new(),
                     state_dir: state.clone(),
                     managed_skill_dirs: vec![
                         asc_capability_skill_sec::ManagedSkillDir::new(&skill).unwrap(),
@@ -151,6 +152,7 @@ fn rpc_context_reaches_skill_audit_without_leaking_into_telemetry_or_the_next_re
     let service = Arc::new(
         SkillSecService::new(
             SkillSecConfig {
+                default_skill_dirs: Vec::new(),
                 state_dir: state.path().canonicalize().unwrap(),
                 managed_skill_dirs: Vec::new(),
             },

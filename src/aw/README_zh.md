@@ -2,77 +2,94 @@
 
 [English](README.md)
 
-AW 为 Agent 策略提供统一配置和本地服务。在 Linux 上，它通过受支持的原生入口
-启动 Qoder CLI、OpenClaw、QwenPaw 和 Hermes，运行外部 Provider，并在 Agent
-会话结束后保留执行元数据。框架继续管理自己的界面、模型配置、调度与权限。
-当前交付为 Preview。
+AW 为 Agent 和 SDK 应用提供统一 Hook 编排、受管 MCP 接入和策略热更新。
+通过一份配置组合工具执行前的安全检查、执行后的输出压缩和自定义规则。
+支持的常驻入口可在任务排空后更新策略，保留宿主进程。
+Agent 继续管理自己的模型、界面和权限。当前提供 Linux Preview。
 
-## 从这里开始
+## 通用能力
 
-| 任务 | 指南 |
+| 能力 | 用户能做什么 |
 | --- | --- |
-| 安装预编译 core 和可选 sec-core 包 | [Preview 安装](../../docs/user-guide/zh/user-entrypoint/aw-preview.md) |
-| 从源码构建并接入自己的组件 | [组件接入教程](../../docs/developer-guide/zh/aw/integration.md) |
-| 编写和校验配置 | [配置参考](../../docs/developer-guide/zh/aw/configuration.md) |
-| 四框架共用策略、验证并清理 | [使用指南](../../docs/user-guide/zh/user-entrypoint/aw.md#四框架使用同一份配置) |
-| 四框架模型可见结果压缩 | [Tokenless Provider](../../docs/user-guide/zh/user-entrypoint/aw-tokenless.md) |
-| 使用已有 sec-core 后端 | [sec-core Provider](../../docs/user-guide/zh/user-entrypoint/aw-sec-core.md) |
-| 容器部署与审计持久化 | [运行与持久化](../../docs/user-guide/zh/user-entrypoint/aw.md#容器与持久化数据) |
+| Hook 编排 | 按目标和工具选择规则，组合 sec-core、Tokenless 与自定义 Hook，统一步骤顺序、执行期限和审计。 |
+| 受管 MCP | 在支持的实际工具调用处执行同一套策略，检查调用身份及获准参数。 |
+| 策略更新 | 向支持的空闲实例显式应用新策略，让后续任务使用新版本。 |
 
-AW 尚未通过 `anolisa install` 或 RPM 分发。Preview 包使用 `aw-package` 安装，
-不安装 Agent 或配置其模型凭据。core 无需 sec-core 或任何 Provider 即可使用。
-源码教程提供[共用 YAML](crates/aw-service/examples/aw.shared.yaml)和无需后端的
-[布尔策略](crates/aw-service/examples/check-tool.py)。
+Adapter 接通原生事件并采纳支持的效果，Provider 实现具体策略。
+core 可独立使用；安全检查与压缩需安装对应 Provider 并通过配置启用。
+工具结果替换限于获准的位置，Agent 的原生权限检查始终保留。
 
-## 支持的原生入口
+## Hook 支持矩阵
 
-| 框架 | 已验证版本 | 入口 |
-| --- | --- | --- |
-| Qoder CLI | 1.1.64 | 交互或 print |
-| OpenClaw | 2026.9.6 | 新 Gateway |
-| QwenPaw / AgentScope | 2.2.2b4 / 2.0.8 | App/API |
-| Hermes | 官方提交 `952c941e` | 显式安装插件后的本地 chat |
+✓ 已声明且有契约测试覆盖，× 尚不支持。矩阵从[回归清单](tests/regression-matrix.json)生成。结果替换的原生限制与 MCP、更新范围见[完整能力表](../../docs/user-guide/zh/aw/capabilities.md)。
 
-运行时支持工具前 `observe`/`block`、工具后 `observe` 或单文本 `replace_result`，以及各框架的原生命令。
-完成观察和用户 Hook 可位于最后一个替换步骤之前（OpenClaw 在压缩后执行原生观察）；sec-core/Tokenless 联合模板保留观察并追加压缩。
-不同框架的 after 事件覆盖不同。配置词汇包含尚未接通的事件/效果，静态校验本身
-不能证明原生效果生效。跨 Agent 审批、输入改写和 OS 强制执行不在当前
-Preview 范围内。各 Adapter 的 profile 要求与共存方式见使用指南。
+<!-- aw-regression-matrix:start -->
+| Agent | `tool.before` / `observe` | `tool.before` / `block` | `tool.after` / `observe` | `tool.after` / `replace_result` |
+| --- | --- | --- | --- | --- |
+| `agentscope` | ✓ | ✓ | ✓ | ✓ |
+| `claude-sdk` | ✓ | ✓ | ✓ | ✓ |
+| `hermes` | ✓ | ✓ | ✓ | ✓ |
+| `openclaw` | ✓ | ✓ | ✓ | ✓ |
+| `pi` | ✓ | ✓ | ✓ | ✓ |
+| `qoder` | ✓ | ✓ | ✓ | ✓ |
+| `qoder-sdk` | ✓ | ✓ | ✓ | × |
+| `qwenpaw` | ✓ | ✓ | ✓ | ✓ |
+<!-- aw-regression-matrix:end -->
 
-## 基本使用
+<a id="安装与使用"></a>
 
-在 Linux 上准备 rustup 和 Qoder CLI 1.1.64，从仓库根目录执行：
+## 安装与首次运行
 
-```bash
-cd src/aw
-cargo build --locked -p aw-service --bin aw
-target/debug/aw validate --config crates/aw-service/examples/aw.qoder.yaml
-target/debug/aw run --config crates/aw-service/examples/aw.qoder.yaml --agent qoder
-```
+从[安装指南](../../docs/user-guide/zh/aw/installation.md)获取 Preview 包并安装。
+当前使用独立安装包；`anolisa install aw` 和 RPM 安装入口尚未提供。
+先安装并登录所选 Agent，再用 `aw config init` 生成配置。
 
-这个中性示例接通 Hook，但不包含安全规则。退出 Qoder 后执行：
+下面以已安装、登录的 Qoder 为例。`AW_PREFIX` 是安装指南中选定的安装目录，
+`qodercli` 和 `aw` 应已加入 `PATH`。
 
 ```bash
-target/debug/aw status --config crates/aw-service/examples/aw.qoder.yaml
-target/debug/aw stop --config crates/aw-service/examples/aw.qoder.yaml
+export AW_HOME="$HOME/aw"
+install -d -m 700 "$AW_HOME" "$AW_HOME/workspace"
+aw config init --prefix "$AW_PREFIX" \
+  --config "$AW_HOME/aw.yaml" --state-dir "$AW_HOME/state" \
+  --qoder "$(command -v qodercli)"
+aw validate --config "$AW_HOME/aw.yaml"
+cd "$AW_HOME/workspace"
+aw run --config "$AW_HOME/aw.yaml" --agent qoder
 ```
 
-用 `aw-package configure` 初始化 Qoder/OpenClaw YAML，不传 `--provider` 就生成
-空策略，也可选择 `--provider command` / `--provider sec-core` / `--provider tokenless` /
-`--provider sec-core+tokenless`（配合 `--socket`）。四框架使用共用模板。
-简单脚本省略 `protocol` 和 `operation`，返回 JSON true/false，命中后的效果放在
-各 YAML 步骤中；AW 校验准入并构造结果，不调用脚本握手方法。添加规则前按
-[初始化与编辑流程](../../docs/user-guide/zh/user-entrypoint/aw-preview.md#编辑已有-provider-与-hook-配置)准备配置。`aw-package config` 离线查看、校验和编辑已有 YAML/JSON
-中的 Provider 与 Hook 步骤，不修改运行中的服务。更改配置前先退出 Agent 并停止
-原服务。`aw install` 是独立、显式的 Hermes 原生插件安装命令，不负责安装软件。
+进入 Qoder 后，请它用工具读取当前目录，并按原生提示处理权限确认。
+退出 Agent 后，本地服务仍可复用。使用结束后查询并停止它。
 
-## 开发参考
+```bash
+aw status --config "$AW_HOME/aw.yaml"
+aw stop --config "$AW_HOME/aw.yaml"
+```
 
-组件通常通过 Provider 协议接入，无需依赖 AW crate。Adapter 与服务客户端开发者
-可查阅下方详细合同。配置、Provider 消息和本地服务消息分别版本化。
+<a id="hook-支持"></a>
+<a id="adapter-能力覆盖"></a>
 
-- [开发环境、Crate 职责与测试](CONTRIBUTING_zh.md)
-- [Provider 协议](docs/design/provider-protocol_zh.md)与 [Host](docs/design/provider-host_zh.md)
-- [本地服务与客户端](docs/design/local-service_zh.md)
-- [有界命令执行](docs/design/bounded-execution_zh.md)
-- [Core 执行与持久 Journal](docs/design/core-execution_zh.md)
+## 支持范围
+
+当前接入 Qoder CLI、Qoder SDK、OpenClaw、Hermes、QwenPaw、Pi SDK、
+Claude SDK 和 AgentScope SDK。CLI 使用原生 Hook 或插件，SDK 应用需要显式接入受管工厂。
+[Qoder SDK 接入](../../docs/developer-guide/zh/aw/agents/qoder-sdk.md)还支持固定摘要的 Bash 消费者、Worker import 和声明式角色资产。
+[能力支持矩阵](../../docs/user-guide/zh/aw/capabilities.md)按 Adapter 和启动模式说明
+结果处理、MCP 与策略更新的差异，并链接支持版本与接线步骤。
+
+## 文档导航
+
+| 任务 | 文档 |
+| --- | --- |
+| 安装并完成首次运行 | [AW 用户手册](../../docs/user-guide/zh/aw/index.md) |
+| 选择 Agent、配置规则和更新策略 | [配置与启动](../../docs/user-guide/zh/aw/configuration.md) |
+| 启用输出压缩或安全检查 | [Tokenless](../../docs/user-guide/zh/aw/tokenless.md)、[sec-core](../../docs/user-guide/zh/aw/security.md) |
+| 查看运行记录 | [AgentSight](../../docs/user-guide/zh/aw/observability.md) |
+| 查询状态、升级卸载与排错 | [运行维护](../../docs/user-guide/zh/aw/operations.md) |
+| 编写 Provider、接入 SDK 或理解架构 | [开发指南](../../docs/developer-guide/zh/aw/index.md) |
+
+<a id="代码架构"></a>
+<a id="开发与验证"></a>
+
+[架构总览](docs/design/zh/architecture.md)说明框架与 Provider 的职责和调用流程。
+源码构建、测试与 CI 入口见[贡献指南](CONTRIBUTING_zh.md)。

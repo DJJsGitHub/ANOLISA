@@ -1,6 +1,109 @@
 # Changelog
 
+## 1.1.0
+
+**Breaking Changes**
+
+- Switched source builds and installs to the V2 Rust CLI and host-level systemd
+  daemon, replacing the source-build Python runtime, user sandbox, and venv
+  layout; source-install scripts must migrate to the V2 hook-facing command
+  surface. (#3510)
+
+**V2 Policy & Daemon Runtime**
+
+- Rejected stale policy reconciliation results atomically, tracked real write-receipt
+  versions, and let newer Delete intents supersede exhausted Apply retries, with
+  deterministic crash-recovery coverage for SQLite persistence. (#6944)
+
+**Storage Safety**
+
+- Fell back to `/var/lib/agent-sec/policy/policy-state.db` for default Policy storage
+  when the primary directory is unsafe, checking both candidates before initialization
+  and rejecting conflicting databases with actionable diagnostics. (#8782)
+
+**Skill Ledger Runtime**
+
+- Raised a typed `SkillLedgerError` instead of a raw `NotADirectoryError` when
+  `skill export --output` points to an existing file. (#6105)
+
+**Build & Packaging**
+
+- Updated rustls to 0.23.45 to address a Dependabot security advisory. (#7783)
+
+**Raw Packaging**
+
+- Added a Linux x86_64 sec-core prebuilt raw-archive release target with SHA-256 and
+  CycloneDX SBOM sidecars. (#8461)
+
+## 1.0.1
+
+**Breaking Changes**
+
+- Removed SkillSec key rotation: `rotate-keys` and `init --force-keys` are rejected before any
+  write, and the current signing key is retained. Scanned and certified Skills are remembered as
+  exact paths in the daemon's `managedSkillDirs`; remove an entry and restart the daemon to revoke
+  it. (#7629)
+
+**Skill Ledger Runtime**
+
+- Authorized and scanned standard system and local-user Skill directories by default through
+  `enableDefaultSkillDirs`, deriving user homes from local account records in the daemon. (#7419)
+- Kept SkillFS notify acceptance within the 64 KiB session response frame so accepted notifies
+  are no longer dropped and retried. (#7188)
+
+**V2 Policy & Daemon Runtime**
+
+- Verified that the connected daemon runs as root before V2 clients send requests, and replaced
+  the legacy shell health check with the `agent-sec-daemon-health` probe. (#7122)
+- Limited daemon connections per user, reserving connections for root so other users cannot
+  starve it. (#7103)
+- Retained `CAP_SYS_PTRACE` in `agent-sec-core.service` so Scope discovery can read protected
+  process links. (#7404)
+- Ran observability-store retention while the daemon is active, including startup catch-up. (#7099)
+- Removed the process-local policy engine repository and prevented polling lock starvation. (#7111)
+
+**Storage Safety**
+
+- Rejected symlinked and non-regular read-only SQLite database paths instead of following them. (#7295)
+- Rejected symlinked and non-regular writable SQLite database paths before opening them. (#7296)
+
+**V2 Security Operations**
+
+- Stripped information-separator characters from `capabilities` environment values and filters
+  as V1 does. (#7194)
+
+**Build & Packaging**
+
+- Changed the default agent-sec-core RPM build target to V2 while keeping an explicit V1 target. (#7563)
+
+**Testing & CI**
+
+- Restored the V2 workspace clippy gate for prompt-scan crates. (#6680)
+
 ## 1.0.0
+
+**Breaking Changes**
+
+- Security operations require a running root daemon; the CLI does not start it or execute locally.
+  Manage `agent-sec-core.service` with system `systemctl`; the default socket is
+  `/run/agent-sec-core/daemon.sock`. (#3217)
+- `AGENT_SEC_DATA_DIR` and `AGENT_SEC_MODEL_SERVICE_*` are now daemon-wide settings; CLI/hook
+  exports no longer apply. Configure the daemon environment and restart. Storage defaults to
+  `/var/log/agent-sec`, without per-user fallbacks; test isolation requires a separate test daemon,
+  data directory, and socket. (#7283)
+- Shared-store queries isolate by trusted OS UID, not account lifetime; root sees all UIDs.
+  Reusing a UID exposes its retained records to the new account. Keep UIDs stable and have
+  administrators handle old data and permissions before reassignment. (#7277)
+- PII custom rules now use `/etc/agent-sec/pii-checker/rules.yaml` instead of the per-user default.
+  Move custom rules there and restart the daemon to apply changes. (#3286)
+- Skill Ledger uses a shared system signing key; V1 keys, keyrings and history are not imported.
+  Rescan Skills to establish V2 trust; key rotation requires root. (#3295)
+- Skill operations require administrator-configured `managedSkillDirs` or authenticated SkillFS
+  mounts. All local users can operate managed Skills; no per-user Skill ACLs are provided. (#3295)
+- V1 per-user Security Events and Observability history is not automatically imported into the
+  V2 system store. No supported cross-store import tool is shipped; preserve V1 data. (#6605)
+- Legacy `harden`, `verify` and `log-sandbox` commands are unavailable in the V2 CLI.
+  Update dependent scripts before switching to V2.
 
 **V2 Security Operations**
 

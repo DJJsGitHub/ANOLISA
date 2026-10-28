@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 
 use crate::agent::run::ActiveAgentRun;
-use crate::approval::broker::ApprovalOutcome;
+use crate::approval::broker::{provider_deny_response, ApprovalOutcome, ProviderResponseInput};
 use crate::approval::cards::write_approval_receipt;
 use crate::approval::handoff::{queue_approved_shell_handoff, queue_interactive_shell_handoff};
 use crate::approval::panel::{
@@ -27,13 +27,6 @@ pub(crate) fn render_approval_actions<W: Write>(
 ) -> std::io::Result<()> {
     for (idx, event) in events.iter().enumerate() {
         let event_index = event_index_base + idx;
-        if event_index < state.approval_slice.invalidated_card_events_before
-            && event.component.as_deref() == Some("card")
-            && (approval_focus_from_event(event, &state.approvals.requests).is_some()
-                || approval_command_from_event(event).is_some())
-        {
-            continue;
-        }
         if let Some((id, action)) = approval_focus_from_event(event, &state.approvals.requests) {
             let key = format!("approval-focus-{event_index}");
             if !state.approvals.handled_actions.insert(key) {
@@ -42,7 +35,7 @@ pub(crate) fn render_approval_actions<W: Write>(
             if approval_is_pending(state, &id) {
                 state.approvals.focus.insert(id, action);
                 redraw_current_approval_request(state, output)?;
-                flush_legacy_approval_panel(state, output)?;
+                output.flush()?;
             }
             continue;
         }
@@ -99,11 +92,7 @@ pub(crate) fn render_approval_actions<W: Write>(
                 }
                 render_runtime_details(state, blocks, &command.id, output)?;
             }
-            if event.component.as_deref() == Some("card") {
-                flush_legacy_approval_panel(state, output)?;
-            } else {
-                output.flush()?;
-            }
+            output.flush()?;
             continue;
         }
 
@@ -192,18 +181,6 @@ pub(crate) fn render_approval_actions<W: Write>(
     Ok(())
 }
 
-fn flush_legacy_approval_panel<W: Write>(
-    state: &InlineState,
-    output: &mut W,
-) -> std::io::Result<()> {
-    if state.approval_slice.inline_geometry.is_none()
-        && !crate::approval::slice_present::slice_surface_is_live(state)
-    {
-        output.flush()?;
-    }
-    Ok(())
-}
-
 /// Deliver a resolved approval decision to its provider/handoff path and
 /// refresh the card panel. Shared by user decisions and the batch-consent
 /// sweep so both go through the exact same delivery pipeline; the sweep
@@ -262,34 +239,19 @@ fn deliver_approval_decision<W: Write>(
         }
 
         if outcome == ApprovalOutcome::ForegroundShellHandoff {
-            let committed_slice = state.approval_slice.activation.is_some()
-                && decision.request.status == ApprovalRequestStatus::Approved;
+            render_approval_resolution(state, &decision.request, decision.title, output)?;
             let active_owner = state
                 .agent_run
                 .active
                 .as_ref()
                 .is_some_and(|run| active_run_owns_provider_approval(run, &decision.request));
-            if committed_slice {
-                queue_approved_shell_handoff(state, &decision.request);
-                if active_owner {
-                    mark_provider_approval_resolved(state);
-                    if !request_can_receive_host_executed_result(state, &decision.request) {
-                        stop_active_agent_run_without_rendering(state, output)?;
-                    }
-                }
+            if decision.request.status == ApprovalRequestStatus::Approved && active_owner {
+                mark_provider_approval_resolved(state);
             }
-            render_approval_resolution(state, &decision.request, decision.title, output)?;
-            if !committed_slice {
-                if decision.request.status == ApprovalRequestStatus::Approved && active_owner {
-                    mark_provider_approval_resolved(state);
-                }
-                if active_owner
-                    && !request_can_receive_host_executed_result(state, &decision.request)
-                {
-                    stop_active_agent_run_without_rendering(state, output)?;
-                }
-                queue_approved_shell_handoff(state, &decision.request);
+            if active_owner && !request_can_receive_host_executed_result(state, &decision.request) {
+                stop_active_agent_run_without_rendering(state, output)?;
             }
+            queue_approved_shell_handoff(state, &decision.request);
             if render_next_card {
                 render_current_approval_request(state, output)?;
             }
@@ -550,6 +512,68 @@ pub(crate) fn drain_unhomed_control_requests(state: &mut InlineState) {
     }
 }
 
+pub(crate) fn cancel_pending_approvals_for_failed_run<W: Write>(
+    state: &mut InlineState,
+    run_id: &str,
+    handle: &AgentRunHandle,
+    output: &mut W,
+) -> std::io::Result<bool> {
+    let pending = state
+        .approvals
+        .requests
+        .iter()
+        .enumerate()
+        .filter(|(_, request)| {
+            request.run_id == run_id && request.status == ApprovalRequestStatus::Pending
+        })
+        .map(|(index, request)| (index, request.id.clone()))
+        .collect::<Vec<_>>();
+    if pending.is_empty() {
+        return Ok(false);
+    }
+    if pending
+        .iter()
+        .any(|(_, id)| state.approvals.active_panel_id.as_ref() == Some(id))
+    {
+        clear_active_approval_panel(state, output)?;
+    }
+    for (index, id) in pending {
+        let decision = crate::approval::resolution::finalize_approval_decision(
+            state,
+            index,
+            ApprovalRequestStatus::Cancelled,
+            MessageId::ApprovalResolutionCancelledTitle,
+            None,
+            false,
+            "run_terminal",
+        )
+        .ok_or_else(|| std::io::Error::other("pending terminal approval disappeared"))?;
+        state
+            .approvals
+            .pending_capture_invalidations
+            .push_back(id.clone());
+        state.approvals.focus.remove(&id);
+        state.approvals.expanded_cards.remove(&id);
+        if let Some(request_id) = decision.request.request_id.as_deref() {
+            let _ = handle.respond_approval(provider_deny_response(
+                ProviderResponseInput {
+                    request_id,
+                    tool_use_id: decision.request.tool_use_id.as_deref(),
+                    tool_input: decision.request.tool_input.as_ref(),
+                },
+                "Agent run failed before approval; this request was not executed.".to_string(),
+            ));
+            state
+                .control
+                .approval_ledger_mut()
+                .mark_responded(run_id, request_id);
+        }
+    }
+    state.agent_run.needs_prompt_after_run = true;
+    state.agent_run.native_prompt_after_run = false;
+    Ok(true)
+}
+
 /// #1940 run-terminal sweep: same contract as the batch drain, for the
 /// paths where the run has already been detached from `InlineState`
 /// (finish/stop/cancel). Also clears the run's ledger entries so the
@@ -574,7 +598,7 @@ pub(crate) fn drain_unhomed_control_requests_with_handle(
     state.control.approval_ledger_mut().clear_run(run_id);
 }
 
-pub(crate) fn active_run_owns_provider_approval(
+fn active_run_owns_provider_approval(
     active_run: &ActiveAgentRun,
     request: &RuntimeApprovalRequest,
 ) -> bool {

@@ -212,6 +212,19 @@ fn one_configuration_maps_both_agents_and_rejects_long_socket() {
     let value: serde_json::Value = serde_yaml_ng::from_slice(&fs::read(&config).unwrap()).unwrap();
     assert_eq!(value["spec"]["agents"].as_object().unwrap().len(), 2);
     assert_eq!(
+        value["spec"]["events"]["tool.before"]["steps"][0]["match"]["tools"],
+        serde_json::json!(["native:qoder:Bash", "native:openclaw:exec"])
+    );
+    assert_eq!(
+        value["spec"]["providers"]["security"]["config"]["unmapped_tool"],
+        "error"
+    );
+    assert_eq!(
+        value["spec"]["events"]["tool.before"]["steps"][0]["on_error"],
+        "block"
+    );
+
+    assert_eq!(
         value["spec"]["providers"]["security"]["config"]["tools"]
             .as_object()
             .unwrap()
@@ -237,10 +250,10 @@ fn configure_rejects_damaged_payloads_and_allows_retry() {
     for split in [false, true] {
         for name in [
             "bin/aw",
-            "bin/aw-package",
             "libexec/aw/providers/sec-core/aw-provider-sec-core",
             "libexec/aw/providers/sec-core/agent-sec-cli",
             "libexec/aw/providers/sec-core/agent-sec-daemon",
+            "libexec/aw/providers/sec-core/agent-sec-daemon-health",
         ] {
             for damage in ["bytes", "missing", "mode", "setuid"] {
                 let f = Fixture::new();
@@ -277,10 +290,23 @@ fn configure_rejects_damaged_payloads_and_allows_retry() {
                     node: Some(Path::new("/bin/true")),
                     openclaw: Some(Path::new("/bin/true")),
                 };
-                assert!(crate::configure(&settings)
-                    .unwrap_err()
-                    .to_string()
-                    .contains("modified or missing"));
+                let error = crate::configure(&settings).unwrap_err().to_string();
+                let reason = match damage {
+                    "bytes" => "checksum mismatch",
+                    "missing" => "modified or missing",
+                    _ => "mode mismatch",
+                };
+                let package = if name == "bin/aw" {
+                    "aw-core"
+                } else {
+                    "aw-provider-sec-core"
+                };
+                assert!(
+                    error.contains(reason)
+                        && error.contains(&path.display().to_string())
+                        && error.contains(&format!("package {package}")),
+                    "split={split} damage={damage} file={name}: {error}"
+                );
                 assert!(!config.exists());
                 assert_eq!(receipts(&f.prefix).unwrap(), before);
                 fs::write(&path, original).unwrap();
@@ -318,7 +344,30 @@ fn tokenless_templates_require_its_package_and_keep_security_before_compression(
     crate::configure(&settings).unwrap();
     let document: serde_json::Value =
         serde_yaml_ng::from_slice(&fs::read(&config).unwrap()).unwrap();
-    assert!(document["spec"]["events"].get("tool.before").is_none());
+    assert_eq!(
+        document["spec"]["events"]["tool.before"]["steps"][0]["operation"],
+        "pre_tool"
+    );
+    let provider = &document["spec"]["providers"]["tokenless"];
+    let argv = provider["transport"]["argv"].as_array().unwrap();
+    assert_eq!(argv[5], "--rtk");
+    assert_eq!(
+        argv[6],
+        serde_json::json!(f.prefix.join("libexec/aw/providers/tokenless/rtk"))
+    );
+    assert_eq!(argv[7], "--rtk-sha256");
+    assert_eq!(
+        argv[8],
+        crate::digest(&f.prefix.join("libexec/aw/providers/tokenless/rtk")).unwrap()
+    );
+    let mut expected = argv[..5].to_vec();
+    expected.insert(1, serde_json::json!("--view"));
+    assert_eq!(provider["view"]["protocol"], "aw-provider-view/v1alpha1");
+    assert_eq!(
+        provider["view"]["transport"]["argv"],
+        serde_json::json!(expected)
+    );
+    assert_eq!(provider["view"]["implementation"], "tokenless");
     assert_eq!(
         document["spec"]["events"]["tool.after"]["steps"][0]["effects"],
         serde_json::json!(["replace_result"])
@@ -334,6 +383,24 @@ fn tokenless_templates_require_its_package_and_keep_security_before_compression(
         document["spec"]["events"]["tool.before"]["steps"][0]["provider"],
         "security"
     );
+    assert_eq!(
+        document["spec"]["events"]["tool.before"]["steps"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    assert_eq!(
+        document["spec"]["events"]["tool.before"]["steps"][1]["operation"],
+        "pre_tool"
+    );
+    assert_eq!(
+        document["spec"]["events"]["tool.before"]["steps"][0]["on_error"],
+        "block"
+    );
+    assert!(document["spec"]["providers"]["security"]
+        .get("view")
+        .is_none());
     assert_eq!(
         document["spec"]["events"]["tool.after"]["steps"]
             .as_array()
@@ -353,4 +420,61 @@ fn tokenless_templates_require_its_package_and_keep_security_before_compression(
         document["spec"]["events"]["tool.after"]["steps"][1]["provider"],
         "tokenless"
     );
+}
+
+#[test]
+fn desired_tokenless_document_does_not_require_installed_payloads() {
+    let f = Fixture::new();
+    let prefix = f.root.join("not-installed");
+    let config = f.root.join("not-published.yaml");
+    let state = f.root.join("not-created");
+    let desired = crate::document(&crate::Settings {
+        prefix: &prefix,
+        config: &config,
+        state: &state,
+        policy: crate::Policy::Tokenless,
+        qoder: Some(Path::new("/bin/true")),
+        node: None,
+        openclaw: None,
+    })
+    .unwrap();
+    assert_eq!(
+        desired["spec"]["providers"]["tokenless"]["transport"]["argv"]
+            .as_array()
+            .unwrap()
+            .len(),
+        5
+    );
+    assert!(!prefix.exists() && !config.exists() && !state.exists());
+}
+
+#[test]
+fn managed_tokenless_configuration_rejects_path_delimiters_before_publication() {
+    let f = Fixture::new();
+    let all = bundle(
+        &f.root.join("tokenless-bundle"),
+        &["aw-core", "aw-provider-tokenless"],
+    );
+    let prefix = f.root.join("prefix:rtk");
+    install(&all, &prefix).unwrap();
+    let config = f.root.join("colon.yaml");
+    let state = f.root.join("state");
+    let mut settings = crate::Settings {
+        prefix: &prefix,
+        config: &config,
+        state: &state,
+        policy: crate::Policy::Tokenless,
+        qoder: Some(Path::new("/bin/true")),
+        node: None,
+        openclaw: None,
+    };
+    assert!(crate::document(&settings).is_ok());
+    assert!(crate::configure(&settings)
+        .unwrap_err()
+        .to_string()
+        .contains("managed RTK directory cannot be represented in PATH"));
+    assert!(!config.exists() && !state.exists());
+    settings.policy = crate::Policy::None;
+    crate::configure(&settings).unwrap();
+    assert!(config.exists());
 }

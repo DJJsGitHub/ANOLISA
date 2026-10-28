@@ -6,44 +6,35 @@ use crate::{SkillSecError, check_deadline};
 use serde_json::{Value, json};
 use std::time::Instant;
 
-/// Baseline selection and explicit administrator trust reset.
+/// Baseline selection without replacing existing signing keys.
 pub struct InitOptions {
-    /// Scan discovered and registered roots after key initialization.
+    /// Scan configured roots after key initialization.
     pub baseline: bool,
-    /// Replace existing keys; only the authenticated root caller may request this.
+    /// Unsupported compatibility input; requests with this flag are rejected.
     pub force_keys: bool,
     /// None or empty selects the default built-in scanners.
     pub scanners: Option<Vec<String>>,
 }
 
 impl SkillSecService {
-    /// Validates the whole baseline request before creating or rotating system trust.
+    /// Validates the whole baseline request before initializing system trust.
     ///
     /// # Errors
-    /// Rejects invalid scanner names, unauthorized rotation, unsafe state and deadlines.
+    /// Rejects invalid scanner names, unsupported key replacement, unsafe state and deadlines.
     pub fn init(
         &self,
         roots: &[SkillRoot],
         options: &InitOptions,
-        caller_uid: u32,
+        _caller_uid: u32,
         deadline: Instant,
     ) -> Result<(Value, i64), SkillSecError> {
-        let requested = requested_names(options.scanners.as_deref())?;
-        if options.force_keys && caller_uid != 0 {
-            return Err(SkillSecError::PermissionDenied);
+        if options.force_keys {
+            return Err(SkillSecError::Unsupported(
+                "force-keys is not supported".into(),
+            ));
         }
-        let before = self.key_status(deadline)?;
-        let key = if options.force_keys && before["initialized"] == true {
-            let managed = self.rotation_skills(deadline)?;
-            let managed_roots: Vec<_> = roots
-                .iter()
-                .filter(|root| managed.contains(&root.identity))
-                .cloned()
-                .collect();
-            self.rotate_keys(&managed_roots, caller_uid, deadline)?
-        } else {
-            self.initialize_with_deadline(deadline)?
-        };
+        let requested = requested_names(options.scanners.as_deref())?;
+        let key = self.initialize_with_deadline(deadline)?;
         let (results, failed) = if options.baseline {
             batch(roots, deadline, |root| {
                 self.scan_batch_root(root, &requested, false, deadline)
@@ -52,7 +43,7 @@ impl SkillSecService {
             (Vec::new(), false)
         };
         Ok((
-            json!({"command":"init","keyCreated":key["keyCreated"] == true || options.force_keys,"key":key,"baseline":options.baseline,"results":results}),
+            json!({"command":"init","keyCreated":key["keyCreated"] == true,"key":key,"baseline":options.baseline,"results":results}),
             i64::from(failed),
         ))
     }
@@ -212,7 +203,14 @@ mod tests {
                 .certify(&root, "custom", None, &json!({"findings":7}), deadline())
                 .is_err()
         );
-        assert!(!service.config.state_dir.join("signing-key.pk8").exists());
+        assert!(
+            !service
+                .config()
+                .unwrap()
+                .state_dir
+                .join("signing-key.pk8")
+                .exists()
+        );
         let executor = SkillSecExecutor::new(service.clone());
         for command in [
             SkillSecCommand::Scan {
@@ -259,7 +257,14 @@ mod tests {
                 },
             );
             assert!(!outcome.success);
-            assert!(!service.config.state_dir.join("signing-key.pk8").exists());
+            assert!(
+                !service
+                    .config()
+                    .unwrap()
+                    .state_dir
+                    .join("signing-key.pk8")
+                    .exists()
+            );
             assert!(!root.io_dir.join(".skill-meta").exists());
         }
         let result = service
@@ -274,14 +279,14 @@ mod tests {
         service
             .certify(&root, "custom", None, &json!([]), deadline())
             .unwrap();
-        let key_path = service.config.state_dir.join("signing-key.pk8");
+        let key_path = service.config().unwrap().state_dir.join("signing-key.pk8");
         let key = fs::read(&key_path).unwrap();
         let before = service.show(&root, deadline()).unwrap();
         let executor = SkillSecExecutor::new(service.clone());
         for baseline in [false, true] {
             let options = InitOptions {
                 baseline,
-                force_keys: true,
+                force_keys: false,
                 scanners: Some(vec!["cisco-static-scanner".into()]),
             };
             assert!(matches!(
@@ -296,7 +301,7 @@ mod tests {
                 &SkillSecRequest {
                     command: SkillSecCommand::Init {
                         baseline,
-                        force_keys: true,
+                        force_keys: false,
                         skill_dirs: vec![],
                         scanners: options.scanners,
                     },
@@ -306,7 +311,14 @@ mod tests {
             );
             assert!(!outcome.success);
             assert_eq!(fs::read(&key_path).unwrap(), key);
-            assert!(!service.config.state_dir.join("key-rotation.json").exists());
+            assert!(
+                !service
+                    .config()
+                    .unwrap()
+                    .state_dir
+                    .join("key-rotation.json")
+                    .exists()
+            );
             assert_eq!(service.show(&root, deadline()).unwrap(), before);
             let audit = service.audit(&root, true, deadline()).unwrap();
             assert_eq!(audit["valid"], true);

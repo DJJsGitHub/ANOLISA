@@ -170,7 +170,10 @@ fn command_end_event_index(events: &[ShellEvent], block: &CommandBlock) -> Optio
 fn is_followup_user_input_event(event: &ShellEvent, block_id: &str) -> bool {
     match event.kind {
         ShellEventKind::CommandStarted => event.command_id.as_deref() != Some(block_id),
-        ShellEventKind::UserInputIntercepted => true,
+        ShellEventKind::UserInputIntercepted => {
+            event.component.as_deref() != Some("shell_prompt_ready")
+                || event.message.as_deref() != Some("painted")
+        }
         _ => false,
     }
 }

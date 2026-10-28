@@ -98,7 +98,12 @@ pub fn inspect(bundle: &Path) -> Result<Manifest> {
             "incompatible platform or Provider protocol",
         )?;
         let required = if component.component == "aw-core" {
-            vec!["bin/aw", "bin/aw-package"]
+            let mut files = vec!["bin/aw"];
+            if component.files.contains_key("bin/aw-package") {
+                // Existing bundles retain ownership and executable checks for the removed CLI.
+                files.push("bin/aw-package");
+            }
+            files
         } else if component.component == "aw-provider-tokenless" {
             require(
                 component.requires.get("aw-core") == Some(&component.version),
@@ -107,6 +112,7 @@ pub fn inspect(bundle: &Path) -> Result<Manifest> {
             vec![
                 "libexec/aw/providers/tokenless/aw-provider-tokenless",
                 "libexec/aw/providers/tokenless/tokenless",
+                "libexec/aw/providers/tokenless/rtk",
             ]
         } else {
             require(
@@ -117,6 +123,7 @@ pub fn inspect(bundle: &Path) -> Result<Manifest> {
                 "libexec/aw/providers/sec-core/aw-provider-sec-core",
                 "libexec/aw/providers/sec-core/agent-sec-cli",
                 "libexec/aw/providers/sec-core/agent-sec-daemon",
+                "libexec/aw/providers/sec-core/agent-sec-daemon-health",
             ]
         };
         require(

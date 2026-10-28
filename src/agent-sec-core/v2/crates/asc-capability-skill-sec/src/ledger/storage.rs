@@ -129,6 +129,35 @@ impl Directory {
         Ok(names)
     }
 
+    /// Bounds default-discovery allocation before a large directory is materialized.
+    pub fn bounded_names(
+        &self,
+        deadline: Instant,
+        remaining: &mut usize,
+    ) -> Result<(Vec<String>, bool), SkillSecError> {
+        let mut names = Vec::new();
+        let mut truncated = false;
+        for item in Dir::read_from(&self.file).map_err(|e| io_error(&self.path, e))? {
+            check_deadline(deadline)?;
+            let item = item.map_err(|e| io_error(&self.path, e))?;
+            let name = item
+                .file_name()
+                .to_str()
+                .map_err(|_| SkillSecError::Integrity("non-UTF-8 discovery entry".into()))?;
+            if matches!(name, "." | "..") {
+                continue;
+            }
+            if *remaining == 0 {
+                truncated = true;
+                break;
+            }
+            *remaining -= 1;
+            names.push(name.to_owned());
+        }
+        names.sort();
+        Ok((names, truncated))
+    }
+
     pub fn read(
         &self,
         name: &str,
@@ -166,13 +195,23 @@ impl Directory {
         bytes: &[u8],
         replace: bool,
     ) -> Result<File, SkillSecError> {
+        self.write_atomic_mode(name, bytes, replace, 0o644)
+    }
+
+    pub(crate) fn write_atomic_mode(
+        &self,
+        name: &str,
+        bytes: &[u8],
+        replace: bool,
+        mode: rustix::fs::RawMode,
+    ) -> Result<File, SkillSecError> {
         validate_name(name)?;
         if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_RECORD_BYTES {
             return Err(SkillSecError::Invalid("ledger record exceeds 8 MiB".into()));
         }
         let temporary = nonce(".record-")?;
         let result = (|| {
-            let file = self.write_new(&temporary, bytes, 0o644)?;
+            let file = self.write_new(&temporary, bytes, mode)?;
             renameat_with(
                 &self.file,
                 temporary.as_str(),

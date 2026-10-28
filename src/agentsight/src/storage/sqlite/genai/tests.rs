@@ -1406,9 +1406,60 @@ fn test_list_traces_by_session_with_time_range() {
 fn test_list_agent_names() {
     let (store, path) = create_populated_store("agent_names");
     let r = store
-        .list_agent_names(BASE_NS, BASE_NS + 6 * STEP_NS)
+        .list_agent_names(BASE_NS, BASE_NS + 6 * STEP_NS, false)
         .unwrap();
     assert_eq!(r, vec!["agent-a", "agent-b"]);
+    cleanup_db(&path);
+}
+
+#[test]
+fn test_list_agent_names_excludes_auxiliary_by_default() {
+    // The list feeds the dashboard's agent filter. Sessions whose only calls
+    // are auxiliary kinds are hidden by /api/sessions by default, so offering
+    // their agents in the filter produced a selectable label that matched no
+    // visible session.
+    let path = std::env::temp_dir().join(format!(
+        "test_genai_agent_names_aux_{}.db",
+        std::process::id()
+    ));
+    cleanup_db(&path);
+    let store =
+        GenAISqliteStore::new_with_path(&path, crate::config::PeriodicStoragePolicy::default())
+            .unwrap();
+    {
+        let conn = store.conn.lock().unwrap();
+        for (call_id, agent, kind) in [
+            ("aux-main", "main-agent", "main"),
+            ("aux-search", "search-helper", "web_search"),
+            // Recap can form a session on its own (#7271), so the session
+            // predicate keeps it; analyzer-only background sessions stay
+            // hidden.
+            ("aux-recap", "recap-agent", "recap"),
+            ("aux-analyzer", "bg-analyzer", "analyzer"),
+        ] {
+            conn.execute(
+                "INSERT INTO genai_events
+                 (event_type, status, call_id, start_timestamp_ns, end_timestamp_ns,
+                  agent_name, process_name, provider, model, call_kind, event_json)
+                 VALUES ('llm_call', 'complete', ?1, ?2, ?3, ?4, ?4, 'openai', 'gpt-4', ?5, '{}')",
+                params![call_id, BASE_NS, BASE_NS + STEP_NS, agent, kind],
+            )
+            .unwrap();
+        }
+    }
+
+    let names = store
+        .list_agent_names(BASE_NS, BASE_NS + 6 * STEP_NS, false)
+        .unwrap();
+    assert_eq!(names, vec!["main-agent", "recap-agent"]);
+
+    let all = store
+        .list_agent_names(BASE_NS, BASE_NS + 6 * STEP_NS, true)
+        .unwrap();
+    assert_eq!(
+        all,
+        vec!["bg-analyzer", "main-agent", "recap-agent", "search-helper"]
+    );
     cleanup_db(&path);
 }
 
@@ -1439,7 +1490,7 @@ fn test_list_agent_names_falls_back_to_process_name() {
     }
 
     let names = store
-        .list_agent_names(BASE_NS, BASE_NS + 6 * STEP_NS)
+        .list_agent_names(BASE_NS, BASE_NS + 6 * STEP_NS, false)
         .unwrap();
     assert_eq!(names, vec!["fallback-agent"]);
     cleanup_db(&path);
@@ -1492,7 +1543,7 @@ fn test_list_agent_names_merges_case_variants() {
         }
     }
     let names = store
-        .list_agent_names(BASE_NS, BASE_NS + 6 * STEP_NS)
+        .list_agent_names(BASE_NS, BASE_NS + 6 * STEP_NS, false)
         .unwrap();
     let qoder_entries: Vec<&String> = names
         .iter()
@@ -1916,6 +1967,106 @@ fn test_insert_pending_records_idle_origin_and_match_key() {
 }
 
 #[test]
+fn completion_memory_columns_preserve_full_and_incremental_messages() {
+    let path = unique_size_test_db("completion-columns");
+    let store = GenAISqliteStore::new_with_path(&path, size_test_policy()).unwrap();
+    for route in ["pending", "captured", "fallback"] {
+        for incremental in [false, true] {
+            let text = "雪\"\n\0".repeat(512);
+            let message = |role: &str, text: String| crate::genai::InputMessage {
+                role: role.into(),
+                parts: vec![MessagePart::Text { content: text }],
+                name: None,
+            };
+            let mut messages = vec![message("user", text.clone())];
+            if incremental {
+                messages.insert(0, message("system", "instructions".into()));
+                messages.insert(1, message("user", "earlier turn".into()));
+                messages.insert(2, message("assistant", "earlier reply".into()));
+            }
+            let request = LLMRequest {
+                messages,
+                temperature: None,
+                max_tokens: None,
+                frequency_penalty: None,
+                presence_penalty: None,
+                top_p: None,
+                top_k: None,
+                seed: None,
+                stop_sequences: None,
+                stream: true,
+                tools: None,
+                raw_body: Some(serde_json::json!({"content":text}).to_string()),
+            };
+            let mut call = LLMCall::new(
+                format!("columns-{route}-{incremental}"),
+                1000,
+                "openai".into(),
+                "fixture".into(),
+                request,
+                1,
+                "fixture".into(),
+            );
+            call.response.messages.push(OutputMessage {
+                role: "assistant".into(),
+                parts: vec![MessagePart::Text {
+                    content: "reply 雪\n\0".into(),
+                }],
+                name: None,
+                finish_reason: Some("stop".into()),
+            });
+            call.metadata.insert("user_query".into(), text);
+            let expected_match_key = format!("columns-match-{route}-{incremental}");
+            call.metadata
+                .insert("pending_match_key".into(), expected_match_key.clone());
+            let expected_input = serde_json::to_string(
+                &crate::genai::semantic::latest_round_input_messages(&call.request.messages),
+            )
+            .unwrap();
+            let expected_output = serde_json::to_string(&call.response.messages).unwrap();
+            let id = call.call_id.clone();
+            let event = GenAISemanticEvent::LLMCall(call);
+            let expected_event = serde_json::to_string(&event).unwrap();
+            if route == "pending" {
+                let conn = store.conn.lock().unwrap();
+                conn.execute("INSERT INTO genai_events (event_type,status,call_id,start_timestamp_ns,event_json,pending_match_key) VALUES ('llm_call','pending',?1,1000,'{}',?2)", [&id, &expected_match_key]).unwrap();
+            }
+            if route == "captured" {
+                store.complete_captured(&event).unwrap();
+            } else {
+                store.complete_pending(&event).unwrap();
+            }
+            let conn = store.conn.lock().unwrap();
+            let saved: (String, String, String, String) = conn.query_row(
+            "SELECT input_messages,output_messages,event_json,status FROM genai_events WHERE call_id = ?1", [&id],
+            |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)),
+        ).unwrap();
+            assert_eq!(
+                saved,
+                (
+                    expected_input,
+                    expected_output,
+                    expected_event,
+                    "complete".into()
+                )
+            );
+            let (match_key, includes_cache): (String, i64) = conn
+                .query_row(
+                    "SELECT pending_match_key, input_tokens_includes_cache
+                     FROM genai_events WHERE call_id = ?1",
+                    [&id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(match_key, expected_match_key);
+            assert_eq!(includes_cache, 1);
+        }
+    }
+    drop(store);
+    cleanup_size_test_db(&path);
+}
+
+#[test]
 fn test_complete_pending_promotion_keeps_captured_request_evidence() {
     // 710a01ec0 established the contract for the call-id UPDATE: the
     // completing call's `input_messages`/`system_instructions` are `None`
@@ -1987,15 +2138,22 @@ fn test_complete_pending_promotion_keeps_captured_request_evidence() {
         .insert("call_kind".to_string(), "main".to_string());
 
     store
-        .complete_pending(&GenAISemanticEvent::LLMCall(call))
+        .complete_captured(&GenAISemanticEvent::LLMCall(call))
         .unwrap();
 
     let conn = store.conn.lock().unwrap();
-    let (input_messages, system_instructions, status): (Option<String>, Option<String>, String) =
-        conn.query_row(
-            "SELECT input_messages, system_instructions, status FROM genai_events",
+    let (input_messages, system_instructions, session_id, conversation_id, status): (
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        String,
+    ) = conn
+        .query_row(
+            "SELECT input_messages, system_instructions, session_id, conversation_id, status
+             FROM genai_events",
             [],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
         )
         .unwrap();
     assert_eq!(status, "complete");
@@ -2008,6 +2166,16 @@ fn test_complete_pending_promotion_keeps_captured_request_evidence() {
         system_instructions.as_deref(),
         Some("captured system prompt"),
         "promotion must not erase the captured system prompt"
+    );
+    assert_eq!(
+        session_id.as_deref(),
+        Some("s-idle"),
+        "promotion must not erase the captured session attribution"
+    );
+    assert_eq!(
+        conversation_id.as_deref(),
+        Some("c-idle"),
+        "promotion must not erase the captured conversation attribution"
     );
     drop(conn);
     cleanup_db(&path);
@@ -2102,7 +2270,7 @@ fn test_complete_pending_promotes_idle_snapshot_by_match_key() {
     );
 
     store
-        .complete_pending(&GenAISemanticEvent::LLMCall(call))
+        .complete_captured(&GenAISemanticEvent::LLMCall(call))
         .unwrap();
 
     let conn = store.conn.lock().unwrap();
@@ -2134,15 +2302,9 @@ fn test_complete_pending_promotes_idle_snapshot_by_match_key() {
     cleanup_db(&path);
 }
 
-/// Two idle snapshots can share one match key: `insert_pending` adopts a
-/// snapshot only when the candidate set is a single row ("Ambiguous idle
-/// snapshots … preserving snapshots"), so the completion then lands in
-/// `complete_pending`'s match-key branch instead of the call-id one. That
-/// branch wrote the evidence columns unconditionally, so a completion whose
-/// parsed request carried no messages erased the request view the drain had
-/// captured — the same loss the call-id branch already guards against.
+/// Ambiguous snapshot keys must preserve each original row and its evidence.
 #[test]
-fn test_complete_pending_keeps_captured_evidence_on_the_match_key_branch() {
+fn test_completion_preserves_ambiguous_idle_snapshots() {
     let path = std::env::temp_dir().join(format!(
         "test_genai_pending_evidence_match_key_{}.db",
         std::process::id()
@@ -2250,27 +2412,39 @@ fn test_complete_pending_keeps_captured_evidence_on_the_match_key_branch() {
         .insert("call_kind".to_string(), "main".to_string());
 
     store
-        .complete_pending(&GenAISemanticEvent::LLMCall(call))
+        .complete_pending(&GenAISemanticEvent::LLMCall(call.clone()))
         .unwrap();
+    call.call_id = "captured-dup".into();
+    let event = GenAISemanticEvent::LLMCall(call);
+    store.complete_captured(&event).unwrap();
+    store.complete_captured(&event).unwrap();
 
     let conn = store.conn.lock().unwrap();
-    let (input, system): (Option<String>, Option<String>) = conn
-        .query_row(
-            "SELECT input_messages, system_instructions FROM genai_events
-             WHERE call_id = 'real-dup'",
-            [],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
+    for id in ["idle-dup-a", "idle-dup-b"] {
+        let (status, input, system): (String, Option<String>, Option<String>) = conn.query_row(
+            "SELECT status, input_messages, system_instructions FROM genai_events WHERE call_id = ?1",
+            [id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        ).unwrap();
+        assert_eq!(status, "pending");
+        assert_eq!(input, info.input_messages);
+        assert_eq!(system, info.system_instructions);
+    }
+    for id in ["real-dup", "captured-dup"] {
+        let status: String = conn
+            .query_row(
+                "SELECT status FROM genai_events WHERE call_id = ?1",
+                [id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "complete");
+    }
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM genai_events", [], |r| r.get(0))
         .unwrap();
-    assert!(
-        input
-            .as_deref()
-            .is_some_and(|v| v.contains("what changed in the parser?")),
-        "the match-key branch must keep the captured request view, got {input:?}"
-    );
-    assert!(
-        system.as_deref().is_some_and(|v| v.contains("be terse")),
-        "the captured system instructions must survive too, got {system:?}"
+    assert_eq!(
+        count, 4,
+        "replayed completion must not duplicate a row or consume a snapshot"
     );
     drop(conn);
     cleanup_db(&path);
@@ -2361,11 +2535,17 @@ fn test_complete_pending_keeps_captured_request_evidence() {
 
     {
         let conn = store.conn.lock().unwrap();
-        let (input, system): (Option<String>, Option<String>) = conn
+        let (input, system, session_id, conversation_id): (
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        ) = conn
             .query_row(
-                "SELECT input_messages, system_instructions FROM genai_events WHERE call_id = 'captured-1'",
+                "SELECT input_messages, system_instructions, session_id, conversation_id
+                 FROM genai_events WHERE call_id = 'captured-1'",
                 [],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
             )
             .unwrap();
         assert!(
@@ -2377,6 +2557,16 @@ fn test_complete_pending_keeps_captured_request_evidence() {
         assert!(
             system.as_deref().is_some_and(|v| v.contains("be terse")),
             "the captured system instructions must survive too, got {system:?}"
+        );
+        assert_eq!(
+            session_id.as_deref(),
+            Some("s-evidence"),
+            "the captured session attribution must survive a completion that carries none"
+        );
+        assert_eq!(
+            conversation_id.as_deref(),
+            Some("c-evidence"),
+            "the captured conversation attribution must survive a completion that carries none"
         );
     }
 
@@ -2953,6 +3143,42 @@ fn test_maintain_applies_age_retention_below_size_threshold() {
 }
 
 #[test]
+fn payload_memory_pruning_compares_json_bytes_instead_of_unicode_characters() {
+    let path = unique_size_test_db("unicode-payload");
+    let store = GenAISqliteStore::new_with_path(&path, size_test_policy()).unwrap();
+    {
+        let conn = store.conn.lock().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE evaluation_runs (id INTEGER PRIMARY KEY, result_json TEXT);",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO genai_events (event_type, start_timestamp_ns, event_json) VALUES ('llm_call', 1, ?1)",
+            ["文".repeat(1024)],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO evaluation_runs (id, result_json) VALUES (1, ?1)",
+            ["x".repeat(2048)],
+        )
+        .unwrap();
+    }
+    assert_eq!(store.prune_old_records().unwrap(), 1);
+    {
+        let conn = store.conn.lock().unwrap();
+        let events: i64 = conn
+            .query_row("SELECT COUNT(*) FROM genai_events", [], |row| row.get(0))
+            .unwrap();
+        let evaluations: i64 = conn
+            .query_row("SELECT COUNT(*) FROM evaluation_runs", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(events, 0, "the Unicode JSON owns more bytes");
+        assert_eq!(evaluations, 1);
+    }
+    drop(store);
+    cleanup_size_test_db(&path);
+}
+
+#[test]
 fn test_prune_old_records() {
     let (store, path) = create_populated_store("prune");
     store.prune_old_records().unwrap();
@@ -3032,18 +3258,184 @@ fn test_list_sessions_excludes_auxiliary() {
 }
 
 #[test]
-fn test_list_sessions_only_auxiliary_hidden() {
+fn test_list_sessions_recap_only_zero_token_contract() {
     let store = make_store_with_pending(&[
         ("c1", "sess-recap", "conv-1", "recap", 1000),
         ("c2", "sess-recap", "conv-2", "web_search", 2000),
     ]);
+    // #7271: recap may form a session so a qwen headless call whose main
+    // capture was missed still surfaces (zero tokens); it must not contribute
+    // tokens or conversation counts.
     let sessions = store.list_sessions(0, 10000, false).unwrap();
-    assert!(
-        sessions.is_empty(),
-        "sessions with only auxiliary calls should be hidden"
-    );
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions[0].conversation_count, 0);
+    assert_eq!(sessions[0].total_input_tokens, 0);
+    assert_eq!(sessions[0].total_output_tokens, 0);
+    assert_eq!(sessions[0].first_user_query, None);
     let sessions_all = store.list_sessions(0, 10000, true).unwrap();
     assert_eq!(sessions_all.len(), 1);
+}
+
+#[test]
+fn test_list_sessions_recap_only_materializes_without_tokens() {
+    // The exact #7271 shape: the capture path missed the main call, leaving
+    // only the managed-memory recap row; the session must still be listed by
+    // default.
+    let store = make_store_with_pending(&[("c1", "sess-qwen", "conv-1", "recap", 1000)]);
+    let sessions = store.list_sessions(0, 10000, false).unwrap();
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions[0].session_id, "sess-qwen");
+    assert_eq!(sessions[0].total_input_tokens, 0);
+}
+
+#[test]
+fn test_list_sessions_web_search_only_hidden() {
+    // web_search rows must not form sessions even though recap now may.
+    let store = make_store_with_pending(&[("c1", "sess-ws", "conv-1", "web_search", 1000)]);
+    assert!(store.list_sessions(0, 10000, false).unwrap().is_empty());
+    assert_eq!(store.list_sessions(0, 10000, true).unwrap().len(), 1);
+}
+
+#[test]
+fn test_list_sessions_analyzer_only_hidden() {
+    // #2750 / #7271 review: the cosh-ng personal analyzer is classified as
+    // its own 'analyzer' kind; its standalone background session must stay
+    // hidden exactly as before the recap-only relaxation.
+    let store = make_store_with_pending(&[("c1", "sess-bg", "conv-1", "analyzer", 1000)]);
+    assert!(store.list_sessions(0, 10000, false).unwrap().is_empty());
+    assert_eq!(store.list_sessions(0, 10000, true).unwrap().len(), 1);
+}
+
+#[test]
+fn test_list_sessions_recap_does_not_move_last_seen_or_model() {
+    // #7271 review point 4: a recap row a few seconds after main must not
+    // move a mixed session's last_seen_ns (the ORDER BY key) or flip
+    // MAX(model)/MAX(agent_name) relative to the pre-#7271 behavior.
+    let path = std::env::temp_dir().join(format!(
+        "test_recap_last_seen_{}.db",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    cleanup_db(&path);
+    let store =
+        GenAISqliteStore::new_with_path(&path, crate::config::PeriodicStoragePolicy::default())
+            .unwrap();
+    {
+        let conn = store.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO genai_events (call_id, event_type, start_timestamp_ns, end_timestamp_ns, duration_ns, model, session_id, trace_id, conversation_id, agent_name, pid, status, call_kind, event_json) \
+             VALUES ('c1','llm_call',1000,2000,1000,'gpt-4','sess-m','t','conv-1','agent-a',1,'complete','main','{}')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO genai_events (call_id, event_type, start_timestamp_ns, end_timestamp_ns, duration_ns, model, session_id, trace_id, conversation_id, agent_name, pid, status, call_kind, event_json) \
+             VALUES ('c2','llm_call',9000,9100,100,'zeta-model','sess-m','t','conv-2','agent-z',1,'complete','recap','{}')",
+            [],
+        )
+        .unwrap();
+    }
+    let sessions = store.list_sessions(0, 10000, false).unwrap();
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(
+        sessions[0].last_seen_ns, 1000,
+        "recap at 9000 must not move last_seen_ns"
+    );
+    assert_eq!(
+        sessions[0].model.as_deref(),
+        Some("gpt-4"),
+        "recap must not flip model"
+    );
+    assert_eq!(sessions[0].agent_name.as_deref(), Some("agent-a"));
+    // A recap-only session still gets a usable last_seen via fallback.
+    let only = make_store_with_pending(&[("c1", "sess-r", "conv-1", "recap", 1000)]);
+    let sessions = only.list_sessions(0, 10000, false).unwrap();
+    assert_eq!(sessions[0].last_seen_ns, 1000);
+    cleanup_db(&path);
+}
+
+#[test]
+fn test_list_sessions_windowed_recap_fallback_ignores_out_of_window_main() {
+    // "Has a main row" is a property of the session, not of the queried time
+    // window: the preview subquery already checks the whole session. Using
+    // the windowed rows made a session whose main rows all fall outside the
+    // window look recap-only and report the recap model/agent.
+    let path = std::env::temp_dir().join(format!(
+        "test_recap_window_{}.db",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    cleanup_db(&path);
+    let store =
+        GenAISqliteStore::new_with_path(&path, crate::config::PeriodicStoragePolicy::default())
+            .unwrap();
+    {
+        let conn = store.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO genai_events (call_id, event_type, start_timestamp_ns, end_timestamp_ns, duration_ns, model, session_id, trace_id, conversation_id, agent_name, pid, status, call_kind, event_json) \
+             VALUES ('c1','llm_call',1000,1100,100,NULL,'sess-w','t','conv-main',NULL,1,'complete','main','{}')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO genai_events (call_id, event_type, start_timestamp_ns, end_timestamp_ns, duration_ns, model, session_id, trace_id, conversation_id, agent_name, pid, status, call_kind, event_json) \
+             VALUES ('c2','llm_call',2000,2100,100,'recap-model','sess-w','t','conv-recap','recap-agent',1,'complete','recap','{}')",
+            [],
+        )
+        .unwrap();
+    }
+
+    let sessions = store.list_sessions(1500, 2500, false).unwrap();
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(
+        sessions[0].model, None,
+        "an out-of-window main row must still suppress the recap model fallback"
+    );
+    assert_eq!(
+        sessions[0].agent_name, None,
+        "an out-of-window main row must still suppress the recap agent fallback"
+    );
+    cleanup_db(&path);
+}
+
+#[test]
+fn test_list_sessions_recap_does_not_inflate_main_session_numbers() {
+    // An existing session with both main and recap keeps its token totals and
+    // conversation counts identical to the pre-#7271 behavior.
+    let store = make_store_with_pending(&[
+        ("c1", "sess-a", "conv-1", "main", 1000),
+        ("c2", "sess-a", "conv-2", "recap", 2000),
+    ]);
+    let sessions = store.list_sessions(0, 10000, false).unwrap();
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions[0].conversation_count, 1);
+    assert_eq!(sessions[0].total_input_tokens, 0); // no usage rows in fixture
+    let with_usage = make_store_with_pending(&[("c1", "sess-a", "conv-1", "main", 1000)]);
+    {
+        let conn = with_usage.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE genai_events SET input_tokens = 100, output_tokens = 50 WHERE call_id = 'c1'",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO genai_events (call_id, event_type, start_timestamp_ns, end_timestamp_ns, duration_ns, input_tokens, output_tokens, total_tokens, session_id, trace_id, conversation_id, agent_name, pid, status, call_kind, event_json) \
+             VALUES ('c2','llm_call',2000,2000,0,70,30,100,'sess-a','t','conv-2','test-agent',1,'complete','recap','{}')",
+            [],
+        )
+        .unwrap();
+    }
+    let sessions = with_usage.list_sessions(0, 10000, false).unwrap();
+    assert_eq!(sessions[0].total_input_tokens, 100, "recap tokens excluded");
+    assert_eq!(sessions[0].total_output_tokens, 50, "recap tokens excluded");
+    assert_eq!(
+        sessions[0].conversation_count, 1,
+        "recap conversation excluded"
+    );
 }
 
 #[test]
@@ -3101,6 +3493,171 @@ fn test_list_traces_by_session_excludes_auxiliary() {
         .list_traces_by_session("sess-x", None, None, true)
         .unwrap();
     assert_eq!(traces_all.len(), 2);
+}
+
+#[test]
+fn test_list_traces_recap_only_session_is_inspectable() {
+    // #7271 review P1: a recap-only session now appears in /api/sessions, so
+    // its drill-down must show the recap trace too — otherwise the list, the
+    // trace view, and the ATIF event view tell three different stories.
+    let store = make_store_with_pending(&[("c1", "sess-r", "conv-recap", "recap", 1000)]);
+    let traces = store
+        .list_traces_by_session("sess-r", None, None, false)
+        .unwrap();
+    assert_eq!(traces.len(), 1);
+    assert_eq!(traces[0].conversation_id, "conv-recap");
+    assert_eq!(traces[0].call_count, 1);
+}
+
+#[test]
+fn test_list_sessions_recap_only_preview_is_inspectable() {
+    // #7271 review P1: with no main rows, the recap row carries the session
+    // preview; mixed sessions keep main-only previews.
+    let store = make_store_with_pending(&[
+        ("c1", "sess-mixed", "conv-1", "main", 1000),
+        ("c2", "sess-mixed", "conv-2", "recap", 2000),
+        ("c3", "sess-ro", "conv-3", "recap", 3000),
+    ]);
+    {
+        let conn = store.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE genai_events SET user_query = 'recap query' WHERE call_id = 'c2'",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE genai_events SET user_query = 'recap-only query' WHERE call_id = 'c3'",
+            [],
+        )
+        .unwrap();
+    }
+    let sessions = store.list_sessions(0, 10000, false).unwrap();
+    let mixed = sessions
+        .iter()
+        .find(|s| s.session_id == "sess-mixed")
+        .unwrap();
+    assert_eq!(
+        mixed.first_user_query, None,
+        "mixed session keeps main-only preview"
+    );
+    let ro = sessions.iter().find(|s| s.session_id == "sess-ro").unwrap();
+    assert_eq!(
+        ro.first_user_query.as_deref(),
+        Some("recap-only query"),
+        "recap-only session preview falls back to the recap row"
+    );
+}
+
+#[test]
+fn test_list_sessions_text_fallback_only_without_main_rows() {
+    // #7271 review P2: model/agent fallbacks must trigger only when the
+    // session has zero main rows; main rows with NULL model/agent_name must
+    // not be papered over by recap-row values.
+    let path = std::env::temp_dir().join(format!(
+        "test_text_fallback_{}.db",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    cleanup_db(&path);
+    let store =
+        GenAISqliteStore::new_with_path(&path, crate::config::PeriodicStoragePolicy::default())
+            .unwrap();
+    {
+        let conn = store.conn.lock().unwrap();
+        // Mixed session: main rows with NULL model, recap row with a model.
+        conn.execute(
+            "INSERT INTO genai_events (call_id, event_type, start_timestamp_ns, end_timestamp_ns, duration_ns, model, session_id, trace_id, conversation_id, agent_name, process_name, pid, status, call_kind, event_json) \
+             VALUES ('m1','llm_call',1000,1100,100,NULL,'sess-a','t','c1',NULL,'proc-a',1,'complete','main','{}')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO genai_events (call_id, event_type, start_timestamp_ns, end_timestamp_ns, duration_ns, model, session_id, trace_id, conversation_id, agent_name, process_name, pid, status, call_kind, event_json) \
+             VALUES ('m2','llm_call',2000,2100,100,'recap-model','sess-a','t','c2','recap-agent','proc-a',1,'complete','recap','{}')",
+            [],
+        )
+        .unwrap();
+        // Recap-only session: fallback must supply model/agent from the recap row.
+        conn.execute(
+            "INSERT INTO genai_events (call_id, event_type, start_timestamp_ns, end_timestamp_ns, duration_ns, model, session_id, trace_id, conversation_id, agent_name, process_name, pid, status, call_kind, event_json) \
+             VALUES ('m3','llm_call',3000,3100,100,'ro-model','sess-ro','t','c3','ro-agent','proc-b',1,'complete','recap','{}')",
+            [],
+        )
+        .unwrap();
+    }
+    let sessions = store.list_sessions(0, 10000, false).unwrap();
+    let mixed = sessions.iter().find(|s| s.session_id == "sess-a").unwrap();
+    assert_eq!(mixed.model, None, "NULL-model main rows must stay NULL");
+    assert_eq!(
+        mixed.agent_name.as_deref(),
+        Some("proc-a"),
+        "falls back to process_name over main rows, not recap agent_name"
+    );
+    let ro = sessions.iter().find(|s| s.session_id == "sess-ro").unwrap();
+    assert_eq!(ro.model.as_deref(), Some("ro-model"));
+    assert_eq!(ro.agent_name.as_deref(), Some("ro-agent"));
+    cleanup_db(&path);
+}
+
+#[test]
+fn test_migration_reclassifies_legacy_analyzer_recap_rows() {
+    // #7271 review P1: rows persisted as 'recap' by pre-split builds must be
+    // reclassified to 'analyzer' on reopen, otherwise #2750's noise sessions
+    // resurface on hosts with existing data.
+    let path = std::env::temp_dir().join(format!(
+        "test_analyzer_backfill_{}.db",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    cleanup_db(&path);
+    let store =
+        GenAISqliteStore::new_with_path(&path, crate::config::PeriodicStoragePolicy::default())
+            .unwrap();
+    {
+        let conn = store.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO genai_events (call_id, event_type, start_timestamp_ns, end_timestamp_ns, duration_ns, session_id, trace_id, conversation_id, agent_name, pid, status, call_kind, user_query, event_json) \
+             VALUES ('a1','llm_call',1000,1100,100,'sess-legacy','t','c1','cosh',1,'complete','recap','Summarize only grounded work into the supplied JSON schema. List every business entity mentioned by a summary or prompt in that item''s entities field.','{}')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO genai_events (call_id, event_type, start_timestamp_ns, end_timestamp_ns, duration_ns, session_id, trace_id, conversation_id, agent_name, pid, status, call_kind, user_query, event_json) \
+             VALUES ('a2','llm_call',2000,2100,100,'sess-qwen','t','c2','QwenCode',1,'complete','recap','Managed memory has TWO directories. Choose which one to write each memory into.','{}')",
+            [],
+        )
+        .unwrap();
+    }
+    drop(store);
+    // Reopen: the v11 backfill runs during schema setup.
+    let reopened =
+        GenAISqliteStore::new_with_path(&path, crate::config::PeriodicStoragePolicy::default())
+            .unwrap();
+    let kinds: Vec<(String, String)> = {
+        let conn = reopened.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare("SELECT call_id, call_kind FROM genai_events ORDER BY call_id")
+            .unwrap();
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .unwrap();
+        rows.filter_map(|r| r.ok()).collect()
+    };
+    assert_eq!(
+        kinds,
+        vec![
+            ("a1".to_string(), "analyzer".to_string()),
+            ("a2".to_string(), "recap".to_string()),
+        ],
+        "only the analyzer-prompt row is reclassified; qwen recap stays recap"
+    );
+    cleanup_db(&path);
 }
 
 #[test]
@@ -3455,6 +4012,305 @@ fn row_count(store: &GenAISqliteStore) -> i64 {
     let conn = store.conn.lock().unwrap();
     conn.query_row("SELECT COUNT(*) FROM genai_events", [], |r| r.get(0))
         .unwrap()
+}
+
+#[test]
+fn maintenance_connection_does_not_block_capture_delivery_or_loop_detection() {
+    use crate::database::{
+        DatabaseAccess, DatabaseCoverage, DatabaseId, DatabaseManager, DatabaseRole, DatabaseSpec,
+    };
+    use std::sync::{Arc, mpsc};
+
+    let (live, path) = create_populated_store("maintenance-isolation");
+    let live = Arc::new(live);
+    let manager = DatabaseManager::new(
+        DatabaseRole::Trace,
+        [DatabaseSpec::new(
+            DatabaseId::GenAi,
+            &path,
+            DatabaseAccess::ReadWrite,
+            DatabaseCoverage::Full,
+        )],
+    )
+    .unwrap();
+    let maintenance = manager
+        .open_read_write(DatabaseId::GenAi, |path| {
+            GenAISqliteStore::open_maintenance_existing(path, size_test_policy(), &live)
+        })
+        .unwrap();
+    let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+    let (release_tx, release_rx) = mpsc::sync_channel(1);
+    let job = manager
+        .maintenance_job(DatabaseId::GenAi, Duration::from_secs(3600), move || {
+            let connection = maintenance.conn.lock().unwrap();
+            ready_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            drop(connection);
+            maintenance.maintain_with_limit_mb(1).map_err(|error| {
+                agentsight_sqlite_lifecycle::LifecycleError::MaintenanceJobFailed(error.to_string())
+            })
+        })
+        .unwrap();
+    manager.start_maintenance(vec![job]).unwrap();
+    ready_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+
+    let (done_tx, done_rx) = mpsc::sync_channel(1);
+    let writer = Arc::clone(&live);
+    let capture = std::thread::spawn(move || {
+        let request =
+            serde_json::from_value(serde_json::json!({"messages":[],"stream":false})).unwrap();
+        let mut call = LLMCall::new(
+            "during-maintenance".into(),
+            BASE_NS as u64,
+            "openai".into(),
+            "fixture".into(),
+            request,
+            1,
+            "fixture".into(),
+        );
+        call.metadata
+            .insert("conversation_id".into(), "live-conversation".into());
+        let result = writer
+            .complete_captured(&GenAISemanticEvent::LLMCall(call))
+            .map(|_| {
+                writer
+                    .get_recent_calls_for_conversation("live-conversation", 5)
+                    .map(|calls| calls.len())
+            })
+            .map_err(|error| error.to_string());
+        done_tx.send(result).unwrap();
+    });
+    let completed = done_rx.recv_timeout(Duration::from_secs(2));
+    release_tx.send(()).unwrap();
+    manager.stop_maintenance().unwrap();
+    capture.join().unwrap();
+    assert_eq!(
+        completed.unwrap().unwrap(),
+        Some(1),
+        "delivery and its follow-up query must not wait for maintenance"
+    );
+    drop(live);
+    drop(manager);
+    cleanup_size_test_db(&path);
+}
+
+#[test]
+fn maintenance_yields_until_all_capture_write_guards_are_released() {
+    let (capture, path) = create_populated_store("capture-priority");
+    let maintenance = GenAISqliteStore::open_maintenance_existing(
+        &path,
+        PeriodicStoragePolicy::default(),
+        &capture,
+    )
+    .unwrap();
+    let first = capture.prioritize_capture();
+    let second = capture.prioritize_capture();
+    maintenance.maintain().unwrap();
+    assert_eq!(row_count(&capture), 6);
+    assert_eq!(
+        maintenance
+            .delete_maintenance_batch(super::schema::PruneTable::Events, None, 128,)
+            .unwrap(),
+        0
+    );
+    drop(first);
+    maintenance.maintain().unwrap();
+    assert_eq!(
+        row_count(&capture),
+        6,
+        "one active or queued capture still has priority"
+    );
+    drop(second);
+    maintenance.maintain().unwrap();
+    assert_eq!(
+        row_count(&capture),
+        0,
+        "retention resumes after capture makes progress"
+    );
+    drop(maintenance);
+    drop(capture);
+    cleanup_size_test_db(&path);
+}
+
+#[test]
+fn maintenance_checkpoint_yields_to_a_pinned_reader() {
+    let path = unique_size_test_db("passive-checkpoint");
+    let live = GenAISqliteStore::new_with_path(&path, size_test_policy()).unwrap();
+    grow_db(&live, 300, 10 * 1024);
+    let reader = rusqlite::Connection::open(&path).unwrap();
+    reader
+        .execute_batch("BEGIN; SELECT COUNT(*) FROM genai_events;")
+        .unwrap();
+    live.conn.lock().unwrap().execute(
+        "INSERT INTO genai_events (event_type, start_timestamp_ns, event_json) VALUES ('llm_call', 301, '{}')", [],
+    ).unwrap();
+    let maintenance =
+        GenAISqliteStore::open_maintenance_existing(&path, size_test_policy(), &live).unwrap();
+    maintenance
+        .conn
+        .lock()
+        .unwrap()
+        .busy_timeout(Duration::from_secs(5))
+        .unwrap();
+    let started = Instant::now();
+    maintenance.maintain().unwrap();
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "a pinned reader must not invoke the checkpoint busy timeout"
+    );
+    assert_eq!(
+        row_count(&live),
+        301,
+        "an incomplete checkpoint must prevent capacity deletion"
+    );
+    reader.execute_batch("ROLLBACK").unwrap();
+    maintenance.maintain().unwrap();
+    assert!(row_count(&live) < 301);
+    drop(maintenance);
+    drop(reader);
+    drop(live);
+    cleanup_size_test_db(&path);
+}
+
+#[test]
+fn maintenance_deletion_batches_bound_payload_and_preserve_pending() {
+    use super::schema::PruneTable;
+
+    let path = unique_size_test_db("bounded-batches");
+    let live = GenAISqliteStore::new_with_path(&path, size_test_policy()).unwrap();
+    {
+        let conn = live.conn.lock().unwrap();
+        let payload = "x".repeat(1024 * 1024);
+        for timestamp in 1..=2 {
+            conn.execute(
+                "INSERT INTO genai_events (event_type, start_timestamp_ns, event_json, input_messages, user_query)
+                 VALUES ('llm_call', ?1, ?2, ?2, ?2)", params![timestamp, payload],
+            ).unwrap();
+        }
+        conn.execute(
+            "INSERT INTO genai_events (event_type, start_timestamp_ns, status, event_json)
+             VALUES ('llm_call', 0, 'pending', ?1), ('llm_call', 3, 'complete', ?2)",
+            params![payload, "x".repeat(6 * 1024 * 1024)],
+        )
+        .unwrap();
+    }
+    let maintenance =
+        GenAISqliteStore::open_maintenance_existing(&path, size_test_policy(), &live).unwrap();
+    for remaining in [3, 2, 1] {
+        assert_eq!(
+            maintenance
+                .delete_maintenance_batch(PruneTable::Events, None, usize::MAX)
+                .unwrap(),
+            1
+        );
+        assert_eq!(row_count(&live), remaining);
+    }
+    let status: String = live
+        .conn
+        .lock()
+        .unwrap()
+        .query_row("SELECT status FROM genai_events", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(status, "pending");
+    drop(maintenance);
+    drop(live);
+    cleanup_size_test_db(&path);
+}
+
+#[test]
+fn maintenance_rechecks_rows_adopted_after_selection() {
+    use super::schema::PruneTable;
+    use std::cell::RefCell;
+    use std::sync::mpsc;
+
+    type Handoff = (mpsc::SyncSender<()>, mpsc::Receiver<()>);
+    thread_local! {
+        static HANDOFF: RefCell<Option<Handoff>> = const { RefCell::new(None) };
+    }
+
+    let path = unique_size_test_db("adoption-during-prune");
+    let live = GenAISqliteStore::new_with_path(&path, size_test_policy()).unwrap();
+    live.conn
+        .lock()
+        .unwrap()
+        .execute(
+            "INSERT INTO genai_events (event_type, start_timestamp_ns, status, event_json)
+         VALUES ('llm_call', 1, 'interrupted', '{}')",
+            [],
+        )
+        .unwrap();
+    let maintenance =
+        GenAISqliteStore::open_maintenance_existing(&path, size_test_policy(), &live).unwrap();
+    let blocker = rusqlite::Connection::open(&path).unwrap();
+    blocker
+        .execute_batch("BEGIN IMMEDIATE; UPDATE genai_events SET status = 'pending';")
+        .unwrap();
+    let (selected_tx, selected_rx) = mpsc::sync_channel(1);
+    let (resume_tx, resume_rx) = mpsc::sync_channel(1);
+    let prune = std::thread::spawn(move || {
+        HANDOFF.with(|state| *state.borrow_mut() = Some((selected_tx, resume_rx)));
+        maintenance
+            .conn
+            .lock()
+            .unwrap()
+            .busy_handler(Some(|attempt| {
+                attempt == 0
+                    && HANDOFF.with(|state| {
+                        let state = state.borrow();
+                        let (selected, resume) = state.as_ref().unwrap();
+                        selected.send(()).is_ok() && resume.recv().is_ok()
+                    })
+            }))
+            .unwrap();
+        maintenance
+            .delete_maintenance_batch(PruneTable::Events, None, 128)
+            .map_err(|error| error.to_string())
+    });
+
+    // The committed row is still interrupted during selection. Its adoption
+    // becomes visible only after maintenance attempts to acquire the write lock.
+    let selected = selected_rx.recv_timeout(Duration::from_secs(2));
+    blocker.execute_batch("COMMIT").unwrap();
+    let _ = resume_tx.send(());
+    let deleted = prune.join().unwrap().unwrap();
+    selected.unwrap();
+    assert_eq!(deleted, 0, "an adopted in-flight row must survive pruning");
+    assert_eq!(row_count(&live), 1);
+    drop(blocker);
+    drop(live);
+    cleanup_size_test_db(&path);
+}
+
+#[test]
+fn maintenance_defers_a_busy_writer_then_resumes_retention() {
+    let path = unique_size_test_db("defer-busy-writer");
+    let policy = PeriodicStoragePolicy::new(1, 0, 1);
+    let live = GenAISqliteStore::new_with_path(&path, policy).unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as i64;
+    live.conn
+        .lock()
+        .unwrap()
+        .execute(
+            "INSERT INTO genai_events (event_type, start_timestamp_ns, event_json)
+         VALUES ('llm_call', 1, '{}'), ('llm_call', ?1, '{}')",
+            [now],
+        )
+        .unwrap();
+    let maintenance = GenAISqliteStore::open_maintenance_existing(&path, policy, &live).unwrap();
+    let blocker = rusqlite::Connection::open(&path).unwrap();
+    blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+    maintenance.maintain().unwrap();
+    assert_eq!(row_count(&live), 2);
+    blocker.execute_batch("ROLLBACK").unwrap();
+    maintenance.maintain().unwrap();
+    assert_eq!(row_count(&live), 1);
+    drop(blocker);
+    drop(maintenance);
+    drop(live);
+    cleanup_size_test_db(&path);
 }
 
 /// Covers all three adaptive prune branches: overshoot 1-2x (10% per
@@ -3998,6 +4854,126 @@ fn call_turn_indices_survive_a_null_call_id_row() {
         .expect("a NULL call_id row must not fail the whole map");
     assert_eq!(indices.get("call-a"), Some(&1));
     assert_eq!(indices.get("call-b"), Some(&3));
+    drop(store);
+    let _ = std::fs::remove_file(&path);
+}
+
+/// A failed recent-calls lookup must not be reported as an empty window.
+///
+/// The DeadLoop detector reads a short window as "too few repetitions to be a
+/// loop", so folding a storage error into an empty list silently disabled the
+/// interruption — and the auto-kill behind it — for that conversation, with no
+/// log line to say so.
+#[test]
+fn a_failed_recent_calls_lookup_is_not_an_empty_window() {
+    let dir = std::env::temp_dir().join(format!(
+        "test_recent_calls_lookup_failure_{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let db = dir.join("foreign.db");
+    // The shape a foreign or legacy file has: the table the lookup selects
+    // from exists, without any of the columns it selects.
+    rusqlite::Connection::open(&db)
+        .expect("fixture connection")
+        .execute_batch("CREATE TABLE genai_events (id INTEGER PRIMARY KEY);")
+        .expect("fixture schema");
+    let store = GenAISqliteStore::open_read_only_existing(&db).expect("foreign store");
+
+    assert!(
+        store
+            .get_recent_calls_for_conversation("conv-1", 10)
+            .is_none(),
+        "an unreadable window must be reported as unknown, not as an empty one"
+    );
+
+    drop(store);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The answer the detector does consume: this conversation's calls, oldest
+/// first, each with the tokens and the parsed output summary it counts
+/// repetitions over.
+#[test]
+fn a_successful_recent_calls_lookup_returns_the_calls_oldest_first() {
+    let path = std::env::temp_dir().join(format!(
+        "test_recent_calls_lookup_success_{}.db",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let store =
+        GenAISqliteStore::new_with_path(&path, crate::config::PeriodicStoragePolicy::default())
+            .unwrap();
+
+    {
+        let conn = store.conn.lock().unwrap();
+        let sql = "INSERT INTO genai_events (\
+                   call_id, event_type, start_timestamp_ns, end_timestamp_ns,\
+                   conversation_id, agent_name, pid, status, input_tokens,\
+                   output_tokens, output_messages, event_json\
+                   ) VALUES (?1,'llm_call',?2,?3,'conv-success','agent-s',7,'complete',?4,?5,?6,'{}')";
+        // Inserted newest-first on purpose: the ascending order the detector
+        // replays has to come from the query, not from the insertion order.
+        conn.execute(
+            sql,
+            params![
+                "call-b",
+                BASE_NS + STEP_NS,
+                BASE_NS + 2 * STEP_NS,
+                20_i64,
+                5_i64,
+                r#"[{"parts":[{"type":"tool_call","name":"read_file","arguments":{"path":"b"}}]}]"#,
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            sql,
+            params![
+                "call-a",
+                BASE_NS,
+                BASE_NS + STEP_NS,
+                10_i64,
+                2_i64,
+                r#"[{"parts":[{"type":"tool_call","name":"read_file","arguments":{"path":"a"}}]}]"#,
+            ],
+        )
+        .unwrap();
+    }
+
+    let calls = store
+        .get_recent_calls_for_conversation("conv-success", 10)
+        .expect("a readable window is not a failure");
+    assert_eq!(
+        calls
+            .iter()
+            .map(|call| call.call_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["call-a", "call-b"],
+        "the window is replayed oldest-first"
+    );
+    assert_eq!((calls[0].input_tokens, calls[0].output_tokens), (10, 2));
+    assert_eq!(
+        calls[0]
+            .tool_calls
+            .iter()
+            .map(|call| call.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["read_file"]
+    );
+    // An empty conversation is an empty window, not the failure `None` means,
+    // and another conversation's calls stay out of this window.
+    assert_eq!(
+        store
+            .get_recent_calls_for_conversation("conv-other", 10)
+            .map(|calls| calls.len()),
+        Some(0)
+    );
+
     drop(store);
     let _ = std::fs::remove_file(&path);
 }

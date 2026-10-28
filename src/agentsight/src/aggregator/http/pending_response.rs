@@ -4,6 +4,7 @@ use super::{
     AggregatedResponse, AggregatedResult, ConnectionId, ConnectionState, HttpConnectionAggregator,
     HttpPair,
 };
+use crate::aggregator::RemoveReason;
 use crate::parser::http::{HttpParser, ParsedHttpMessage, ParsedRequest, ParsedResponse};
 use crate::probes::sslsniff::SslEvent;
 use anyhow::{Result, bail};
@@ -127,23 +128,56 @@ impl Framing {
 }
 
 impl PendingResponse {
-    /// Bytes retained while response framing is incomplete.
-    pub(super) fn buffered_bytes(&self) -> usize {
-        match self {
-            Self::Headers(event) => event.buf.len(),
-            Self::Body { response, .. } => response.source_event.buf.len(),
-        }
+    fn exceeds_limit(&self, limit: usize) -> bool {
+        matches!(self, Self::Body { response, framing, .. }
+            if response.body_len > limit || matches!(framing, Framing::Length(n) if *n > limit))
     }
 
-    /// Select message framing without decoding the response body.
-    pub(super) fn body(response: ParsedResponse, method: Option<&str>) -> Result<Self> {
-        let framing = Framing::new(&response, method)?;
-        let end_timestamp_ns = response.source_event.timestamp_ns;
-        Ok(Self::Body {
-            response,
-            framing,
-            end_timestamp_ns,
-        })
+    fn discard_body(&mut self) {
+        if let Self::Body { response, .. } = self {
+            super::lifecycle::metadata_response(response);
+        }
+    }
+    /// Finish an in-flight response on the clean-exit path with whatever
+    /// bytes arrived, yielding a completable pair when at least the final
+    /// response headers are present (issue #7553: an application that never
+    /// reads the declared body leaves the connection `ResponsePending`
+    /// forever; the clean-exit sweep must surface the call instead of
+    /// stranding it as a pending row that the stale scan later flips to
+    /// `interrupted`). Returns the response plus its provenance timestamp.
+    ///
+    /// Returns `None` when even the header block is unusable (truncated or
+    /// unparsable), leaving the entry to the request-evidence path. The
+    /// dead-PID drain (vanished PIDs without an exit event) intentionally
+    /// keeps the interrupted-evidence semantics.
+    pub(super) fn finish_partial(
+        &mut self,
+        limit: usize,
+        max_headers: usize,
+    ) -> Option<(ParsedResponse, u64)> {
+        // The provenance timestamp of the buffered response bytes: the header
+        // event for a headers-only assembly, the retained fragment timestamp
+        // for one with body bytes.
+        let end_timestamp_ns = match self {
+            Self::Headers(event) => event.timestamp_ns,
+            Self::Body {
+                end_timestamp_ns, ..
+            } => *end_timestamp_ns,
+        };
+        let response = match self {
+            Self::Headers(_) => self.parsed_headers(max_headers).ok().flatten()?,
+            Self::Body { response, .. } => {
+                // Framing never completed: accept the buffered bytes as the
+                // final (partial) body rather than dropping the response.
+                let mut response = response.clone();
+                response.body_len = response.body_len.min(limit);
+                response
+            }
+        };
+        if is_informational(response.status_code) {
+            return None;
+        }
+        Some((response, end_timestamp_ns))
     }
 
     /// SSL direction that owns the response.
@@ -169,7 +203,6 @@ impl PendingResponse {
             } => {
                 *end_timestamp_ns = event.timestamp_ns;
                 let used = response.body_len;
-                response.body_len = used.saturating_add(data.len());
                 (&mut response.source_event, used, limit)
             }
         };
@@ -179,6 +212,9 @@ impl PendingResponse {
         let source = Rc::make_mut(source);
         source.buf.extend_from_slice(data);
         source.len = source.buf.len() as u32;
+        if let Self::Body { response, .. } = self {
+            response.body_len = used.saturating_add(data.len());
+        }
         Ok(())
     }
 
@@ -259,10 +295,31 @@ impl HttpConnectionAggregator {
         request: Option<ParsedRequest>,
         response: ParsedResponse,
     ) -> Option<AggregatedResult> {
-        match PendingResponse::body(response, request.as_ref().map(|r| r.method.as_str())) {
-            Ok(assembly) => self.advance_response(id, request, assembly),
+        let end_timestamp_ns = response.source_event.timestamp_ns;
+        match Framing::new(&response, request.as_ref().map(|r| r.method.as_str())) {
+            Ok(framing) => self.advance_response(
+                id,
+                request,
+                PendingResponse::Body {
+                    response,
+                    framing,
+                    end_timestamp_ns,
+                },
+            ),
             Err(error) => {
-                log::warn!("[HttpAggregator] discarded invalid response | conn={id:?}: {error}");
+                log::warn!("[HttpAggregator] cannot frame response | conn={id:?}: {error}");
+                self.insert(
+                    id,
+                    ConnectionState::ResponsePending {
+                        request,
+                        assembly: PendingResponse::Body {
+                            response,
+                            framing: Framing::CloseDelimited,
+                            end_timestamp_ns,
+                        },
+                    },
+                );
+                self.abandon(&id, RemoveReason::ProtocolError);
                 None
             }
         }
@@ -299,7 +356,17 @@ impl HttpConnectionAggregator {
             }
             Ok(false) => self.insert(id, ConnectionState::ResponsePending { request, assembly }),
             Err(error) => {
-                log::warn!("[HttpAggregator] discarded incomplete response | conn={id:?}: {error}")
+                log::warn!(
+                    "[HttpAggregator] incomplete response finalized early | conn={id:?}: {error}"
+                );
+                let reason = if assembly.exceeds_limit(self.max_body_bytes) {
+                    assembly.discard_body();
+                    RemoveReason::OverBudget
+                } else {
+                    RemoveReason::ProtocolError
+                };
+                self.insert(id, ConnectionState::ResponsePending { request, assembly });
+                self.abandon(&id, reason);
             }
         }
         None
@@ -316,8 +383,10 @@ impl HttpConnectionAggregator {
             } => {
                 if let Err(error) = assembly.append(event, self.max_body_bytes) {
                     log::warn!(
-                        "[HttpAggregator] discarded incomplete response | conn={id:?}: {error}"
+                        "[HttpAggregator] response append exceeds byte limit | conn={id:?}: {error}"
                     );
+                    self.insert(id, ConnectionState::ResponsePending { request, assembly });
+                    self.abandon(&id, RemoveReason::OverBudget);
                     return None;
                 }
                 (request, assembly)
@@ -353,7 +422,7 @@ impl HttpConnectionAggregator {
                     );
                     return None;
                 }
-                request.reassembled_body = Some(body_buffer);
+                request.set_reassembled_body(body_buffer);
                 (Some(request), assembly)
             }
             other => {
@@ -386,9 +455,9 @@ impl HttpConnectionAggregator {
                 return result;
             }
             Err(error) => {
-                log::warn!(
-                    "[HttpAggregator] discarded invalid response headers | conn={id:?}: {error}"
-                );
+                log::warn!("[HttpAggregator] invalid response headers | conn={id:?}: {error}");
+                self.insert(id, ConnectionState::ResponsePending { request, assembly });
+                self.abandon(&id, RemoveReason::ProtocolError);
                 return None;
             }
             Ok(None) => {}

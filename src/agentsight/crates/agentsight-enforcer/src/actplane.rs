@@ -30,6 +30,20 @@ use uuid::Uuid;
 use crate::event_hub::SecurityEventHub;
 use crate::{BackendError, EnforcementBackend, EventHub, SubscriberClass};
 
+// Normalization and resolution primitives land before the topology stage that
+// consumes them, so they stay test-scoped until a production caller exists.
+#[cfg(test)]
+mod file_protection_discovery;
+#[cfg(test)]
+mod file_protection_manifest;
+#[cfg(test)]
+mod file_protection_mountinfo;
+#[cfg(test)]
+mod file_protection_policy;
+#[cfg(test)]
+mod file_protection_resolver;
+#[cfg(test)]
+mod file_protection_topology;
 mod inode_policy;
 use inode_policy::InodePolicy;
 
@@ -43,6 +57,14 @@ const _: () = assert!(
 
 /// Exact official upstream revision compiled into this adapter.
 pub const ACTPLANE_REVISION: &str = "a62e5d9d96f91101cda019519053e950d532380a";
+
+fn validate_actplane_policy_payload(request: &ApplyPolicy) -> Result<(), BackendError> {
+    crate::backend::validate_apply_policy_payload(request)?;
+    if request.file_protection_policy.is_some() {
+        return Err(crate::backend::structured_file_protection_unsupported());
+    }
+    Ok(())
+}
 
 #[derive(Clone)]
 struct ActiveBinding {
@@ -206,6 +228,7 @@ impl ActPlaneBackend {
         mut request: ApplyPolicy,
         credential_policy: Option<CredentialExfiltrationPolicy>,
     ) -> Result<PreparedBinding, BackendError> {
+        validate_actplane_policy_payload(&request)?;
         // Resolve namespace-local PID to host PID BEFORE start-time validation,
         // so that the stale-process check reads the correct /proc/<host_pid>/stat.
         let host_pid = resolve_to_host_pid(request.root_pid, request.process_start_time);
@@ -759,8 +782,22 @@ fn parse_process_start_time(stat: &str) -> Result<u64, ProcessStatError> {
         .map_err(|_| ProcessStatError::InvalidStartTime)
 }
 
+/// Reads a `/proc` text file, decoding non-UTF-8 bytes lossily.
+///
+/// `/proc/<pid>/stat` and `/proc/<pid>/status` embed the process name, and the
+/// kernel allows almost any non-NUL bytes in a name (`prctl(PR_SET_NAME)` sets
+/// them directly, and an executable whose name is not valid UTF-8 passes them
+/// on). `read_to_string` rejects such a file outright, which failed binding
+/// preparation (`KernelFailure`) and PID-namespace resolution for a process
+/// purely because of its name, while every field these parsers read (start
+/// time, NSpid) is plain ASCII positioned after the name. Mirrors the
+/// sibling fix in `src/enforcement/target.rs`.
+fn read_proc_text_lossy(path: &str) -> std::io::Result<String> {
+    fs::read(path).map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+}
+
 fn read_process_start_time(pid: i32) -> Result<u64, BackendError> {
-    let stat = fs::read_to_string(format!("/proc/{pid}/stat"))
+    let stat = read_proc_text_lossy(&format!("/proc/{pid}/stat"))
         .map_err(|error| BackendError::KernelFailure(format!("read /proc/{pid}/stat: {error}")))?;
     parse_process_start_time(&stat)
         .map_err(|error| BackendError::KernelFailure(format!("parse /proc/{pid}/stat: {error}")))
@@ -782,6 +819,7 @@ fn credential_apply_request(
             policy_revision: policy.revision.to_string(),
             policy_dsl,
             policy_mode: Some(policy.mode),
+            file_protection_policy: None,
         },
         policy,
     ))
@@ -801,6 +839,7 @@ fn replacement_failure_code(error: &BackendError) -> ReplaceFailureCode {
 fn validation_failure_code(error: &ReplaceValidationError) -> ReplaceFailureCode {
     match error {
         ReplaceValidationError::CredentialPolicy(_)
+        | ReplaceValidationError::PolicyPayload(_)
         | ReplaceValidationError::SourcePolicySnapshot(_) => ReplaceFailureCode::CompileFailure,
         ReplaceValidationError::SameBindingId
         | ReplaceValidationError::SourceNotEnforced
@@ -1334,11 +1373,10 @@ fn kernel_error_with_cleanup(
 ///    caller handle the stale-process / not-found case.
 fn resolve_to_host_pid(input_pid: i32, input_start_time: u64) -> i32 {
     // Fast path: pid exists in host /proc and start_time matches.
-    if let Ok(start_time) = proc_start_time(input_pid) {
-        if start_time == input_start_time {
-            return first_nspid(input_pid).unwrap_or(input_pid);
-        }
-        // pid exists but belongs to a different process (namespace collision).
+    if let Ok(start_time) = proc_start_time(input_pid)
+        && start_time == input_start_time
+    {
+        return first_nspid(input_pid).unwrap_or(input_pid);
     }
 
     // Slow path: scan /proc for a process whose innermost NSpid == input_pid
@@ -1362,10 +1400,10 @@ fn resolve_to_host_pid(input_pid: i32, input_start_time: u64) -> i32 {
         if *nspid.last().unwrap() != input_pid {
             continue; // innermost ns PID doesn't match
         }
-        if let Ok(pst) = proc_start_time(host_pid) {
-            if pst == input_start_time {
-                return nspid[0]; // host PID
-            }
+        if let Ok(pst) = proc_start_time(host_pid)
+            && pst == input_start_time
+        {
+            return nspid[0]; // host PID
         }
     }
 
@@ -1376,9 +1414,15 @@ fn resolve_to_host_pid(input_pid: i32, input_start_time: u64) -> i32 {
 /// index 0 is the outermost (host) PID and the last element is the innermost
 /// (namespace-local) PID.
 fn read_nspid_chain(pid: i32) -> Vec<i32> {
-    let Ok(status) = fs::read_to_string(format!("/proc/{pid}/status")) else {
+    let Ok(status) = read_proc_text_lossy(&format!("/proc/{pid}/status")) else {
         return vec![];
     };
+    parse_nspid_from_status(&status)
+}
+
+/// Parse the `NSpid:` chain from a decoded `/proc/<pid>/status` payload;
+/// empty when the line is absent or carries no valid PID.
+fn parse_nspid_from_status(status: &str) -> Vec<i32> {
     for line in status.lines() {
         if let Some(rest) = line.strip_prefix("NSpid:") {
             return rest
@@ -1398,7 +1442,7 @@ fn first_nspid(pid: i32) -> Option<i32> {
 
 /// Read `start_time` (field 22) from `/proc/<pid>/stat`.
 fn proc_start_time(pid: i32) -> Result<u64, ()> {
-    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).map_err(|_| ())?;
+    let stat = read_proc_text_lossy(&format!("/proc/{pid}/stat")).map_err(|_| ())?;
     let after_comm = &stat[stat.rfind(')').ok_or(())? + 2..];
     after_comm
         .split_ascii_whitespace()
@@ -1456,6 +1500,7 @@ mod tests {
                     policy_revision: "revision-1".into(),
                     policy_dsl: "fixture".into(),
                     policy_mode: Some(PolicyMode::Audit),
+                    file_protection_policy: None,
                 },
                 state: BindingState::Enforced,
                 message: None,
@@ -1468,6 +1513,35 @@ mod tests {
             label_names: HashMap::from([(1, "CREDENTIAL".into())]),
             inode_policy: InodePolicy::default(),
         }
+    }
+
+    #[test]
+    fn structured_payload_is_rejected_without_resolving_a_process() {
+        use agentsight_enforcement_protocol::{
+            FILE_PROTECTION_POLICY_VERSION, FileProtectionPolicy, FileProtectionTarget,
+            FileProtectionTargetKind, FileProtectionTopologyMode, FileProtections,
+        };
+
+        let mut request = active_binding().binding.request;
+        request.root_pid = 0;
+        request.process_start_time = 0;
+        request.policy_dsl.clear();
+        request.file_protection_policy = Some(FileProtectionPolicy {
+            version: FILE_PROTECTION_POLICY_VERSION,
+            topology_mode: FileProtectionTopologyMode::StaticAtApply,
+            targets: vec![FileProtectionTarget {
+                path: "/missing/file".into(),
+                kind: FileProtectionTargetKind::ExactFile,
+                protections: FileProtections {
+                    delete: true,
+                    ordinary_write: false,
+                },
+                exclusions: vec![],
+            }],
+        });
+        let error = validate_actplane_policy_payload(&request).expect_err("unsupported payload");
+        assert!(matches!(error, BackendError::CompileFailure(message)
+            if message == crate::backend::STRUCTURED_FILE_PROTECTION_UNSUPPORTED));
     }
 
     fn raw_violation(timestamp_ns: u64) -> Violation {
@@ -1584,6 +1658,22 @@ mod tests {
             compile_credential_exfiltration_policy(&policy).is_err(),
             "enforce mode must fail closed without a trusted endpoint as well"
         );
+    }
+
+    #[test]
+    fn non_enforcing_policies_compile_without_a_trusted_endpoint() {
+        for mode in [PolicyMode::Observe, PolicyMode::Audit] {
+            let mut policy = credential_policy();
+            policy.mode = mode;
+            policy.trusted_endpoints.clear();
+
+            let dsl = compile_credential_exfiltration_policy(&policy)
+                .expect("non-enforcing policies do not require a trusted endpoint");
+
+            assert!(dsl.contains("notify connect endpoint \"*\" if CREDENTIAL"));
+            assert!(!dsl.contains("unless target"));
+            assert!(compile_str(&dsl).is_ok());
+        }
     }
 
     #[test]
@@ -2083,6 +2173,41 @@ mod tests {
     fn proc_start_time_handles_parenthesized_comm() {
         let stat = "42 (a tricky) name) S 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 98765";
         assert_eq!(parse_process_start_time(stat), Ok(98765));
+    }
+
+    #[test]
+    fn read_proc_text_lossy_keeps_ascii_fields_across_invalid_bytes() {
+        // /proc/<pid>/stat embeds the comm between parentheses, and the kernel
+        // allows non-NUL non-UTF-8 bytes in a comm. `read_to_string` rejected
+        // the whole file, failing binding preparation (KernelFailure) for a
+        // valid target; the lossy read keeps the ASCII start-time field.
+        let dir = std::env::temp_dir().join(format!("enforcer_stat_{}", std::process::id()));
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join("stat");
+        let mut stat = b"42 (qoder".to_vec();
+        stat.push(0xff);
+        stat.extend_from_slice(
+            b") S 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 45678 1000 100 0 0 0 0 0 0 0 0 0 0 0 0 17 0 0 0 0 0 0\n",
+        );
+        fs::write(&path, &stat).expect("write non-UTF-8 stat");
+
+        let text = read_proc_text_lossy(path.to_str().unwrap()).expect("lossy read must succeed");
+        assert!(text.starts_with("42 (qoder\u{fffd}) S "));
+        assert_eq!(parse_process_start_time(&text), Ok(45678));
+
+        assert!(read_proc_text_lossy("/proc/2000000000/stat").is_err());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parse_nspid_from_status_survives_a_lossy_name_line() {
+        // /proc/<pid>/status leads with `Name:`, so a non-UTF-8 comm decodes
+        // lossily in front of the NSpid line the resolver needs.
+        let status = "Name:\tqoder\u{fffd}\nPid:\t39560\nNSpid:\t39560\t1\nTgid:\t39560\n";
+        assert_eq!(parse_nspid_from_status(status), vec![39560, 1]);
+        // Missing line stays empty.
+        assert!(parse_nspid_from_status("Pid:\t39560\n").is_empty());
     }
 
     #[test]

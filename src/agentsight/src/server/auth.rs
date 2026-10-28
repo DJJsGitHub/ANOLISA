@@ -389,31 +389,67 @@ fn normalize_path(mut path: String) -> String {
 ///
 /// Loopback is a network location, not an authorization boundary, so the
 /// endpoints that put the server's privileges or credentials to work require a
-/// credential of their own even from the local machine. That covers the
-/// kernel-policy mutations plus the two that are equally consequential and were
-/// missing: rewriting where the server sends its stored LLM credential
-/// (`POST /api/optimize/config`) and killing and re-execing an agent process as
-/// root (`POST /api/agent-health/{pid}/restart`). Data-plane writes (labels,
-/// triage, evaluations) stay on the loopback path: they change what the
-/// dashboard shows, not what the host does.
-fn is_privileged_mutation_path(method: &actix_web::http::Method, path: &str) -> bool {
+/// credential of their own even from the local machine. Tokenless detail reads
+/// also proxy a stored service credential and therefore require authentication.
+/// That covers the kernel-policy mutations, the endpoints that rewrite
+/// security-relevant server configuration, and the actions that put a stored
+/// credential to work: rewriting where the server sends its LLM credential
+/// (`POST /api/optimize/config`), rewriting the hookless runtime configuration
+/// (`POST /api/storage/config`), killing and re-execing an agent process as
+/// root (`POST /api/agent-health/{pid}/restart`), and the endpoints that spend
+/// that LLM credential (`POST /api/sessions/search`,
+/// `POST /api/causal-attribution`, `POST /api/reuse/judge`, and
+/// `POST /api/optimize/sessions/{session}/{dimension}`). Data-plane writes
+/// (labels, triage, evaluations) stay on the loopback path: they change what
+/// the dashboard shows, not what the host does.
+fn is_credential_required_path(method: &actix_web::http::Method, path: &str) -> bool {
     match *method {
         actix_web::http::Method::POST => {
             matches!(
                 path,
                 "/api/enforcement/bindings"
+                    | "/api/tokenless/refresh"
                     | "/api/enforcement/file-bindings"
                     | "/api/enforcement/credential-bindings"
                     | "/api/optimize/config"
+                    // Rewrites the hookless runtime configuration file: the
+                    // value is re-read by every maintenance pass, so this is a
+                    // host mutation (0 disables the disk cap entirely), not a
+                    // dashboard preference.
+                    | "/api/storage/config"
+                    // These endpoints spend the LLM credential stored in the
+                    // optimize config (semantic search, judgment, attribution
+                    // and optimization). They are not dashboard data writes:
+                    // a loopback caller could otherwise run up the account's
+                    // usage without ever possessing the credential.
+                    | "/api/sessions/search"
+                    | "/api/causal-attribution"
+                    | "/api/reuse/judge"
             ) || path
-                .strip_prefix("/api/agent-health/")
-                .and_then(|rest| rest.strip_suffix("/restart"))
-                .is_some_and(|pid| !pid.is_empty() && !pid.contains('/'))
+                .strip_prefix("/api/optimize/sessions/")
+                .is_some_and(|rest| {
+                    let mut parts = rest.split('/');
+                    matches!(
+                        (parts.next(), parts.next(), parts.next()),
+                        (Some(session), Some(dimension), None)
+                            if !session.is_empty() && !dimension.is_empty()
+                    )
+                })
+                || path
+                    .strip_prefix("/api/agent-health/")
+                    .and_then(|rest| rest.strip_suffix("/restart"))
+                    .is_some_and(|pid| !pid.is_empty() && !pid.contains('/'))
                 || ["/contain", "/review"].iter().any(|suffix| {
                     path.strip_prefix("/api/audit/cases/")
                         .and_then(|case_id| case_id.strip_suffix(suffix))
                         .is_some_and(|case_id| !case_id.is_empty() && !case_id.contains('/'))
                 })
+        }
+        actix_web::http::Method::GET => {
+            path == "/api/tokenless/records"
+                || path
+                    .strip_prefix("/api/tokenless/records/")
+                    .is_some_and(|id| !id.is_empty() && !id.contains('/'))
         }
         actix_web::http::Method::DELETE => path
             .strip_prefix("/api/enforcement/bindings/")
@@ -510,7 +546,18 @@ where
         // Privileged mutations always require an explicit credential. Loopback is a
         // network location, not an authorization boundary: unprivileged local processes
         // must not be able to use the root server as a confused deputy.
-        if path.matches(|value| is_privileged_mutation_path(req.method(), value)) {
+        let tokenless_query = *req.method() == actix_web::http::Method::GET
+            && req
+                .app_data::<actix_web::web::Data<super::tokenless::QueryClient>>()
+                .is_some()
+            && path.matches(|value| {
+                value == "/api/token-savings"
+                    || value
+                        .strip_prefix("/api/token-savings/session/")
+                        .is_some_and(|id| !id.is_empty() && !id.contains('/'))
+            });
+        if tokenless_query || path.matches(|value| is_credential_required_path(req.method(), value))
+        {
             let authenticated = self.auth.enabled && is_authenticated(&self.auth, &req);
             if authenticated {
                 let fut = self.service.call(req);

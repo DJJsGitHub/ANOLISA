@@ -139,6 +139,7 @@ function loadPageModule(relativePath, moduleStubs, driver) {
   const requireStub = (name) => {
     if (name === 'react') return reactStub;
     if (moduleStubs[name]) return moduleStubs[name];
+    if (name === '../utils/text') return loadPageModule('src/utils/text.ts', moduleStubs, driver);
     throw new Error(`unexpected require from ${relativePath}: ${name}`);
   };
   const fn = new Function('require', 'module', 'exports', code);
@@ -1690,4 +1691,524 @@ test('system audit: an event list pruned below the current page must reopen on r
   await h.answer({ events: auditEvents(5), eventTotal: 5 });
   rendered = h.render();
   assert.ok(h.text(rendered).includes('session-0'), 'the pruned events must stay reachable');
+});
+
+// ─── Dead Previous click: the two pagers #7486 names ─────────────────────────
+//
+// The same asymmetry #7183 fixed on the sessions page: the display clamps the
+// page (`safePage` / `clamped`), Next clamps its updater, but Previous
+// subtracted from the raw state - so after a list shrink one click only
+// decremented the hidden page and the table did not move.
+
+test('optimization history: one previous click moves back from the displayed page after a shrink', async () => {
+  const driver = createHooksDriver();
+  const { calls, stubs } = deferredFetchStubs(['fetchOptimizeHistory']);
+  const t = (key, args) => (args ? `${key}:${JSON.stringify(args)}` : key);
+  const module = loadPageModule('src/pages/OptimizationPage.tsx', {
+    'react-router-dom': { useParams: () => ({}), useNavigate: () => () => {} },
+    recharts: {},
+    '../utils/apiClient': { ...stubs, ApiRequestError: class ApiRequestError extends Error {} },
+    '../components/CopyButton': { copyText: () => {} },
+    '../utils/formatDuration': { formatDurationSecs: (value) => String(value) },
+    '../i18n': { useI18n: () => ({ t }), useLocaleTag: () => 'en' },
+    '../utils/accuracyAttribution': {
+      fixLocusDiverges: () => false,
+      fixLocusLabel: () => '',
+    },
+    '../utils/richText': richTextStub,
+    '../components/TokenFlameChart': componentStub('TokenFlameChart'),
+  }, driver);
+  // Without a sessionId the route element is the history list view itself.
+  const view = driver.render(module.OptimizationPage).element.type;
+  assert.equal(typeof view, 'function', 'the list route must render a component');
+
+  const entry = (i) => ({
+    session_id: `fixture-${i}`,
+    dimensions: [],
+    created_at_ns: i + 1,
+    updated_at_ns: i + 1,
+  });
+  // The history query is effect 0; re-running it is what a shrinking history
+  // arrives on (the effect is keyed on the i18n handle, so a locale switch or
+  // any refresh re-issues it without resetting the page).
+  const query = async (count) => {
+    const rendered = driver.render(view);
+    rendered.effects[0]();
+    calls.fetchOptimizeHistory.at(-1).resolve(Array.from({ length: count }, (_, i) => entry(i)));
+    await settle();
+    await settle();
+  };
+  const button = (label) => {
+    const node = findElement(driver.render(view).element, (el) => el.type === 'button'
+      && elementText(el).join('') === label);
+    assert.ok(node, `visible ${label} button`);
+    return node;
+  };
+  const summary = () => {
+    const node = findElement(driver.render(view).element, (el) => el.type === 'span'
+      && elementText(el).join('').startsWith('opt.history.paginationSummary:'));
+    assert.ok(node, 'the pager summary must be rendered');
+    return JSON.parse(elementText(node).join('').slice('opt.history.paginationSummary:'.length));
+  };
+
+  await query(40);
+  assert.equal(summary().page, 1, 'sanity: the list opens on page 1');
+  button('»').props.onClick();
+  assert.equal(summary().page, 3, 'sanity: 40 rows at 15 a page put the last page at 3');
+  await query(20);
+  assert.equal(summary().page, 2, 'the shrink clamps the displayed page');
+  const previous = button('‹');
+  assert.equal(previous.props.disabled, false, 'Previous must be enabled on page 2 of 2');
+  previous.props.onClick();
+  assert.equal(summary().page, 1, 'one previous click must move the displayed page back by one');
+});
+
+test('agent health interruptions: one previous click moves back from the displayed page after a refresh shrinks the list', async () => {
+  const t = (key, args) => (args ? `${key}:${JSON.stringify(args)}` : key);
+  const { calls, stubs } = deferredFetchStubs(['fetchInterruptions']);
+  const driver = createHooksDriver();
+  const module = loadPageModule('src/pages/AgentHealthPage.tsx', {
+    '../utils/apiClient': {
+      ...stubs,
+      fetchAgentHealth: async () => [],
+      fetchAgentProcessHealth: async () => ({ roots: [], agents: [] }),
+      deleteAgentHealth: async () => {},
+      restartAgentHealth: async () => {},
+      resolveInterruption: async () => {},
+      createCredentialBinding: async () => ({}),
+      fetchAgentProtectionPreview: async () => ({ paths: [] }),
+      fetchEnforcementBindings: async () => ({ bindings: [] }),
+      detachEnforcementBinding: async () => {},
+      fetchSecurityCases: async () => ({ data: { items: [], total: 0 } }),
+      fetchLatencyMetrics: async () => ({}),
+    },
+    '../i18n': {
+      useI18n: () => ({ t }),
+      useLocaleTag: () => 'en-US',
+      INTERRUPTION_TYPES: [],
+      interruptionTypeKey: () => null,
+    },
+    '../utils/datetime': { formatNs: (ns) => String(ns) },
+    '../constants/policyIds': { CREDENTIAL_POLICY_ID: 'policy' },
+  }, driver);
+
+  // The pagination lives in a section the page renders. Take that component out
+  // of the page's own tree, then drive it against a cleared slot map: the page
+  // itself is never re-rendered, but the section is (its hooks bind to this
+  // module's driver, so the element has to come from this same instance).
+  const pageTree = driver.render(module.AgentHealthPage).element;
+  const section = findElement(pageTree, (el) => typeof el.type === 'function'
+    && el.type.name === 'InterruptionSection');
+  assert.ok(section, 'the page must render its interruption section');
+  driver.slots.length = 0;
+  driver._memos.length = 0;
+  driver._callbackCache.length = 0;
+
+  const realSetInterval = global.setInterval;
+  const realClearInterval = global.clearInterval;
+  const intervals = [];
+  const mounted = [];
+  const sameDeps = (a, b) => a.length === b.length && a.every((dep, i) => Object.is(dep, b[i]));
+  const runEffects = (rendered) => {
+    rendered.effects.forEach((fn, index) => {
+      const deps = fn.__deps;
+      const prev = mounted[index];
+      if (prev && sameDeps(prev.deps, deps)) return;
+      if (prev && typeof prev.cleanup === 'function') prev.cleanup();
+      global.setInterval = (cb) => { intervals.push(cb); return intervals.length; };
+      global.clearInterval = () => {};
+      let cleanup;
+      try {
+        cleanup = fn();
+      } finally {
+        global.setInterval = realSetInterval;
+        global.clearInterval = realClearInterval;
+      }
+      mounted[index] = { deps, cleanup };
+    });
+  };
+  const render = () => {
+    const rendered = driver.render(section.type, section.props);
+    runEffects(rendered);
+    return rendered;
+  };
+  const rows = (count) => Array.from({ length: count }, (_, i) => ({
+    interruption_id: `fixture-${i}`,
+    resolved: false,
+    severity: 'high',
+    interruption_type: 'loop',
+    occurred_at_ns: i + 1,
+    call_id: null,
+    detail: null,
+  }));
+  const button = (label) => {
+    const node = findElement(render().element, (el) => el.type === 'button'
+      && elementText(el).join('') === label);
+    assert.ok(node, `visible ${label} button`);
+    return node;
+  };
+  const summary = () => {
+    const node = findElement(render().element, (el) => el.type === 'span'
+      && elementText(el).join('').startsWith('common.page:'));
+    assert.ok(node, 'the pager summary must be rendered');
+    return JSON.parse(elementText(node).join('').slice('common.page:'.length));
+  };
+  // The 30 s poll is the refresh path the shrunken list arrives on.
+  const refresh = async (count) => {
+    const before = calls.fetchInterruptions.length;
+    intervals.forEach((cb) => cb());
+    assert.equal(calls.fetchInterruptions.length, before + 1, 'the poll must re-issue the query');
+    calls.fetchInterruptions.at(-1).resolve(rows(count));
+    await settle();
+    await settle();
+  };
+
+  render();
+  calls.fetchInterruptions.at(-1).resolve(rows(40));
+  await settle();
+  await settle();
+  assert.equal(summary().cur, 1, 'sanity: the section opens on page 1');
+  button('common.last').props.onClick();
+  assert.equal(summary().cur, 3, 'sanity: 40 rows at 15 a page put the last page at 3');
+  await refresh(20);
+  assert.equal(summary().cur, 2, 'the shrink clamps the displayed page');
+  const previous = button('common.prev');
+  assert.equal(previous.props.disabled, false, 'Previous must be enabled on page 2 of 2');
+  previous.props.onClick();
+  assert.equal(summary().cur, 1, 'one previous click must move the displayed page back by one');
+});
+
+// Filter controls can change without changing the request payload.
+async function semanticFilterScenario(mutation, outcome = 'success') {
+  const { calls, stubs } = deferredFetchStubs([
+    'fetchSessions',
+    'fetchTrajectories',
+    'fetchOptimizeConfig',
+    'semanticSearchSessions',
+  ]);
+  const driver = createHooksDriver();
+  const sameDeps = (a, b) => a.length === b.length && a.every((v, i) => Object.is(v, b[i]));
+  const realSetTimeout = global.setTimeout;
+  const settle = () => new Promise((r) => realSetTimeout(r, 0));
+  const t = (k) => k;
+  const page = loadPageModule(
+    'src/pages/AgentSessionsPage.tsx',
+    {
+      'react-router-dom': { useNavigate: () => () => {} },
+      '../i18n': { useI18n: () => ({ t }), useLocaleTag: () => 'en-US' },
+      '../utils/apiClient': stubs,
+      '../utils/semanticSearchFilter': loadPageModule('src/utils/semanticSearchFilter.ts', {}),
+      '../utils/sessionModel': loadPageModule('src/utils/sessionModel.ts', {}),
+      '../components/CopyButton': componentStub('CopyButton'),
+    },
+    driver,
+  ).AgentSessionsPage;
+  const timers = new Map();
+  let timerId = 0;
+  const mounted = [];
+  function effects(rendered) {
+    const old = [global.setTimeout, global.clearTimeout];
+    global.setTimeout = (fn) => {
+      timers.set(++timerId, fn);
+      return timerId;
+    };
+    global.clearTimeout = (id) => timers.delete(id);
+    try {
+      rendered.effects.forEach((effect, i) => {
+        if (mounted[i] && sameDeps(mounted[i].deps, effect.__deps)) return;
+        mounted[i]?.cleanup?.();
+        mounted[i] = { deps: effect.__deps, cleanup: effect() };
+      });
+    } finally {
+      [global.setTimeout, global.clearTimeout] = old;
+    }
+  }
+  function render() {
+    const r = driver.render(page);
+    effects(r);
+    return r;
+  }
+  function fire() {
+    for (const [id, fn] of [...timers]) {
+      timers.delete(id);
+      fn();
+    }
+  }
+  const active = Date.now() - 1000;
+  const sessions = () =>
+    Array.from({ length: 6 }, (_, i) => ({
+      session_id: `session-${i}`,
+      agent_name: 'claude',
+      model: 'fixture',
+      conversation_count: 1,
+      first_seen_ns: (active - 60000) * 1e6,
+      last_seen_ns: (active - i * 1000) * 1e6,
+      total_input_tokens: 10,
+      total_output_tokens: 5,
+      first_user_query: `question ${i}`,
+      last_user_query: `answer ${i}`,
+    }));
+  const logs = () =>
+    mutation === 'source_changed_candidates'
+      ? [
+          {
+            ...sessions()[0],
+            session_id: 'session-0',
+            source: 'claude',
+            is_subagent: false,
+            num_steps: 1,
+            collected_at_ns: active * 1e6,
+            project: 'fixture',
+          },
+        ]
+      : [];
+  render();
+  calls.fetchSessions[0].resolve(sessions());
+  calls.fetchTrajectories[0].resolve(logs());
+  calls.fetchOptimizeConfig[0].resolve({ configured: true });
+  await settle();
+  let r = render();
+  const input = findElement(
+    r.element,
+    (n) => n.type === 'input' && n.props.placeholder === 'as.searchPlaceholder',
+  );
+  input.props.onChange({ target: { value: 'find the widget' } });
+  render();
+  fire();
+  assert.equal(calls.semanticSearchSessions.length, 1);
+  const original = { results: [{ session_id: 'session-0', relevance: 'high', reason: 'fixture' }] };
+  if (outcome === 'failure')
+    calls.semanticSearchSessions[0].reject(new Error('fixture unavailable'));
+  else if (outcome !== 'pending')
+    calls.semanticSearchSessions[0].resolve(outcome === 'empty' ? { results: [] } : original);
+  await settle();
+  r = render();
+  assert.equal(driver.slots[8].value, outcome === 'pending');
+  assert.equal(Object.keys(driver.slots[9].value).length, outcome === 'success' ? 1 : 0);
+  if (mutation === 'agent_same_candidates') {
+    findElement(r.element, (n) => n.type === 'select').props.onChange({
+      target: { value: 'claude' },
+    });
+  } else if (mutation === 'range_same_candidates') {
+    findElement(
+      r.element,
+      (n) => n.type === 'button' && elementText(n).includes('as.timePreset.last24h'),
+    ).props.onClick();
+  } else if (mutation.startsWith('source_')) {
+    const label = mutation === 'source_same_candidates' ? 'as.source.ebpf' : 'as.source.log';
+    findElement(
+      r.element,
+      (n) => n.type === 'button' && elementText(n).includes(label),
+    ).props.onClick();
+  } else if (mutation === 'query_changed') {
+    input.props.onChange({ target: { value: 'find something else' } });
+  } else {
+    findElement(
+      r.element,
+      (n) => n.type === 'button' && elementText(n).includes('common.refresh'),
+    ).props.onClick();
+  }
+  render();
+  if (calls.fetchSessions.length > 1) {
+    calls.fetchSessions[1].resolve(sessions());
+    calls.fetchTrajectories[1].resolve(logs());
+    await settle();
+    render();
+  }
+  fire();
+  if (calls.semanticSearchSessions.length > 1) {
+    calls.semanticSearchSessions[1].resolve(original);
+    await settle();
+  }
+  if (outcome === 'pending') {
+    calls.semanticSearchSessions[0].resolve(original);
+    await settle();
+  }
+  r = render();
+  const text = elementText(r.element);
+  return {
+    mutation,
+    requests: calls.semanticSearchSessions.length,
+    pending_timers: timers.size,
+    semantic_loading: driver.slots[8].value,
+    matches: Object.keys(driver.slots[9].value),
+    spinner_visible: text.includes('AI ...'),
+    displayed_session_ids: text.filter((v) => /^session-\d$/.test(v)),
+    semantic_error: driver.slots[10].value,
+  };
+}
+
+for (const mutation of [
+  'agent_same_candidates',
+  'source_same_candidates',
+  'range_same_candidates',
+]) {
+  for (const outcome of ['success', 'empty', 'failure', 'pending']) {
+    test(`agent sessions: ${mutation} preserves ${outcome} ranking ownership`, async () => {
+      const result = await semanticFilterScenario(mutation, outcome);
+      assert.equal(
+        result.requests,
+        1,
+        'equivalent candidates must not incur another ranking request',
+      );
+      assert.equal(result.pending_timers, 0, 'no replacement search should be scheduled');
+      assert.equal(result.semantic_loading, false, 'a settled request must release the spinner');
+      assert.equal(result.spinner_visible, false, 'the real page must stop displaying AI ...');
+      assert.equal(result.semantic_error, outcome === 'failure');
+      assert.deepEqual(
+        result.matches,
+        ['success', 'pending'].includes(outcome) ? ['session-0'] : [],
+      );
+      assert.deepEqual(
+        result.displayed_session_ids,
+        ['success', 'pending'].includes(outcome) ? ['session-0'] : [],
+      );
+    });
+  }
+}
+
+test('agent sessions: changed filters cancel the superseded ranking', async () => {
+  const result = await semanticFilterScenario('source_changed_candidates', 'pending');
+  assert.equal(result.requests, 1, 'the one-row pool needs no ranking request');
+  assert.equal(result.semantic_loading, false);
+  assert.deepEqual(result.matches, [], 'a late old result must not repopulate matches');
+  assert.deepEqual(result.displayed_session_ids, ['session-0']);
+});
+
+// ─── SystemAuditPage: a server-side filter must re-issue the query ───────────
+//
+// The case list is filtered by the server (`agent_id`, `status`, `blocked` are
+// query params), so a filter change has to change the loader's identity - and it
+// has to start from the first page, or the narrowed list is asked for a page it
+// no longer has.
+
+test('system audit: a case filter change re-queries the list from the first page', async () => {
+  const driver = createHooksDriver();
+  const { calls, stubs } = deferredFetchStubs([
+    'fetchAuditSummary',
+    'fetchSecurityCases',
+    'fetchAuditSessions',
+    'fetchAuditEvents',
+    'fetchEnforcementBindings',
+  ]);
+  const t = (key, args) => (args ? `${key}:${JSON.stringify(args)}` : key);
+  const page = loadPageModule('src/pages/SystemAuditPage.tsx', {
+    'react-router-dom': {
+      useNavigate: () => () => {},
+      useSearchParams: () => [new URLSearchParams(), () => {}],
+    },
+    '../i18n': { useI18n: () => ({ t, locale: 'en-US' }), useLocaleTag: () => 'en-US' },
+    '../components/ContainmentDialog': componentStub('ContainmentDialog'),
+    '../components/ContainmentLifecycleCard': componentStub('ContainmentLifecycleCard'),
+    '../components/Pagination': loadPageModule('src/components/Pagination.tsx', {}, driver),
+    '../utils/enforcementMode': {
+      effectiveBindingMode: (request) => (request && request.policy_mode) || 'audit',
+    },
+    '../utils/ruleReason': { translateRuleReason: (summary) => summary },
+    '../utils/apiClient': {
+      ...stubs,
+      fetchSecurityCase: async () => ({ data: null }),
+      reviewSecurityCase: async () => ({}),
+    },
+  }, driver).SystemAuditPage;
+  assert.equal(typeof page, 'function', 'SystemAuditPage must be a component');
+
+  const mounted = [];
+  const render = () => {
+    const rendered = driver.render(page);
+    rendered.effects.forEach((fn, index) => {
+      const deps = fn.__deps;
+      const prev = mounted[index];
+      if (prev && sameDeps(prev.deps, deps)) return;
+      if (prev && typeof prev.cleanup === 'function') prev.cleanup();
+      mounted[index] = { deps, cleanup: fn() };
+    });
+    return rendered;
+  };
+  const fixture = (count, first = 0) => Array.from({ length: count }, (_, i) => ({
+    case_id: `case-${first + i}`,
+    agent_id: 'claude',
+    session_id: `session-${first + i}`,
+    summary: `rule ${first + i}`,
+    severity: 'high',
+    risk_score: 40 + i,
+    status: 'open',
+    blocked: false,
+    updated_at_ns: (first + i + 1) * 1_000_000_000,
+  }));
+  // load() awaits its five callers in one allSettled, so each reload is answered
+  // as a batch.
+  const answer = async (payload = {}) => {
+    calls.fetchAuditSummary.at(-1).resolve({ data: {} });
+    calls.fetchSecurityCases.at(-1).resolve({
+      data: { items: payload.items ?? [], total: payload.total ?? 0 },
+    });
+    calls.fetchAuditSessions.at(-1).resolve({ data: { items: [], total: 0 } });
+    calls.fetchAuditEvents.at(-1).resolve({ data: { items: [], total: 0, next_offset: null } });
+    calls.fetchEnforcementBindings.at(-1).resolve({ bindings: [] });
+    await settle();
+    await settle();
+  };
+  const lastQuery = () => calls.fetchSecurityCases.at(-1).args[0];
+  const text = (rendered) => elementText(rendered.element).join('|');
+
+  let rendered = render();
+  await answer({ items: fixture(60), total: 60 });
+  rendered = render();
+  assert.equal(calls.fetchSecurityCases.length, 1, 'sanity: an answered load must not re-issue itself');
+  assert.equal(lastQuery().status, undefined, 'sanity: the default filter sends no status');
+
+  // Move to page 2 first, so the offset reset is observable.
+  const pager = findElement(rendered.element, (el) => el.props
+    && el.props.limit === 20 && typeof el.props.onPageChange === 'function');
+  assert.ok(pager, 'sanity: 60 cases must render the pager');
+  const pagerButtons = collectElements(pager.type(pager.props)).filter(
+    (el) => el.type === 'button' && el.props && el.props.disabled !== true,
+  );
+  assert.ok(pagerButtons.length, 'sanity: the pager must offer an enabled control');
+  pagerButtons[pagerButtons.length - 1].props.onClick();
+  rendered = render();
+  assert.equal(calls.fetchSecurityCases.length, 2, 'sanity: the next page reloads the list');
+  assert.equal(lastQuery().offset, 20, 'sanity: page 2 is offset 20');
+  await answer({ items: fixture(20, 20), total: 60 });
+  rendered = render();
+
+  // The status filter is server-side: changing it must re-issue the query, and
+  // from the first page - keeping offset 20 would ask the narrowed list for a
+  // page it does not have.
+  const statusSelect = findElement(rendered.element, (el) => el.type === 'select'
+    && el.props && el.props.value === 'all');
+  assert.ok(statusSelect, 'sanity: the status filter must be rendered');
+  statusSelect.props.onChange({ target: { value: 'open' } });
+  rendered = render();
+  assert.equal(calls.fetchSecurityCases.length, 3, 'a filter change must re-issue the query');
+  assert.equal(lastQuery().status, 'open', 'the filter must reach the server');
+  assert.equal(lastQuery().offset, 0, 'the re-issued query must start from the first page');
+  await answer({ items: fixture(5), total: 5 });
+  rendered = render();
+  assert.ok(!text(rendered).includes('audit.cases.empty'), 'the filtered page must not be empty');
+  assert.ok(text(rendered).includes('rule 0'), 'the filtered page must show its rows');
+
+  // The same rule for the "only blocked" checkbox.
+  const blockedBox = findElement(rendered.element, (el) => el.type === 'input'
+    && el.props && el.props.type === 'checkbox');
+  assert.ok(blockedBox, 'sanity: the blocked checkbox must be rendered');
+  blockedBox.props.onChange({ target: { checked: true } });
+  rendered = render();
+  assert.equal(calls.fetchSecurityCases.length, 4, 'the checkbox must re-issue the query');
+  assert.equal(lastQuery().blocked, true, 'the checkbox must reach the server');
+  assert.equal(lastQuery().offset, 0, 'the checkbox query must start from the first page');
+  await answer({ items: fixture(5), total: 5 });
+  rendered = render();
+
+  // And clearing the filters goes back to the unfiltered first page.
+  const clearChip = findElement(rendered.element, (el) => el.type === 'button'
+    && elementText(el).join('') === '清除筛选');
+  assert.ok(clearChip, 'sanity: an active filter must offer the clear control');
+  clearChip.props.onClick();
+  rendered = render();
+  assert.equal(calls.fetchSecurityCases.length, 5, 'clearing the filters must re-issue the query');
+  assert.equal(lastQuery().status, undefined, 'cleared: no status is sent');
+  assert.equal(lastQuery().blocked, undefined, 'cleared: no blocked flag is sent');
+  assert.equal(lastQuery().offset, 0, 'the cleared query must start from the first page');
 });

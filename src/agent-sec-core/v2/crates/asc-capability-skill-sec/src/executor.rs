@@ -8,6 +8,35 @@ use serde_json::{Map, Value, json};
 use std::sync::Arc;
 use std::time::Instant;
 
+/// Discovered identities plus directory failures that prevent complete coverage.
+#[derive(Debug, Default)]
+pub struct SkillDiscovery {
+    /// Authorized identities, sorted and deduplicated across all discovery sources.
+    pub skills: Vec<crate::SkillIdentity>,
+    /// Business diagnostics; raw paths and errors must not enter public audit events.
+    pub errors: Vec<DiscoveryError>,
+}
+
+/// A failed discovery or physical resolution, separate from a scanner finding.
+#[derive(Debug, serde::Serialize)]
+pub struct DiscoveryError {
+    /// Directory whose coverage or physical resolution failed.
+    pub root: crate::SkillIdentity,
+    /// Diagnostic returned to the requesting client, not the public audit sink.
+    pub error: String,
+}
+
+struct PreparedRoots {
+    roots: Vec<SkillRoot>,
+    errors: Vec<DiscoveryError>,
+}
+
+fn discovery_failed(output: &Value) -> bool {
+    output["discoveryErrors"]
+        .as_array()
+        .is_some_and(|errors| !errors.is_empty())
+}
+
 /// Physical resolution and integration health supplied by daemon composition.
 /// Implementations must authenticate mounted mappings and never fall back inside a mount.
 pub trait SkillEnvironment: Send + Sync {
@@ -70,101 +99,134 @@ impl SkillSecExecutor {
         self
     }
 
-    fn allowed(&self, identity: &crate::SkillIdentity) -> bool {
-        self.service
-            .config
-            .managed_skill_dirs
-            .iter()
-            .any(|pattern| pattern.contains(identity))
-            || self.environment.manages(identity)
+    fn allowed(&self, identity: &crate::SkillIdentity) -> Result<bool, SkillSecError> {
+        Ok(self.service.config()?.allows(identity) || self.environment.manages(identity))
     }
 
-    /// Discovers authorized ordinary Skills and registered mounts without traversing FUSE.
-    /// Shared by aggregate commands and the daemon's asynchronous startup scan.
+    /// Discovers authorized Skills without traversing authenticated mounts.
+    /// Directory failures retain successful discoveries and identify incomplete coverage.
     ///
     /// # Errors
-    /// Reports invalid or unreadable configured roots, corrupt registration and expired deadlines.
-    pub fn discover(&self, deadline: Instant) -> Result<Vec<crate::SkillIdentity>, SkillSecError> {
-        let mut skills: std::collections::BTreeSet<_> = self
-            .service
-            .managed_skills()?
-            .into_iter()
-            .filter(|identity| self.allowed(identity))
-            .collect();
-        for pattern in &self.service.config.managed_skill_dirs {
-            // Mounted Skills are discovered by authenticated notifications, never by traversing FUSE.
-            if !self.environment.manages(&pattern.root) {
-                skills.extend(crate::discovery::discover(pattern, deadline, |id| {
-                    self.environment.manages(id)
-                })?);
+    /// Reports unavailable configuration and expired deadlines.
+    pub fn discover(&self, deadline: Instant) -> Result<SkillDiscovery, SkillSecError> {
+        let mut skills = std::collections::BTreeSet::new();
+        let mut errors = Vec::new();
+        let mut completed: Vec<&crate::ManagedSkillDir> = Vec::new();
+        let config = self.service.config()?;
+        let mut budget = crate::discovery::DefaultBudget::default();
+        for (patterns, defaults) in [
+            (&config.managed_skill_dirs, false),
+            (&config.default_skill_dirs, true),
+        ] {
+            for pattern in patterns {
+                if defaults && budget.exhausted {
+                    break;
+                }
+                if self.environment.manages(&pattern.root) {
+                    if pattern.scope == crate::config::Scope::Exact {
+                        skills.insert(pattern.root.clone());
+                    }
+                    continue;
+                }
+                if defaults
+                        && completed.iter().any(|explicit| {
+                            *explicit == pattern
+                                || (explicit.scope == crate::config::Scope::Recursive
+                                    && explicit.contains(&pattern.root))
+                        })
+                        // Recursive discovery skips symlinks; a default root must still reject them.
+                        && crate::ledger::storage::Directory::open(pattern.root.path()).is_ok()
+                {
+                    continue;
+                }
+                let result = crate::discovery::discover(
+                    pattern,
+                    deadline,
+                    |id| self.environment.manages(id),
+                    &mut skills,
+                    if defaults { Some(&mut budget) } else { None },
+                );
+                match result {
+                    Ok(()) => {
+                        if !defaults {
+                            completed.push(pattern);
+                        }
+                    }
+                    Err(SkillSecError::Timeout) => return Err(SkillSecError::Timeout),
+                    Err(error) => errors.push(DiscoveryError {
+                        root: pattern.root.clone(),
+                        error: error.to_string(),
+                    }),
+                }
             }
         }
-        Ok(skills.into_iter().collect())
+        Ok(SkillDiscovery {
+            skills: skills.into_iter().collect(),
+            errors,
+        })
     }
 
     fn prepare(
         &self,
         request: &SkillSecRequest,
         deadline: Instant,
-    ) -> Result<Vec<SkillRoot>, SkillSecError> {
+    ) -> Result<PreparedRoots, SkillSecError> {
         check_deadline(deadline)?;
         let command = &request.command;
-        let rotates = matches!(
+        if matches!(
             command,
             SkillSecCommand::RotateKeys {}
                 | SkillSecCommand::Init {
                     force_keys: true,
                     ..
                 }
-        );
-        if rotates && request.caller_uid != 0 {
-            return Err(SkillSecError::PermissionDenied);
+        ) {
+            return Err(SkillSecError::Unsupported(
+                "key rotation and force-keys are not supported".into(),
+            ));
         }
         // Validate caller paths before discovery or resolution performs any target I/O.
         let mut identities = command.identities(&[])?;
         for identity in &identities {
-            if !self.allowed(identity) {
+            if !self.allowed(identity)? {
                 return Err(SkillSecError::ScopeDenied(identity.clone()));
             }
         }
-        let recovery =
-            if rotates && !matches!(command, SkillSecCommand::Init { baseline: true, .. }) {
-                self.service.rotation_recovery_skills(deadline)?
-            } else {
-                None
-            };
-        let mut managed = if rotates {
-            self.service.rotation_skills(deadline)?
-        } else {
-            Vec::new()
-        };
-        if matches!(
+        let mut managed = Vec::new();
+        let aggregate = matches!(
             command,
             SkillSecCommand::Init { baseline: true, .. }
                 | SkillSecCommand::Scan { all: true, .. }
                 | SkillSecCommand::Check { all: true, .. }
                 | SkillSecCommand::Status { .. }
-        ) {
-            managed.extend(self.discover(deadline)?);
+        );
+        let mut errors = Vec::new();
+        if aggregate {
+            let discovery = self.discover(deadline)?;
+            managed.extend(discovery.skills);
+            errors = discovery.errors;
         }
         identities.extend(managed);
         identities.sort();
         identities.dedup();
         for identity in &identities {
-            // Only root can finish an already authorized, private rotation intent after reconfiguration.
-            // Registration alone never grants this exception to a new operation.
-            if !self.allowed(identity)
-                && !recovery
-                    .as_ref()
-                    .is_some_and(|skills| skills.contains(identity))
-            {
+            if !self.allowed(identity)? {
                 return Err(SkillSecError::ScopeDenied(identity.clone()));
             }
         }
-        identities
-            .iter()
-            .map(|identity| self.environment.resolve(identity, deadline))
-            .collect()
+        let mut roots = Vec::new();
+        for identity in identities {
+            match self.environment.resolve(&identity, deadline) {
+                Ok(root) => roots.push(root),
+                Err(SkillSecError::Timeout) => return Err(SkillSecError::Timeout),
+                Err(error) if aggregate => errors.push(DiscoveryError {
+                    root: identity,
+                    error: error.to_string(),
+                }),
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(PreparedRoots { roots, errors })
     }
 
     fn run(
@@ -207,6 +269,9 @@ impl SkillSecExecutor {
                 } else {
                     Ok((service.scan(root()?, &options, deadline)?, 0))
                 }
+            }
+            SkillSecCommand::StartupScan { .. } => {
+                service.scan_batch(roots, &ScanOptions::default(), deadline)
             }
             SkillSecCommand::Certify {
                 scanner,
@@ -265,9 +330,9 @@ impl SkillSecExecutor {
             )),
             SkillSecCommand::Activate { .. } => Ok((service.activate(root()?, deadline)?, 0)),
             SkillSecCommand::Reconcile { .. } => Ok((service.reconcile(root()?, deadline)?, 0)),
-            SkillSecCommand::RotateKeys {} => {
-                Ok((service.rotate_keys(roots, request.caller_uid, deadline)?, 0))
-            }
+            SkillSecCommand::RotateKeys {} => Err(SkillSecError::Unsupported(
+                "key rotation is not supported".into(),
+            )),
         }
     }
     fn list_scanners(&self) -> (Value, i64) {
@@ -328,7 +393,7 @@ impl SkillSecExecutor {
         } else {
             "healthy"
         };
-        let mut value = json!({"command":"status","keys":keys,"config":{"managedSkillDirPatterns":service.config.managed_skill_dirs.len(),"registeredScanners":service.scanners().scanners().iter().map(|s| &s.name).collect::<Vec<_>>()},"skills":{"discovered":results.len(),"breakdown":breakdown,"health":health}});
+        let mut value = json!({"command":"status","keys":keys,"config":{"managedSkillDirPatterns":service.config()?.patterns().count(),"registeredScanners":service.scanners().scanners().iter().map(|s| &s.name).collect::<Vec<_>>()},"skills":{"discovered":results.len(),"breakdown":breakdown,"health":health}});
         if verbose {
             value["results"] = json!(results);
         }
@@ -356,15 +421,34 @@ impl CapabilityExecutor for SkillSecExecutor {
         let result = if control.cancelled {
             Err(SkillSecError::Timeout)
         } else {
-            self.prepare(request, control.deadline).and_then(|roots| {
-                skill_count = roots.len();
-                self.run(request, &roots, control.deadline)
-            })
+            self.prepare(request, control.deadline)
+                .and_then(|prepared| {
+                    skill_count = prepared.roots.len();
+                    let (mut data, mut code) = if prepared.roots.is_empty()
+                        && !prepared.errors.is_empty()
+                        && !matches!(request.command, SkillSecCommand::Status { .. })
+                    {
+                        // Preserve discovery errors instead of replacing them with an empty-batch error.
+                        // No scan or baseline key may be created for an entirely failed selection.
+                        (json!({"command": request.command.name(), "results": []}), 1)
+                    } else {
+                        self.run(request, &prepared.roots, control.deadline)?
+                    };
+                    if !prepared.errors.is_empty() {
+                        data["discoveryErrors"] = json!(prepared.errors);
+                        if matches!(request.command, SkillSecCommand::Status { .. }) {
+                            data["skills"]["health"] = json!("critical");
+                        }
+                        code = 1;
+                    }
+                    Ok((data, code))
+                })
         };
         let mut outcome = match result {
             Ok((data, exit_code)) => {
                 let failed_execution = exit_code != 0
-                    && (data["status"] == "error"
+                    && (discovery_failed(&data)
+                        || data["status"] == "error"
                         || data["results"]
                             .as_array()
                             .is_some_and(|items| items.iter().any(|v| v["status"] == "error")));
@@ -405,6 +489,17 @@ fn event_verdict(command: &SkillSecCommand, output: &Value) -> Option<&'static s
         "tampered",
         "error",
     ];
+    if discovery_failed(output)
+        && matches!(
+            command,
+            SkillSecCommand::Init { .. }
+                | SkillSecCommand::Scan { .. }
+                | SkillSecCommand::Check { .. }
+                | SkillSecCommand::StartupScan { .. }
+        )
+    {
+        return Some("error");
+    }
     let known = |value: &Value| {
         VERDICTS
             .iter()
@@ -415,6 +510,7 @@ fn event_verdict(command: &SkillSecCommand, output: &Value) -> Option<&'static s
         SkillSecCommand::Init { .. }
         | SkillSecCommand::Scan { .. }
         | SkillSecCommand::Check { .. }
+        | SkillSecCommand::StartupScan { .. }
             if output["results"].is_array() =>
         {
             output["results"]
@@ -461,7 +557,7 @@ pub fn error_outcome(error: &SkillSecError) -> ActionOutcome {
     let kind = match error {
         SkillSecError::PermissionDenied | SkillSecError::ScopeDenied(_) => "PermissionDenied",
         SkillSecError::Busy => "Busy",
-        SkillSecError::RotationPending => "RotationPending",
+        SkillSecError::Unsupported(_) => "NotImplementedError",
         SkillSecError::Timeout => "TimeoutError",
         SkillSecError::Invalid(_) | SkillSecError::Json(_) => "ValueError",
         SkillSecError::Io { source, .. } if source.kind() == std::io::ErrorKind::NotFound => {
@@ -523,6 +619,9 @@ impl AuditProjector for SkillSecAuditProjector {
         if let Some(items) = output["results"].as_array() {
             result.insert("resultCount".into(), json!(items.len()));
         }
+        if let Some(errors) = output["discoveryErrors"].as_array() {
+            result.insert("discoveryErrorCount".into(), json!(errors.len()));
+        }
         if let Some(verdict) = event_verdict(&request.command, output) {
             result.insert("verdict".into(), json!(verdict));
         }
@@ -577,11 +676,12 @@ mod tests {
         let environment = Arc::new(RejectingEnvironment(AtomicUsize::new(0)));
         let executor = SkillSecExecutor::new(service.clone()).with_environment(environment.clone());
         let request = SkillSecRequest {
-            command: SkillSecCommand::Init {
-                baseline: true,
-                force_keys: true,
-                skill_dirs: vec![root.identity.clone()],
+            command: SkillSecCommand::Scan {
+                skill_dir: Some(root.identity.clone()),
+                all: false,
+                skill_dirs: vec![],
                 scanners: None,
+                force: false,
             },
             caller_uid: 0,
         };
@@ -595,7 +695,14 @@ mod tests {
         assert_eq!(outcome.error_type, "IntegrityError");
         assert_eq!(environment.0.load(Ordering::Acquire), 1);
         assert_eq!(service.active_requests.load(Ordering::Acquire), 0);
-        assert!(!service.config.state_dir.join("signing-key.pk8").exists());
+        assert!(
+            !service
+                .config()
+                .unwrap()
+                .state_dir
+                .join("signing-key.pk8")
+                .exists()
+        );
         assert!(!root.io_dir.join(".skill-meta").exists());
         let audit = SkillSecAuditProjector
             .project(&request, &outcome)
@@ -653,7 +760,14 @@ mod tests {
         }
         assert_eq!(environment.0.load(Ordering::Acquire), 0);
         assert_eq!(service.active_requests.load(Ordering::Acquire), 0);
-        assert!(!service.config.state_dir.join("signing-key.pk8").exists());
+        assert!(
+            !service
+                .config()
+                .unwrap()
+                .state_dir
+                .join("signing-key.pk8")
+                .exists()
+        );
         assert!(!root.io_dir.join(".skill-meta").exists());
     }
 
@@ -680,12 +794,8 @@ mod tests {
 
     #[test]
     fn authenticated_mapping_keeps_the_source_identity_and_status_health() {
-        let (_temporary, mut service, physical) = uninitialized_fixture();
-        Arc::get_mut(&mut service)
-            .unwrap()
-            .config
-            .managed_skill_dirs
-            .clear();
+        let (_temporary, service, physical) = uninitialized_fixture();
+        service.config.lock().unwrap().managed_skill_dirs.clear();
         let identity =
             crate::SkillIdentity::new(physical.io_dir.with_file_name("source-alias")).unwrap();
         let root = SkillRoot::resolved(identity.clone(), physical.io_dir).unwrap();
@@ -695,20 +805,43 @@ mod tests {
             deadline: deadline(),
             cancelled: false,
         };
+        service.initialize().unwrap();
+        assert_eq!(service.show(&root, deadline()).unwrap()["managed"], false);
         let request = SkillSecRequest {
             command: SkillSecCommand::Certify {
                 skill_dir: identity.clone(),
                 scanner: "custom".into(),
                 scanner_version: None,
-                findings: json!([]),
+                findings: json!([{"rule":"risk","level":"deny","message":"unsafe"}]),
             },
             caller_uid: 1001,
         };
         let outcome = executor.execute(&control, &request);
         assert!(outcome.success, "{outcome:?}");
         assert_eq!(outcome.data["skillCount"], 1);
-        assert_eq!(service.managed_skills().unwrap(), vec![identity]);
-        assert_eq!(service.check(&root, deadline()).unwrap()["status"], "pass");
+        let shown = service.show(&root, deadline()).unwrap();
+        assert_eq!(shown["managed"], true);
+        assert_eq!(shown["latestStatus"], "deny");
+        assert_eq!(shown["findings"].as_array().unwrap().len(), 1);
+        assert!(
+            !service
+                .config()
+                .unwrap()
+                .state_dir
+                .join("managed-skills.json")
+                .exists()
+        );
+        service
+            .config
+            .lock()
+            .unwrap()
+            .managed_skill_dirs
+            .push(crate::ManagedSkillDir::new(identity.path()).unwrap());
+        assert_eq!(
+            executor.discover(deadline()).unwrap().skills,
+            vec![identity]
+        );
+        assert_eq!(service.check(&root, deadline()).unwrap()["status"], "deny");
         let status = executor.execute(
             &control,
             &SkillSecRequest {
@@ -899,6 +1032,7 @@ mod tests {
         let service = Arc::new(
             SkillSecService::new(
                 crate::SkillSecConfig {
+                    default_skill_dirs: Vec::new(),
                     state_dir: directory.path().canonicalize().unwrap(),
                     managed_skill_dirs: Vec::new(),
                 },

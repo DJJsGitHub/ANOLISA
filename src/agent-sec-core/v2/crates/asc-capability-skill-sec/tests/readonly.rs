@@ -2,7 +2,7 @@
 //! Mounts exist only in a child mount namespace; the daemon itself needs no mount capability.
 
 use asc_action_runtime::{CapabilityExecutor as _, ExecutionControl};
-use asc_action_types::SkillSecRequest;
+use asc_action_types::{SkillIdentity, SkillSecCommand, SkillSecRequest};
 use asc_capability_skill_sec::{
     ManagedSkillDir, SkillSecConfig, SkillSecService, executor::SkillSecExecutor,
     scanner::ScannerRegistry,
@@ -51,6 +51,7 @@ fn service(state: &Path, pattern: &Path) -> Arc<SkillSecService> {
     Arc::new(
         SkillSecService::new(
             SkillSecConfig {
+                default_skill_dirs: Vec::new(),
                 state_dir: state.to_owned(),
                 managed_skill_dirs: vec![ManagedSkillDir::new(pattern).unwrap()],
             },
@@ -105,10 +106,9 @@ fn readonly_system_batches_skip_without_weakening_explicit_writes() {
     // Mode bits alone must not skip a root-writable Skill.
     fs::set_permissions(&writable, fs::Permissions::from_mode(0o555)).unwrap();
     bind_readonly(&readonly, &readonly);
+    let write_error = fs::write(readonly.join("probe"), "").unwrap_err();
     assert_eq!(
-        fs::write(readonly.join("probe"), "")
-            .unwrap_err()
-            .raw_os_error(),
+        write_error.raw_os_error(),
         Some(rustix::io::Errno::ROFS.raw_os_error())
     );
     let state = temp.path().join("state");
@@ -134,7 +134,25 @@ fn readonly_system_batches_skip_without_weakening_explicit_writes() {
         assert!(!readonly.join(".skill-meta").exists());
         assert!(writable.join(".skill-meta/latest.json").is_file());
     }
-    assert_eq!(service.managed_skills().unwrap().len(), 1);
+    let startup = executor.execute(
+        &ExecutionControl {
+            deadline: Instant::now() + Duration::from_secs(30),
+            cancelled: false,
+        },
+        &SkillSecRequest {
+            command: SkillSecCommand::StartupScan {
+                skill_dir: SkillIdentity::new(&readonly).unwrap(),
+            },
+            caller_uid: 0,
+        },
+    );
+    assert!(startup.success, "{startup:?}");
+    assert_eq!(
+        startup.data["output"]["results"][0]["reasonCode"],
+        "readonly_system_skill"
+    );
+    assert!(!readonly.join(".skill-meta").exists());
+    assert!(!state.join("managed-skills.json").exists());
     assert!(!run(&executor, json!({"command":"scan", "skillDir":readonly})).success);
     // The same EROFS storage outside the default location remains a batch error.
     let ordinary = share.join("anolisa/skills/readonly");

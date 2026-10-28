@@ -57,7 +57,9 @@ def test_dproc_013_systemd_lifecycle(request):
         state = Path("/var/lib") / name
         audit = Path("/var/log") / name
         config = staging / "skillsec.json"
-        config.write_text(json.dumps({"stateDir": str(state)}))
+        config.write_text(
+            json.dumps({"stateDir": str(state), "enableDefaultSkillDirs": False})
+        )
         config.chmod(0o600)
         unit_path = Path("/run/systemd/system") / unit
         template = (ROOT / "packaging/systemd/agent-sec-core-v2.service.in").read_text()

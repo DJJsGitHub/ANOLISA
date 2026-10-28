@@ -17,7 +17,7 @@
     {
       "name": "uninitialized-system",
       "request": {"method": "action.skill_sec", "params": {"command": "status"}},
-      "response": {"requestId": "fixture", "result": {"success": true, "exitCode": 0, "error": null, "errorType": "", "data": {"keys": {"initialized": false, "fingerprint": null, "encrypted": false, "keyringSize": 0, "rotationPending": false}, "skills": {"discovered": 0, "health": "empty"}}}},
+      "response": {"requestId": "fixture", "result": {"success": true, "exitCode": 0, "error": null, "errorType": "", "data": {"keys": {"initialized": false, "fingerprint": null, "encrypted": false, "keyringSize": 0}, "skills": {"discovered": 0, "health": "empty"}}}},
       "exitCode": 0, "stderrContains": ""
     },
     {
@@ -41,8 +41,14 @@
     {
       "name": "execution-failure",
       "request": {"method": "action.skill_sec", "params": {"command": "rotate-keys"}},
-      "response": {"requestId": "fixture", "result": {"success": false, "exitCode": 1, "error": "SkillSec operation requires root administrator", "errorType": "PermissionDenied", "data": {"status": "error", "error": "SkillSec operation requires root administrator"}}},
-      "exitCode": 1, "stderrContains": "root administrator"
+      "response": {"requestId": "fixture", "result": {"success": false, "exitCode": 1, "error": "unsupported SkillSec operation: key rotation and force-keys are not supported", "errorType": "NotImplementedError", "data": {"status": "error", "error": "unsupported SkillSec operation: key rotation and force-keys are not supported"}}},
+      "exitCode": 1, "stderrContains": "not supported"
+    },
+    {
+      "name": "unsupported-force-keys",
+      "request": {"method": "action.skill_sec", "params": {"command": "init", "forceKeys": true}},
+      "response": {"requestId": "fixture", "result": {"success": false, "exitCode": 1, "error": "unsupported SkillSec operation: key rotation and force-keys are not supported", "errorType": "NotImplementedError", "data": {"status": "error", "error": "unsupported SkillSec operation: key rotation and force-keys are not supported"}}},
+      "exitCode": 1, "stderrContains": "not supported"
     },
     {
       "name": "committed-activation-pending",

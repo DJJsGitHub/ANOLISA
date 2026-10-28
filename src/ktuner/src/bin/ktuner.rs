@@ -241,6 +241,12 @@ fn cmd_check(
             "security": counts.sec,
             "high_confidence": counts.high,
             "writable": counts.writable,
+            // The performance findings in each `--category` bucket; security
+            // findings are counted once, under `security`.
+            "network": counts.net,
+            "memory": counts.mem,
+            "io": counts.io,
+            "cpu": counts.cpu,
         },
         "system": system_json(&info),
         "environment": format!("{runtime_env}"),
@@ -265,6 +271,11 @@ fn cmd_check(
 /// (`hidden`, `holders`, `available_schedulers`), so a suggestion those
 /// rules did not make can be explained from the report alone.
 ///
+/// A queue attribute the engine could not read (`read_ahead_kb`,
+/// `nr_requests`, `rq_affinity`) prints as 0, the value the key has always
+/// carried in that case, so the key keeps its type; the rules see the missing
+/// reading and do not advise on it.
+///
 /// `cpu_cores` and `memory_gb` are the effective values the rules scale by,
 /// clamped to the cgroup limits that bind the process; `cpu_cores_host` and
 /// `memory_gb_host` are the host's own readings, so a report tells whether
@@ -279,9 +290,9 @@ fn system_json(info: &detect::SystemInfo) -> serde_json::Value {
                 "type": disk.disk_type.to_string(),
                 "scheduler": disk.scheduler,
                 "available_schedulers": disk.available_schedulers,
-                "nr_requests": disk.nr_requests,
-                "read_ahead_kb": disk.read_ahead_kb,
-                "rq_affinity": disk.rq_affinity,
+                "nr_requests": disk.nr_requests.unwrap_or(0),
+                "read_ahead_kb": disk.read_ahead_kb.unwrap_or(0),
+                "rq_affinity": disk.rq_affinity.unwrap_or(0),
                 "hidden": disk.hidden,
                 "holders": disk.holders,
             })
@@ -5100,9 +5111,12 @@ mod tests {
                 entry["available_schedulers"],
                 json!(disk.available_schedulers)
             );
-            assert_eq!(entry["nr_requests"], json!(disk.nr_requests));
-            assert_eq!(entry["read_ahead_kb"], json!(disk.read_ahead_kb));
-            assert_eq!(entry["rq_affinity"], json!(disk.rq_affinity));
+            assert_eq!(entry["nr_requests"], json!(disk.nr_requests.unwrap_or(0)));
+            assert_eq!(
+                entry["read_ahead_kb"],
+                json!(disk.read_ahead_kb.unwrap_or(0))
+            );
+            assert_eq!(entry["rq_affinity"], json!(disk.rq_affinity.unwrap_or(0)));
             assert_eq!(entry["hidden"], json!(disk.hidden));
             assert_eq!(entry["holders"], json!(disk.holders));
         }

@@ -1,4 +1,6 @@
 #[cfg(target_os = "linux")]
+pub(crate) mod cpu_budget;
+#[cfg(target_os = "linux")]
 pub mod decompress;
 #[cfg(target_os = "linux")]
 pub mod process;
@@ -53,3 +55,10 @@ mod tests {
         );
     }
 }
+
+pub(crate) mod retained;
+#[cfg(target_os = "linux")]
+pub(crate) mod stream_decode;
+
+#[cfg(target_os = "linux")]
+mod brotli_alloc;

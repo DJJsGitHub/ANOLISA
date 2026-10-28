@@ -3,7 +3,9 @@
 use super::*;
 use asc_action_runtime::{Finalizer, SecurityEventSink, testing::audit_finalizer};
 use asc_capability_skill_sec::{
-    SkillSecConfig, SkillSecService, executor::SkillSecExecutor, scanner::ScannerRegistry,
+    SkillSecConfig, SkillSecService,
+    executor::{SkillDiscovery, SkillSecExecutor},
+    scanner::ScannerRegistry,
 };
 use asc_daemon_core::RootManagedPrincipalPolicy;
 use asc_daemon_service::{BoundUnixSocket, ServiceConfig, ShutdownToken, UnixService};
@@ -42,7 +44,7 @@ fn start_bridge(
         Arc::new(asc_capability_pii_scan::PiiRuleSet::builtin().unwrap()),
         executor,
     );
-    worker.start(application, || Ok(Vec::new()))?;
+    worker.start(application, || Ok(SkillDiscovery::default()))?;
     Ok((bridge, worker))
 }
 
@@ -143,8 +145,12 @@ impl Fixture {
         Arc::new(
             SkillSecService::new(
                 SkillSecConfig {
+                    default_skill_dirs: Vec::new(),
                     state_dir: state,
-                    managed_skill_dirs: Vec::new(),
+                    managed_skill_dirs: vec![
+                        asc_capability_skill_sec::ManagedSkillDir::new(self.canonical.join("demo"))
+                            .unwrap(),
+                    ],
                 },
                 ScannerRegistry::default(),
             )
@@ -360,106 +366,6 @@ fn resolver_accepts_reserved_leaf_inside_a_category_only() {
 }
 
 #[test]
-fn rotation_commands_resolve_current_inodes_and_retain_failed_intents() {
-    for command in [
-        json!({"command":"rotate-keys"}),
-        json!({"command":"init","forceKeys":true,"baseline":false}),
-        json!({"command":"init","forceKeys":true,"baseline":true}),
-    ] {
-        let fixture = Fixture::new();
-        let events = Arc::new(Events::default());
-        let service = fixture.service();
-        let finalizer = audit_finalizer(events);
-        let (bridge, worker) =
-            start_bridge(fixture.config(), service.clone(), finalizer.clone()).unwrap();
-        let bridge = Arc::new(bridge);
-        let identity = SkillIdentity::new(fixture.canonical.join("demo")).unwrap();
-        let deadline = || Instant::now() + Duration::from_secs(5);
-        let root = bridge.resolve(&identity, deadline()).unwrap();
-        service.initialize().unwrap();
-        service
-            .certify(&root, "fixture", None, &json!([]), deadline())
-            .unwrap();
-        let before = service.key_status(deadline()).unwrap()["fingerprint"].clone();
-        let intent = fixture.directory.path().join("state/key-rotation.json");
-        fs::write(
-            &intent,
-            serde_json::to_vec(&json!({
-                "previous_fingerprint":before,"skills":[identity]
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-        fs::set_permissions(&intent, fs::Permissions::from_mode(0o600)).unwrap();
-        let parked = fixture.live.join("parked");
-        fs::rename(&root.io_dir, &parked).unwrap();
-        fs::create_dir(&root.io_dir).unwrap();
-        for name in ["SKILL.md", ".skill-meta"] {
-            fs::rename(parked.join(name), root.io_dir.join(name)).unwrap();
-        }
-        assert_ne!(
-            fs::metadata(&root.io_dir).unwrap().ino(),
-            fs::metadata(&parked).unwrap().ino()
-        );
-        assert!(
-            service
-                .rotate_keys(std::slice::from_ref(&root), 0, deadline())
-                .is_err()
-        );
-        let application = crate::skill_application(
-            finalizer,
-            Arc::new(asc_capability_pii_scan::PiiRuleSet::builtin().unwrap()),
-            SkillSecExecutor::new(service.clone()).with_environment(bridge.environment()),
-        );
-        let dispatcher = ordinary_dispatcher(application);
-        let invoke = || {
-            serde_json::to_value(dispatcher.handle_with_control(
-                asc_daemon_protocol::RequestId::new("rotation").unwrap(),
-                asc_daemon_core::PeerCredentials::new(0, 0, 1),
-                &asc_daemon_service::DispatchControl::new(deadline()),
-                asc_daemon_protocol::DaemonRequest {
-                    method: "action.skill_sec".into(),
-                    params: command.clone(),
-                    trace_context: None,
-                    compatibility: None,
-                },
-            ))
-            .unwrap()
-        };
-        fixture.mode.store(1, Ordering::Release);
-        assert_eq!(invoke()["result"]["success"], false);
-        assert_eq!(
-            service.key_status(deadline()).unwrap()["fingerprint"],
-            before
-        );
-        assert!(intent.exists());
-        assert!(matches!(
-            service.check(&root, deadline()),
-            Err(SkillSecError::RotationPending)
-        ));
-        fixture.mode.store(0, Ordering::Release);
-        let result = invoke();
-        assert_eq!(result["result"]["success"], true, "{command}: {result}");
-        assert_ne!(
-            service.key_status(deadline()).unwrap()["fingerprint"],
-            before
-        );
-        assert!(!intent.exists());
-        let resolved = bridge.resolve(&identity, deadline()).unwrap();
-        let expected = if command["baseline"] == true {
-            "pass"
-        } else {
-            "tampered"
-        };
-        assert_eq!(
-            service.check(&resolved, deadline()).unwrap()["status"],
-            expected
-        );
-        worker.shutdown().unwrap();
-    }
-}
-
-#[test]
 fn configuration_and_secret_validation_reject_unsafe_bindings() {
     let fixture = Fixture::new();
     let mut config = fixture.config();
@@ -501,7 +407,7 @@ async fn public_socket_authenticates_notify_and_keeps_v2_requests_separate() {
         executor,
     );
     worker
-        .start(application.clone(), || Ok(Vec::new()))
+        .start(application.clone(), || Ok(SkillDiscovery::default()))
         .unwrap();
     let dispatcher = Arc::new(SkillFsDispatcher::new(
         ordinary_dispatcher(application),
@@ -700,7 +606,7 @@ async fn assert_restart_and_failed_mapping(
     fixture: &Fixture,
     bridge: &SkillFsBridge,
     worker: &SkillWorker,
-    service: &SkillSecService,
+    service: &Arc<SkillSecService>,
     socket: &Path,
 ) {
     fs::write(
@@ -710,7 +616,13 @@ async fn assert_restart_and_failed_mapping(
     .unwrap();
     worker
         .queue
-        .schedule_startup(service.managed_skills().unwrap())
+        .schedule_startup(
+            SkillSecExecutor::new(service.clone())
+                .with_environment(bridge.environment())
+                .discover(Instant::now() + Duration::from_secs(5))
+                .unwrap()
+                .skills,
+        )
         .unwrap();
     tokio::time::timeout(Duration::from_secs(10), async {
         while bridge.status()["processed"].as_u64().unwrap() < 2 {
@@ -740,14 +652,20 @@ async fn assert_activation_after_scan_error(
     fixture: &Fixture,
     bridge: &SkillFsBridge,
     worker: &SkillWorker,
-    service: &SkillSecService,
+    service: &Arc<SkillSecService>,
     events: &Events,
 ) {
     fs::remove_file(fixture.live.join("demo/SKILL.md")).unwrap();
     let before = events.0.lock().unwrap().len();
     worker
         .queue
-        .schedule_startup(service.managed_skills().unwrap())
+        .schedule_startup(
+            SkillSecExecutor::new(service.clone())
+                .with_environment(bridge.environment())
+                .discover(Instant::now() + Duration::from_secs(5))
+                .unwrap()
+                .skills,
+        )
         .unwrap();
     tokio::time::timeout(Duration::from_secs(10), async {
         while bridge.status()["processed"].as_u64().unwrap() < 3 {
@@ -786,7 +704,7 @@ async fn an_acceptance_whose_echo_exceeds_the_session_frame_is_delivered_degrade
         executor,
     );
     worker
-        .start(application.clone(), || Ok(Vec::new()))
+        .start(application.clone(), || Ok(SkillDiscovery::default()))
         .unwrap();
     let dispatcher = Arc::new(SkillFsDispatcher::new(
         ordinary_dispatcher(application),

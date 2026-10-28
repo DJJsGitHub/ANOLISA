@@ -563,6 +563,52 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_response_empty_usage_object() {
+        // A non-streaming /v1/messages response may carry `"usage": {}`.
+        // The fields must default to 0 instead of failing deserialization —
+        // a parse failure used to drop the real response_id and strand the
+        // completion path (issue #7553).
+        let json = serde_json::json!({
+            "id": "msg_empty_usage",
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "text", "text": "hi"}],
+            "model": "claude-3-opus-20240229",
+            "usage": {}
+        });
+
+        let response = AnthropicParser::parse_response(&json);
+        assert!(response.is_some());
+
+        let response = response.unwrap();
+        assert_eq!(response.id, "msg_empty_usage");
+        assert_eq!(response.usage.input_tokens, 0);
+        assert_eq!(response.usage.output_tokens, 0);
+    }
+
+    /// A response that omits `usage` entirely (as likely as `"usage": {}`
+    /// when the body is incomplete) must still parse and keep the response
+    /// id rather than failing deserialization (issue #7553 review).
+    #[test]
+    fn test_parse_response_without_usage_key() {
+        let json = serde_json::json!({
+            "id": "msg_no_usage",
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "text", "text": "hi"}],
+            "model": "claude-3-opus-20240229"
+        });
+
+        let response = AnthropicParser::parse_response(&json);
+        assert!(response.is_some());
+
+        let response = response.unwrap();
+        assert_eq!(response.id, "msg_no_usage");
+        assert_eq!(response.usage.input_tokens, 0);
+        assert_eq!(response.usage.output_tokens, 0);
+    }
+
+    #[test]
     fn test_parse_response_with_unmodeled_block_keeps_the_text() {
         // Extended-thinking redaction adds a block type this build does not
         // model (`redacted_thinking`); the server-tool blocks do the same.
@@ -592,6 +638,89 @@ mod tests {
             "the answer text must survive the unmodeled block: {:?}",
             response.content
         );
+    }
+
+    /// A search-and-fetch answer is built almost entirely from server-tool
+    /// blocks: the model calls `server_tool_use` and the provider returns
+    /// `web_search_tool_result` / `web_fetch_tool_result`. Those spellings
+    /// used to fall into the catch-all `Unknown` variant, so a streamed
+    /// answer that only searched (no text before the call) aggregated to no
+    /// content at all, and `parse_response` returned `None` — the whole call
+    /// then had no output messages and reported `EmptyResponse`.
+    #[test]
+    fn test_parse_response_keeps_server_tool_blocks() {
+        let json = serde_json::json!({
+            "id": "msg_server_tools",
+            "type": "message",
+            "role": "assistant",
+            "content": [
+                {"type": "server_tool_use", "id": "srvtoolu_1", "name": "web_search",
+                 "input": {"query": "rust 2026"}},
+                {"type": "web_search_tool_result", "tool_use_id": "srvtoolu_1",
+                 "content": [{"type": "web_search_result", "url": "https://example.com"}]},
+                {"type": "text", "text": "Here is what I found."}
+            ],
+            "model": "claude-sonnet-4-5",
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 20, "output_tokens": 8}
+        });
+
+        let response = AnthropicParser::parse_response(&json)
+            .expect("a server-tool answer must not fail the whole response");
+
+        assert!(
+            response.content.iter().any(|block| matches!(
+                block,
+                AnthropicContentBlock::ToolUse { name, .. } if name == "web_search"
+            )),
+            "the server-side call must survive: {:?}",
+            response.content
+        );
+        assert!(
+            response.content.iter().any(|block| matches!(
+                block,
+                AnthropicContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == "srvtoolu_1"
+            )),
+            "the search result must survive: {:?}",
+            response.content
+        );
+    }
+
+    /// The streaming path builds the same blocks from `content_block_start`:
+    /// a server-tool-only stream used to aggregate into a text block holding
+    /// the deltas' input JSON, which is not the call the model made.
+    #[test]
+    fn test_aggregate_sse_keeps_a_server_tool_use_block() {
+        let events = serde_json::json!([
+            {"type": "message_start", "message": {
+                "id": "msg_srv", "type": "message", "role": "assistant",
+                "model": "claude-sonnet-4-5", "content": [],
+                "usage": {"input_tokens": 10, "output_tokens": 0}}},
+            {"type": "content_block_start", "index": 0,
+             "content_block": {"type": "server_tool_use", "id": "srvtoolu_1",
+                               "name": "web_search", "input": {}}},
+            {"type": "content_block_delta", "index": 0,
+             "delta": {"type": "input_json_delta", "partial_json": "{\"query\":\"rust\"}"}},
+            {"type": "content_block_stop", "index": 0},
+            {"type": "message_delta", "delta": {"stop_reason": "end_turn"},
+             "usage": {"output_tokens": 5}}
+        ]);
+
+        let resp = AnthropicParser::parse_response(&events).expect("the stream must aggregate");
+        assert_eq!(
+            resp.content.len(),
+            1,
+            "the server-side call must not be dropped: {:?}",
+            resp.content
+        );
+        match &resp.content[0] {
+            AnthropicContentBlock::ToolUse { id, name, input } => {
+                assert_eq!(id, "srvtoolu_1");
+                assert_eq!(name, "web_search");
+                assert_eq!(input, &serde_json::json!({"query": "rust"}));
+            }
+            other => panic!("a server_tool_use stream must keep the call, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1021,6 +1150,41 @@ mod tests {
         assert_eq!(response.usage.output_tokens, 105);
         assert_eq!(response.usage.cache_creation_input_tokens, Some(100));
         assert_eq!(response.usage.cache_read_input_tokens, Some(20565));
+    }
+
+    /// DashScope-compatible streams slim the `message_start` event down to the
+    /// model and usage counters; the id, type and role the official API sends
+    /// are absent. The same shape is what the genai SSE-enrichment tests feed
+    /// in for DashScope. The typed event used to fail deserialization and be
+    /// skipped whole, so the aggregated response lost the model and the
+    /// preliminary input/cache snapshot whenever the terminal delta reported
+    /// only `output_tokens`.
+    #[test]
+    fn test_aggregate_sse_accepts_a_slim_message_start() {
+        let events = serde_json::json!([
+            {"type": "message_start", "message": {
+                "model": "qwen3.7-max",
+                "usage": {"input_tokens": 1234, "output_tokens": 1}}},
+            {"type": "content_block_start", "index": 0,
+             "content_block": {"type": "text", "text": ""}},
+            {"type": "content_block_delta", "index": 0,
+             "delta": {"type": "text_delta", "text": "hi"}},
+            {"type": "content_block_stop", "index": 0},
+            {"type": "message_delta", "delta": {"stop_reason": "end_turn"},
+             "usage": {"output_tokens": 42}}
+        ]);
+
+        let resp = AnthropicParser::parse_response(&events).expect("the stream must aggregate");
+        assert_eq!(
+            resp.model, "qwen3.7-max",
+            "a slim message_start must still supply the model"
+        );
+        assert_eq!(
+            resp.usage.input_tokens, 1234,
+            "the start snapshot must survive an output-only terminal delta"
+        );
+        assert_eq!(resp.usage.output_tokens, 42);
+        assert_eq!(resp.content.len(), 1);
     }
 
     /// Test: SSE stream whose terminal `message_delta` reports only the cache

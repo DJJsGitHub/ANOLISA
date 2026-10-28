@@ -72,12 +72,17 @@ impl TokenParser {
         // (`promptTokenCount`/`candidatesTokenCount`, 2e018e7d9), so the
         // gate must recognize them too or a Gemini chunk split across TLS
         // records recovers nothing while every other provider still does.
+        // Its snake_case spellings are the gateway fallback the direct parse
+        // keeps, and they have to be gated on for the same reason: a buffer
+        // that names them is turned away before the scan ever sees it.
         if data.contains("\"input_tokens\"")
             || data.contains("\"output_tokens\"")
             || data.contains("\"prompt_tokens\"")
             || data.contains("\"completion_tokens\"")
             || data.contains("\"promptTokenCount\"")
             || data.contains("\"candidatesTokenCount\"")
+            || data.contains("\"prompt_token_count\"")
+            || data.contains("\"candidates_token_count\"")
         {
             let usage = Self::scan_partial_usage(data);
             if usage.is_some() {
@@ -91,32 +96,49 @@ impl TokenParser {
 
     /// Recover token usage fields from a possibly-truncated JSON string by
     /// scanning for the integer values that follow `"input_tokens"`,
-    /// `"output_tokens"`, etc. The first occurrence wins, which matches
-    /// dashscope's behaviour of placing the canonical `usage` block before
-    /// any `x_details` echo.
+    /// `"output_tokens"`, etc. The first *numeric* occurrence wins, which
+    /// matches dashscope's behaviour of placing the canonical `usage` block
+    /// before any `x_details` echo.
+    ///
+    /// A non-numeric occurrence is skipped: a committed Responses payload
+    /// echoes the request's `tools` before `usage`, so a tool parameter
+    /// named `input_tokens` appears there as an object schema. Stopping at
+    /// it lost the real count that followed.
     fn scan_partial_usage(data: &str) -> Option<TokenUsage> {
         fn find_u64(s: &str, key: &str) -> Option<u64> {
             let pat = format!("\"{key}\"");
-            let mut idx = s.find(&pat)?;
-            idx += pat.len();
-            let rest = s.get(idx..)?;
-            let rest = rest.trim_start();
-            let rest = rest.strip_prefix(':')?.trim_start();
-            let end = rest
-                .find(|c: char| !c.is_ascii_digit())
-                .unwrap_or(rest.len());
-            if end == 0 {
-                return None;
+            let mut search_from = 0usize;
+            while let Some(relative) = s.get(search_from..)?.find(&pat) {
+                let idx = search_from + relative + pat.len();
+                search_from = idx;
+                let rest = s.get(idx..)?.trim_start();
+                let Some(rest) = rest.strip_prefix(':').map(str::trim_start) else {
+                    continue;
+                };
+                let end = rest
+                    .find(|c: char| !c.is_ascii_digit())
+                    .unwrap_or(rest.len());
+                if end == 0 {
+                    continue;
+                }
+                if let Ok(value) = rest[..end].parse::<u64>() {
+                    return Some(value);
+                }
             }
-            rest[..end].parse::<u64>().ok()
+            None
         }
 
         // Gemini's wire counters are camelCase (`promptTokenCount` /
         // `candidatesTokenCount` under `usageMetadata`); the snake_case
-        // spellings stay as the gateway fallback, mirroring
-        // `extract_usage_object`'s Gemini arm.
-        let gemini_input = find_u64(data, "promptTokenCount");
-        let gemini_output = find_u64(data, "candidatesTokenCount");
+        // spellings are the gateway fallback `extract_usage_object`'s Gemini
+        // arm keeps, so the scan reads them the same way and in the same
+        // order. A gateway that spells them snake_case is the reason
+        // `detect_provider_from_usage` reads `prompt_token_count` as the
+        // Gemini signal.
+        let gemini_input =
+            find_u64(data, "promptTokenCount").or_else(|| find_u64(data, "prompt_token_count"));
+        let gemini_output = find_u64(data, "candidatesTokenCount")
+            .or_else(|| find_u64(data, "candidates_token_count"));
         let is_gemini = gemini_input.is_some() || gemini_output.is_some();
         let input = find_u64(data, "input_tokens")
             .or_else(|| find_u64(data, "prompt_tokens"))
@@ -429,6 +451,39 @@ mod tests {
         assert_eq!(usage.total_tokens(), 826, "reconciles with totalTokenCount");
     }
 
+    /// Gemini's counters have two spellings: the wire format is camelCase
+    /// (`promptTokenCount`/`candidatesTokenCount` under `usageMetadata`), and
+    /// the snake_case spellings are the gateway fallback `extract_usage_object`
+    /// keeps (the provider detector reads `prompt_token_count` as the Gemini
+    /// signal too). The continuation recovery was taught the camelCase pair
+    /// only, and its gate runs before the scan: a truncated chunk from such a
+    /// gateway is turned away before anything reads it, so the same payload
+    /// that parses cleanly one line above records no usage at all.
+    #[test]
+    fn test_scan_partial_usage_gemini_gateway_spellings() {
+        let parser = TokenParser::new();
+        // The same payload the gateway spells snake_case, complete.
+        let complete = r#"{"candidates":[{"content":{"parts":[{"text":"Hel"}],"role":"model"},"index":0}],"usageMetadata":{"prompt_token_count":57,"candidates_token_count":3,"total_token_count":60},"modelVersion":"gemini-2.5-flash"}"#;
+        let parsed = parser.parse_data(complete).expect("complete usage parses");
+        assert_eq!(parsed.input_tokens, 57);
+        assert_eq!(parsed.output_tokens, 3);
+        assert_eq!(parsed.provider, LLMProvider::Gemini);
+
+        // The last TLS record was cut, so the strict parse fails; the
+        // continuation recovery must reach the same counters.
+        let truncated = r#"data:{"candidates":[{"content":{"parts":[{"text":"Hel"}],"role":"model"},"index":0}],"usageMetadata":{"prompt_token_count":57,"candidates_token_count":3,"total_token_count":60"#;
+        let usage = parser
+            .parse_data(truncated)
+            .expect("truncated gateway-spelled gemini usage must still parse");
+        assert_eq!(usage.input_tokens, 57);
+        assert_eq!(usage.output_tokens, 3);
+        assert_eq!(
+            usage.provider,
+            LLMProvider::Gemini,
+            "the gateway spelling still bills like Gemini (cache sits inside the prompt count)"
+        );
+    }
+
     /// Regression guard from **real captured traffic**: Anthropic-protocol
     /// gateway responses carry `total_tokens` in `usage` but have no `output`
     /// envelope, so they must stay Anthropic.
@@ -521,6 +576,10 @@ mod tests {
         assert_eq!(usage.input_tokens, 100);
         assert_eq!(usage.output_tokens, 0);
         assert_eq!(usage.provider, LLMProvider::Anthropic);
+        // The model rides inside `message.model`; no streamed Anthropic event
+        // carries a top-level `model`, so reading only that key stored every
+        // Claude stream with an empty model in the token record.
+        assert_eq!(usage.model.as_deref(), Some("claude-3-opus"));
     }
 
     #[test]
@@ -822,6 +881,9 @@ mod tests {
         // OpenAI-style usage keys must keep the OpenAI provider label so
         // billed_input_tokens does not switch to the Anthropic formula.
         assert_eq!(usage.provider, LLMProvider::OpenAI);
+        // The model rides inside `response.model`; the event has no top-level
+        // `model`, so the token record kept an empty model for Responses calls.
+        assert_eq!(usage.model.as_deref(), Some("qwen3-coder-plus"));
     }
 
     #[test]
@@ -858,6 +920,21 @@ data:{"sequence_number":10,"type":"response.completed","response":{"usage":{"tot
         assert_eq!(usage.cache_creation_input_tokens, Some(10));
         assert_eq!(usage.cache_read_input_tokens, Some(20));
         assert_eq!(usage.provider, LLMProvider::Anthropic);
+    }
+
+    #[test]
+    fn test_scan_partial_usage_skips_a_tool_schema_key() {
+        // The Responses `response.completed` payload echoes the request's
+        // tool definitions before `usage`. A tool parameter named like a
+        // usage counter is an object schema, not a count; the scan used to
+        // stop there and record input=0 for a truncated buffer.
+        let data = r#"{"type":"response.completed","response":{"tools":[{"type":"function","function":{"name":"meter","parameters":{"type":"object","properties":{"input_tokens":{"type":"integer"},"output_tokens":{"type":"integer"}}}}}],"usage":{"input_tokens":57,"output_tokens":3"#;
+        let parser = TokenParser::new();
+        let usage = parser
+            .parse_data(data)
+            .expect("the real usage counters must still parse");
+        assert_eq!(usage.input_tokens, 57);
+        assert_eq!(usage.output_tokens, 3);
     }
 
     #[test]

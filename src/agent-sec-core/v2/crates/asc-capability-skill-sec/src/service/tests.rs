@@ -26,6 +26,7 @@ pub(crate) fn uninitialized_fixture() -> (tempfile::TempDir, Arc<SkillSecService
     let service = Arc::new(
         SkillSecService::new(
             SkillSecConfig {
+                default_skill_dirs: Vec::new(),
                 state_dir: state,
                 managed_skill_dirs: vec![crate::ManagedSkillDir::new(base.join("*")).unwrap()],
             },
@@ -51,7 +52,9 @@ fn empty_skill_queries_succeed_without_initializing_keys_or_ledger() {
             if initialized {
                 service.initialize().unwrap();
             }
-            let before = fs::read_dir(&service.config.state_dir).unwrap().count();
+            let before = fs::read_dir(&service.config().unwrap().state_dir)
+                .unwrap()
+                .count();
             let checked = service.check(&root, deadline()).unwrap();
             assert_eq!(checked["status"], "none");
             assert!(checked["versionId"].is_null());
@@ -60,7 +63,9 @@ fn empty_skill_queries_succeed_without_initializing_keys_or_ledger() {
             assert_eq!(audited["versions_checked"], 0);
             assert_eq!(audited["errors"], json!([]));
             assert_eq!(
-                fs::read_dir(&service.config.state_dir).unwrap().count(),
+                fs::read_dir(&service.config().unwrap().state_dir)
+                    .unwrap()
+                    .count(),
                 before
             );
             assert_eq!(root.io_dir.join(".skill-meta").exists(), empty_ledger);
@@ -74,10 +79,22 @@ fn empty_skill_queries_succeed_without_initializing_keys_or_ledger() {
                 );
             }
             assert_eq!(
-                service.config.state_dir.join("signing-key.pk8").exists(),
+                service
+                    .config()
+                    .unwrap()
+                    .state_dir
+                    .join("signing-key.pk8")
+                    .exists(),
                 initialized
             );
-            assert!(service.managed_skills().unwrap().is_empty());
+            assert!(
+                !service
+                    .config()
+                    .unwrap()
+                    .state_dir
+                    .join("managed-skills.json")
+                    .exists()
+            );
         }
     }
 }
@@ -102,7 +119,14 @@ fn incomplete_ledger_without_a_key_is_not_an_unscanned_skill() {
     fs::write(meta.join("latest.json"), "{}").unwrap();
     assert!(service.check(&root, deadline()).is_err());
     assert!(service.audit(&root, true, deadline()).is_err());
-    assert!(!service.config.state_dir.join("signing-key.pk8").exists());
+    assert!(
+        !service
+            .config()
+            .unwrap()
+            .state_dir
+            .join("signing-key.pk8")
+            .exists()
+    );
     service.initialize().unwrap();
     assert_eq!(
         service.check(&root, deadline()).unwrap()["status"],
@@ -120,7 +144,7 @@ fn existing_history_still_requires_a_valid_private_key() {
     service
         .certify(&root, "fixture", None, &json!([]), deadline())
         .unwrap();
-    let key_path = service.config.state_dir.join("signing-key.pk8");
+    let key_path = service.config().unwrap().state_dir.join("signing-key.pk8");
     let key = fs::read(&key_path).unwrap();
     fs::remove_file(&key_path).unwrap();
     assert!(service.check(&root, deadline()).is_err());
@@ -143,7 +167,7 @@ fn existing_history_still_requires_a_valid_private_key() {
 }
 
 #[test]
-fn empty_skill_queries_obey_skill_locks_and_rotation_fences() {
+fn empty_skill_queries_obey_skill_locks_and_ignore_removed_state() {
     let (_temporary, service, root) = uninitialized_fixture();
     let lock = service.skill_lock(&root.identity).unwrap();
     let guard = lock.lock().unwrap();
@@ -157,18 +181,27 @@ fn empty_skill_queries_obey_skill_locks_and_rotation_fences() {
     ));
     drop(guard);
     fs::write(
-        service.config.state_dir.join("key-rotation.json"),
+        service
+            .config()
+            .unwrap()
+            .state_dir
+            .join("key-rotation.json"),
         serde_json::to_vec(&json!({"previous_fingerprint":"previous","skills":[]})).unwrap(),
     )
     .unwrap();
-    assert!(matches!(
-        service.check(&root, deadline()),
-        Err(SkillSecError::RotationPending)
-    ));
-    assert!(matches!(
-        service.audit(&root, false, deadline()),
-        Err(SkillSecError::RotationPending)
-    ));
+    assert_eq!(service.check(&root, deadline()).unwrap()["status"], "none");
+    assert_eq!(
+        service.audit(&root, false, deadline()).unwrap()["valid"],
+        true
+    );
+    assert!(
+        service
+            .config()
+            .unwrap()
+            .state_dir
+            .join("key-rotation.json")
+            .is_file()
+    );
     assert!(!root.io_dir.join(".skill-meta").exists());
 }
 
@@ -206,52 +239,45 @@ fn ledger_snapshots_cannot_be_registered_as_skill_roots() {
 }
 
 #[test]
-fn retry_recovers_registration_failure_after_first_commit_without_a_new_version() {
-    let (_temporary, service, root) = fixture();
-    let registration = service.config.state_dir.join("managed-skills.json");
-    // A directory blocks registration's atomic rename after the real Ledger commit succeeds.
-    fs::create_dir(&registration).unwrap();
+fn configuration_save_failure_preserves_scan_result_and_activation() {
+    let (_temporary, mut service, root) = fixture();
+    let invalid_config = root.io_dir.join("SKILL.md");
+    let service_mut = Arc::get_mut(&mut service).unwrap();
+    service_mut.config_path = Some(invalid_config);
+    service_mut
+        .config
+        .get_mut()
+        .unwrap()
+        .managed_skill_dirs
+        .clear();
+    let result = service
+        .scan(&root, &ScanOptions::default(), deadline())
+        .unwrap();
+    assert_eq!(result["status"], "scanned");
     assert!(
-        service
-            .scan(&root, &ScanOptions::default(), deadline())
-            .is_err()
+        result["warnings"][0]
+            .as_str()
+            .unwrap()
+            .contains("could not be saved")
     );
+    assert!(root.io_dir.join(".skill-meta/activation.json").is_file());
     let latest_path = root.io_dir.join(".skill-meta/latest.json");
     let latest = fs::read(&latest_path).unwrap();
-    assert_eq!(service.check(&root, deadline()).unwrap()["status"], "pass");
-    assert!(service.managed_skills().unwrap().is_empty());
-    assert!(!root.io_dir.join(".skill-meta/activation.json").exists());
-
-    fs::remove_dir(&registration).unwrap();
-    let config = service.config.clone();
-    drop(service);
-    let restarted = SkillSecService::new(config.clone(), ScannerRegistry::default()).unwrap();
-    // Startup only discovers persisted registrations. The unacknowledged request needs retry.
-    assert!(restarted.managed_skills().unwrap().is_empty());
-    let retried = restarted
+    let retried = service
         .scan(&root, &ScanOptions::default(), deadline())
         .unwrap();
     assert_eq!(retried["status"], "noop");
     assert_eq!(retried["newVersion"], false);
-    assert_eq!(retried["versionId"], "v000001");
-    assert_eq!(fs::read(&latest_path).unwrap(), latest);
-    assert_eq!(
-        restarted.managed_skills().unwrap(),
-        vec![root.identity.clone()]
+    assert!(
+        retried["warnings"][0]
+            .as_str()
+            .unwrap()
+            .contains("could not be saved")
     );
-    assert!(root.io_dir.join(".skill-meta/activation.json").is_file());
-    drop(restarted);
-
-    let restarted = SkillSecService::new(config, ScannerRegistry::default()).unwrap();
-    for identity in restarted.managed_skills().unwrap() {
-        let result = restarted
-            .reconcile(&SkillRoot::direct(identity.path()).unwrap(), deadline())
-            .unwrap();
-        assert_eq!(result["reconciled"], true);
-        assert_eq!(result["repairedLatest"], false);
-    }
+    assert_eq!(fs::read(&latest_path).unwrap(), latest);
+    assert!(service.config().unwrap().managed_skill_dirs.is_empty());
     assert_eq!(
-        restarted.audit(&root, true, deadline()).unwrap()["versions_checked"],
+        service.audit(&root, true, deadline()).unwrap()["versions_checked"],
         1
     );
 }
@@ -264,7 +290,7 @@ fn staged_scan_ignores_later_live_edits_and_commit_recheck_rejects_them() {
     let content = Content::capture(&directory, false, deadline()).unwrap();
     let original = ScanTree::open(&root.io_dir, deadline()).unwrap();
     let (stage, tree) = content
-        .scan_tree(&service.config.state_dir, &original, deadline())
+        .scan_tree(&service.config().unwrap().state_dir, &original, deadline())
         .unwrap();
     fs::write(root.io_dir.join("run.sh"), "rm -rf /\n").unwrap();
     let scanned = service
@@ -522,7 +548,7 @@ fn concurrent_initializers_create_one_key_and_do_not_repair_invalid_keys() {
             .iter()
             .all(|result| result["keyFingerprint"] == results[0]["keyFingerprint"])
     );
-    let key_path = service.config.state_dir.join("signing-key.pk8");
+    let key_path = service.config().unwrap().state_dir.join("signing-key.pk8");
     fs::write(&key_path, "invalid-key").unwrap();
     assert!(matches!(
         service.initialize_with_deadline(deadline()),
@@ -775,4 +801,313 @@ fn failed_export_spares_a_competing_exports_completed_output() {
         3,
         "SKILL.md, run.sh and bulk.bin must all survive"
     );
+}
+
+struct RememberedMount(SkillRoot);
+impl crate::executor::SkillEnvironment for RememberedMount {
+    fn manages(&self, identity: &SkillIdentity) -> bool {
+        identity == &self.0.identity
+    }
+    fn resolve(&self, identity: &SkillIdentity, _: Instant) -> Result<SkillRoot, SkillSecError> {
+        assert_eq!(identity, &self.0.identity);
+        Ok(self.0.clone())
+    }
+}
+
+#[test]
+fn configuration_writeback_preserves_private_mode_and_restart_discovery() {
+    use crate::executor::SkillSecExecutor;
+    let (temporary, mut service, physical) = fixture();
+    let config_path = temporary.path().canonicalize().unwrap().join("custom.json");
+    let original =
+        json!({"managedSkillDirs":[],"parsers":{"custom":"generic"},"scanners":[],"skillfs":null});
+    fs::write(&config_path, serde_json::to_vec(&original).unwrap()).unwrap();
+    fs::set_permissions(&config_path, fs::Permissions::from_mode(0o600)).unwrap();
+    let inner = Arc::get_mut(&mut service).unwrap();
+    inner.config_path = Some(config_path.clone());
+    // Runtime defaults need not be copied into the persistent explicit list.
+    inner.config.get_mut().unwrap().managed_skill_dirs.clear();
+    inner.config.get_mut().unwrap().default_skill_dirs =
+        vec![crate::ManagedSkillDir::new("/runtime-default/*").unwrap()];
+    let root = SkillRoot::resolved(
+        SkillIdentity::new(physical.io_dir.with_file_name("canonical")).unwrap(),
+        physical.io_dir,
+    )
+    .unwrap();
+    let result = service
+        .scan(&root, &ScanOptions::default(), deadline())
+        .unwrap();
+    assert_eq!(service.show(&root, deadline()).unwrap()["managed"], true);
+    if rustix::process::geteuid().as_raw() != 0 {
+        assert!(
+            result["warnings"][0]
+                .as_str()
+                .unwrap()
+                .contains("could not be saved")
+        );
+        assert_eq!(
+            serde_json::from_slice::<Value>(&fs::read(&config_path).unwrap()).unwrap(),
+            original
+        );
+    } else {
+        assert!(result["warnings"].is_null(), "{result}");
+        let saved = crate::config::read_system_config(&config_path).unwrap();
+        assert_eq!(saved["managedSkillDirs"], json!([root.identity]));
+        assert_eq!(saved["parsers"], original["parsers"]);
+        assert_eq!(saved["scanners"], original["scanners"]);
+        assert_eq!(saved["skillfs"], original["skillfs"]);
+        assert_eq!(fs::metadata(&config_path).unwrap().mode() & 0o777, 0o600);
+        assert_eq!(fs::metadata(&config_path).unwrap().uid(), 0);
+        let environment = Arc::new(RememberedMount(root.clone()));
+        let executor = SkillSecExecutor::new(service.clone()).with_environment(environment.clone());
+        assert_eq!(
+            executor.discover(deadline()).unwrap().skills,
+            vec![root.identity.clone()]
+        );
+        assert_eq!(service.config().unwrap().managed_skill_dirs.len(), 1);
+        assert_eq!(service.config().unwrap().default_skill_dirs.len(), 1);
+        let unchanged = fs::metadata(&config_path).unwrap().ino();
+        assert_eq!(
+            service
+                .scan(&root, &ScanOptions::default(), deadline())
+                .unwrap()["status"],
+            "noop"
+        );
+        assert_eq!(fs::metadata(&config_path).unwrap().ino(), unchanged);
+        let restarted = Arc::new(
+            SkillSecService::new(
+                SkillSecConfig {
+                    default_skill_dirs: Vec::new(),
+                    state_dir: service.config().unwrap().state_dir,
+                    managed_skill_dirs: serde_json::from_value(saved["managedSkillDirs"].clone())
+                        .unwrap(),
+                },
+                ScannerRegistry::default(),
+            )
+            .unwrap()
+            .with_config_path(config_path)
+            .unwrap(),
+        );
+        assert_eq!(
+            SkillSecExecutor::new(restarted)
+                .with_environment(environment)
+                .discover(deadline())
+                .unwrap()
+                .skills,
+            vec![root.identity.clone()]
+        );
+        assert!(!root.identity.path().exists());
+        assert!(
+            !service
+                .config()
+                .unwrap()
+                .state_dir
+                .join("managed-skills.json")
+                .exists()
+        );
+        println!("root configuration writeback, 0600 ownership and exact mount restart verified");
+    }
+}
+
+#[test]
+fn configuration_writeback_serializes_concurrent_exact_paths() {
+    let (temporary, mut service, _) = fixture();
+    let base = temporary.path().canonicalize().unwrap();
+    let path = base.join("new-parent/custom.json");
+    let inner = Arc::get_mut(&mut service).unwrap();
+    inner.config_path = Some(path.clone());
+    inner.config.get_mut().unwrap().managed_skill_dirs.clear();
+    let handles: Vec<_> = (0..8)
+        .map(|index| {
+            let live = base.join(format!("live-{index}"));
+            fs::create_dir(&live).unwrap();
+            fs::write(live.join("SKILL.md"), "safe").unwrap();
+            let root = SkillRoot::resolved(
+                SkillIdentity::new(base.join(format!("canonical-{index}"))).unwrap(),
+                live,
+            )
+            .unwrap();
+            let service = service.clone();
+            std::thread::spawn(move || {
+                service
+                    .certify(&root, "custom", None, &json!([]), deadline())
+                    .unwrap()
+            })
+        })
+        .collect();
+    for handle in handles {
+        let result = handle.join().unwrap();
+        if rustix::process::geteuid().as_raw() == 0 {
+            assert!(result["warnings"].is_null(), "{result}");
+        } else {
+            assert!(
+                result["warnings"][0]
+                    .as_str()
+                    .unwrap()
+                    .contains("could not be saved")
+            );
+        }
+    }
+    if rustix::process::geteuid().as_raw() == 0 {
+        let saved = crate::config::read_system_config(&path).unwrap();
+        let patterns: Vec<crate::ManagedSkillDir> =
+            serde_json::from_value(saved["managedSkillDirs"].clone()).unwrap();
+        assert_eq!(patterns.len(), 8);
+        for index in 0..8 {
+            assert!(patterns.contains(
+                &crate::ManagedSkillDir::new(base.join(format!("canonical-{index}"))).unwrap()
+            ));
+        }
+        assert_eq!(service.config().unwrap().managed_skill_dirs, patterns);
+        assert_eq!(fs::metadata(path).unwrap().mode() & 0o777, 0o600);
+        println!("root concurrent exact path writeback verified");
+    } else {
+        assert!(!path.exists());
+        assert!(service.config().unwrap().managed_skill_dirs.is_empty());
+    }
+}
+
+#[test]
+fn configuration_writeback_rejects_unsafe_files_without_losing_risk_results() {
+    for kind in ["symlink", "hardlink", "writable", "oversized", "invalid"] {
+        let (temporary, mut service, physical) = fixture();
+        let base = temporary.path().canonicalize().unwrap();
+        let target = base.join("target.json");
+        let path = base.join("custom.json");
+        fs::write(&target, "{}").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o600)).unwrap();
+        match kind {
+            "symlink" => symlink(&target, &path).unwrap(),
+            "hardlink" => fs::hard_link(&target, &path).unwrap(),
+            "writable" => {
+                fs::write(&path, "{}").unwrap();
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o666)).unwrap();
+            }
+            "oversized" => fs::write(&path, " ".repeat(1024 * 1024 + 1)).unwrap(),
+            _ => fs::write(&path, "invalid JSON").unwrap(),
+        }
+        let before = fs::read(&path).unwrap();
+        let inner = Arc::get_mut(&mut service).unwrap();
+        inner.config_path = Some(path.clone());
+        inner.config.get_mut().unwrap().managed_skill_dirs.clear();
+        let root = SkillRoot::resolved(
+            SkillIdentity::new(base.join("canonical")).unwrap(),
+            physical.io_dir,
+        )
+        .unwrap();
+        let result = service
+            .certify(
+                &root,
+                "custom",
+                None,
+                &json!([{"rule":"risk","level":"deny","message":"unsafe"}]),
+                deadline(),
+            )
+            .unwrap();
+        assert!(
+            result["warnings"][0]
+                .as_str()
+                .unwrap()
+                .contains("could not be saved")
+        );
+        assert_eq!(service.check(&root, deadline()).unwrap()["status"], "deny");
+        assert_eq!(
+            service.show(&root, deadline()).unwrap()["latestStatus"],
+            "deny"
+        );
+        assert!(root.io_dir.join(".skill-meta/activation.json").exists());
+        assert_eq!(fs::read(&path).unwrap(), before);
+        assert_eq!(fs::read(&target).unwrap(), b"{}");
+        assert!(service.config().unwrap().managed_skill_dirs.is_empty());
+    }
+    if rustix::process::geteuid().as_raw() == 0 {
+        println!("root unsafe config link, mode, size and JSON rejection verified");
+    }
+}
+
+#[test]
+fn configuration_writeback_never_expands_literal_wildcard_identities() {
+    for name in ["*", "**"] {
+        let (temporary, mut service, physical) = fixture();
+        let base = temporary.path().canonicalize().unwrap();
+        let path = base.join("custom.json");
+        let original = b"{\"managedSkillDirs\":[]}";
+        fs::write(&path, original).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        let inner = Arc::get_mut(&mut service).unwrap();
+        inner.config_path = Some(path.clone());
+        inner.config.get_mut().unwrap().managed_skill_dirs.clear();
+        let root = SkillRoot::resolved(
+            SkillIdentity::new(base.join(name)).unwrap(),
+            physical.io_dir,
+        )
+        .unwrap();
+        let result = service
+            .certify(&root, "custom", None, &json!([]), deadline())
+            .unwrap();
+        assert!(
+            result["warnings"][0]
+                .as_str()
+                .unwrap()
+                .contains("exact managedSkillDirs entry")
+        );
+        assert_eq!(fs::read(path).unwrap(), original);
+        assert!(service.config().unwrap().managed_skill_dirs.is_empty());
+        assert_eq!(service.show(&root, deadline()).unwrap()["managed"], true);
+    }
+}
+
+#[test]
+fn configuration_writeback_remembers_only_the_processed_default_skill() {
+    use crate::executor::SkillSecExecutor;
+    use asc_action_runtime::{CapabilityExecutor as _, ExecutionControl};
+    use asc_action_types::SkillSecRequest;
+    let (temporary, mut service, root) = fixture();
+    let base = temporary.path().canonicalize().unwrap();
+    let path = base.join("custom.json");
+    fs::write(&path, "{\"managedSkillDirs\":[]}").unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+    let inner = Arc::get_mut(&mut service).unwrap();
+    inner.config_path = Some(path.clone());
+    let config = inner.config.get_mut().unwrap();
+    config.default_skill_dirs = std::mem::take(&mut config.managed_skill_dirs);
+    let executor = SkillSecExecutor::new(service.clone());
+    let invoke = |command| {
+        executor.execute(
+            &ExecutionControl {
+                deadline: deadline(),
+                cancelled: false,
+            },
+            &SkillSecRequest {
+                command: serde_json::from_value(command).unwrap(),
+                caller_uid: 1001,
+            },
+        )
+    };
+    let scanned = invoke(json!({"command":"scan","skillDir":root.identity}));
+    assert!(scanned.success, "{scanned:?}");
+    service.config.lock().unwrap().default_skill_dirs.clear();
+    if rustix::process::geteuid().as_raw() == 0 {
+        assert_eq!(
+            crate::config::read_system_config(&path).unwrap()["managedSkillDirs"],
+            json!([root.identity])
+        );
+        assert!(invoke(json!({"command":"check","skillDir":root.identity})).success);
+        assert_eq!(
+            invoke(json!({"command":"check","skillDir":base.join("sibling")})).error_type,
+            "PermissionDenied"
+        );
+        println!("root default directory exact memory and permanent authorization verified");
+    } else {
+        assert!(
+            scanned.data["output"]["warnings"][0]
+                .as_str()
+                .unwrap()
+                .contains("could not be saved")
+        );
+        assert_eq!(
+            invoke(json!({"command":"check","skillDir":root.identity})).error_type,
+            "PermissionDenied"
+        );
+    }
 }
