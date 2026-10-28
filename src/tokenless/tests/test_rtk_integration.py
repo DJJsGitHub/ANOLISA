@@ -110,6 +110,37 @@ class RtkIntegrationTest(unittest.TestCase):
             "capabilities": {"replace_output": True, "replace_with_text": True, "recovery": {"kind": recovery}},
         })
 
+    def test_source_previews_keep_native_line_windows(self) -> None:
+        source = "".join(
+            f"# Function {index}\n@decorator\ndef function_{index}():\n    return {index}\n\n"
+            for index in range(30)
+        )
+        (self.root / "source.py").write_text(source)
+        for command in (
+            "head -40 source.py",
+            "head -n 40 source.py",
+            "tail -40 source.py",
+            "wc -l source.py; head -40 source.py",
+            "cat source.py | head -40",
+            "env LANG=C timeout 10 head -40 source.py",
+        ):
+            with self.subTest(command=command):
+                result = self.protocol(
+                    "pre_tool",
+                    {
+                        "tool_name": "Bash",
+                        "arguments": {"command": command},
+                        "command_field": "command",
+                        "capabilities": {"replace_arguments": True},
+                    },
+                )
+                self.assertEqual(result["action"], "passthrough")
+                self.assertEqual(result["output_optimization"], "none")
+                self.assertEqual(result["arguments"]["command"], command)
+                self.assertEqual(
+                    self.execute(result["arguments"]["command"]), self.execute(command)
+                )
+
     def test_unchanged_local_html_keeps_file_origin_after_rewrite(self) -> None:
         content = "<html><body><main>" + "<p>Editable source markup.</p>" * 100 + "</main></body></html>"
         (self.root / "page.html").write_text(content)
