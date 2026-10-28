@@ -52,6 +52,37 @@ fn outcome(label: TrajectoryLabel, rules: &[&str]) -> TriageOutcome {
     }
 }
 
+fn insert_event_at(store: &ReuseStore, session_id: &str, created_at_ns: i64, reason: &str) {
+    let conn = store.lock().unwrap();
+    conn.execute(
+        "INSERT INTO session_label_events (
+            session_id, from_label, to_label, action, reason, decided_by, created_at_ns
+         ) VALUES (?1, 'unknown', 'good', 'auto_retriage', ?2, 'system', ?3)",
+        params![session_id, reason, created_at_ns],
+    )
+    .unwrap();
+}
+
+fn insert_large_auto_label(store: &ReuseStore, session_id: &str, updated_at_ns: i64) {
+    store
+        .upsert_auto_label(
+            session_id,
+            identity(),
+            outcome(TrajectoryLabel::Good, &[]),
+            "hash",
+            "v1",
+        )
+        .unwrap();
+    let conn = store.lock().unwrap();
+    conn.execute(
+        "UPDATE session_labels
+         SET auto_reason = ?2, updated_at_ns = ?3
+         WHERE session_id = ?1",
+        params![session_id, "x".repeat(24 * 1024), updated_at_ns],
+    )
+    .unwrap();
+}
+
 #[test]
 fn schema_is_created_and_reopening_is_a_no_op() {
     let path = tmp_dir("reopen").join("reuse.db");
@@ -534,6 +565,97 @@ fn rule_stats_separate_overrides_from_confirmations() {
 }
 
 #[test]
+fn confirming_an_overridden_row_keeps_it_overridden() {
+    // The dashboard offers Confirm on every row, including overridden ones.
+    // Re-confirming used to rewrite the row as `Confirmed`, which moved it
+    // from the `overridden` bucket to the `confirmed` one in
+    // `rule_override_stats` and understated the rule-misfire signal the
+    // statistics exist to measure.
+    let store = store("confirm-keeps-override");
+    for id in ["single", "batch"] {
+        store
+            .upsert_auto_label(
+                id,
+                identity(),
+                outcome(TrajectoryLabel::Bad, &["R1"]),
+                "h",
+                "v1",
+            )
+            .unwrap();
+        store
+            .apply_decision(
+                id,
+                LabelAction::Override(TrajectoryLabel::Good),
+                "alice",
+                None,
+            )
+            .unwrap();
+    }
+
+    let single = store
+        .apply_decision("single", LabelAction::Confirm, "bob", None)
+        .unwrap();
+    store.confirm_batch(&["batch".to_string()], "bob").unwrap();
+    let batch = store.get_label("batch").unwrap().unwrap();
+
+    for label in [single, batch] {
+        assert_eq!(
+            label.confirm_state,
+            ConfirmState::Overridden,
+            "a re-confirm endorses the human's verdict, not the rules'"
+        );
+        assert_eq!(label.human_label, Some(TrajectoryLabel::Good));
+        // Still signed off by a person: an override is not an unconfirmed row.
+        assert!(label.is_human_backed());
+    }
+
+    let stats = store.rule_override_stats().unwrap();
+    let r1 = stats.iter().find(|s| s.rule == "R1").unwrap();
+    assert_eq!(
+        r1.overridden, 2,
+        "the misfire signal must survive the confirm"
+    );
+    assert_eq!(r1.confirmed, 0);
+}
+
+#[test]
+fn a_confirmed_judged_row_still_counts_against_the_rules() {
+    // The rules fired `unknown`, the model judge said `good`, and a person
+    // confirmed the model's verdict. `apply_decision` pins
+    // `human_label = effective_label()` (good), so the row is human-backed —
+    // but bucketing by `confirm_state` alone recorded it as a rule
+    // confirmation even though the accepted verdict contradicts the rules,
+    // while `tally_override` counts the same row as an override. The two
+    // statistics derived from one store must agree.
+    let store = store("stats-judged-confirm");
+    store
+        .upsert_auto_label(
+            "s1",
+            identity(),
+            outcome(TrajectoryLabel::Unknown, &["R1"]),
+            "h",
+            "v1",
+        )
+        .unwrap();
+    store
+        .record_judgement("s1", &verdict(TrajectoryLabel::Good, vec![1], false))
+        .unwrap();
+    let confirmed = store
+        .apply_decision("s1", LabelAction::Confirm, "alice", None)
+        .unwrap();
+    assert!(confirmed.is_human_backed());
+    assert_eq!(confirmed.human_label, Some(TrajectoryLabel::Good));
+
+    let stats = store.rule_override_stats().unwrap();
+    let r1 = stats.iter().find(|s| s.rule == "R1").unwrap();
+    assert_eq!(
+        r1.confirmed, 0,
+        "the confirmed verdict (good) contradicts the rule verdict (unknown)"
+    );
+    assert_eq!(r1.overridden, 1, "the rule misfire must be visible");
+}
+
+#[test]
 fn unconfirmed_rows_contribute_nothing_to_rule_stats() {
     let store = store("stats-unconfirmed");
     store
@@ -917,4 +1039,129 @@ fn sessions_with_labels_empty_input_is_empty() {
         )
         .unwrap();
     assert!(store.sessions_with_labels(&[]).unwrap().is_empty());
+}
+
+// ─── Retention and capacity maintenance ──────────────────────────────────────
+
+#[test]
+fn maintenance_deletes_only_expired_events_by_age() {
+    let store = store("maintenance-retention");
+    store
+        .upsert_auto_label(
+            "s1",
+            identity(),
+            outcome(TrajectoryLabel::Good, &[]),
+            "h",
+            "v",
+        )
+        .unwrap();
+    insert_event_at(&store, "s1", 1, "expired");
+    insert_event_at(&store, "s1", now_ns(), "current");
+
+    let report = store.maintain(1, 0).unwrap();
+
+    assert_eq!(report.expired_events, 1);
+    assert_eq!(report.size.status, MaintenanceStatus::Disabled);
+    let events = store.events("s1").unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].reason.as_deref(), Some("current"));
+    assert!(store.get_label("s1").unwrap().is_some());
+}
+
+#[test]
+fn size_maintenance_deletes_events_before_labels() {
+    let store = store("maintenance-event-size");
+    store
+        .upsert_auto_label(
+            "label-must-remain",
+            identity(),
+            outcome(TrajectoryLabel::Good, &[]),
+            "h",
+            "v",
+        )
+        .unwrap();
+    let payload = "x".repeat(24 * 1024);
+    for index in 0..96 {
+        insert_event_at(&store, "label-must-remain", index, &payload);
+    }
+    assert!(store.size_snapshot().unwrap().physical_bytes > 1024 * 1024);
+
+    let report = store.maintain(0, 1).unwrap();
+
+    assert!(report.size.deleted_rows > 0);
+    assert_eq!(report.size.status, MaintenanceStatus::TargetReached);
+    assert!(store.events("label-must-remain").unwrap().len() < 96);
+    assert!(store.get_label("label-must-remain").unwrap().is_some());
+}
+
+#[test]
+fn size_maintenance_removes_oldest_automatic_labels_but_protects_decisions() {
+    let store = store("maintenance-label-size");
+    for index in 0..90 {
+        insert_large_auto_label(&store, &format!("auto-{index:03}"), index);
+    }
+    insert_large_auto_label(&store, "confirmed", 91);
+    store
+        .apply_decision("confirmed", LabelAction::Confirm, "alice", None)
+        .unwrap();
+    insert_large_auto_label(&store, "overridden", 92);
+    store
+        .apply_decision(
+            "overridden",
+            LabelAction::Override(TrajectoryLabel::Bad),
+            "bob",
+            Some("reviewed".to_string()),
+        )
+        .unwrap();
+    assert!(store.size_snapshot().unwrap().physical_bytes > 1024 * 1024);
+
+    let report = store.maintain(0, 1).unwrap();
+
+    assert!(
+        report.size.deleted_rows > 2,
+        "labels should be capacity-pruned"
+    );
+    assert!(store.get_label("auto-000").unwrap().is_none());
+    assert!(store.get_label("auto-089").unwrap().is_some());
+    let confirmed = store.get_label("confirmed").unwrap().unwrap();
+    assert_eq!(confirmed.confirm_state, ConfirmState::Confirmed);
+    assert_eq!(confirmed.decided_by.as_deref(), Some("alice"));
+    let overridden = store.get_label("overridden").unwrap().unwrap();
+    assert_eq!(overridden.confirm_state, ConfirmState::Overridden);
+    assert_eq!(overridden.human_label, Some(TrajectoryLabel::Bad));
+    assert_eq!(overridden.decided_by.as_deref(), Some("bob"));
+}
+
+#[test]
+fn retention_checkpoint_busy_stops_before_size_pruning() {
+    let state_dir = tmp_dir("maintenance-busy").join("private");
+    let path = state_dir.join(ReuseStore::DB_NAME);
+    let store = ReuseStore::open_private(&state_dir).unwrap();
+    store
+        .upsert_auto_label(
+            "retained",
+            identity(),
+            outcome(TrajectoryLabel::Good, &[]),
+            "h",
+            "v",
+        )
+        .unwrap();
+    let payload = "x".repeat(24 * 1024);
+    for index in 0..64 {
+        insert_event_at(&store, "retained", index, &payload);
+    }
+    assert_eq!(store.checkpoint().unwrap(), CheckpointOutcome::Completed);
+
+    let reader = Connection::open(&path).unwrap();
+    reader
+        .execute_batch("BEGIN; SELECT COUNT(*) FROM session_label_events;")
+        .unwrap();
+
+    let report = store.maintain(1, 1).unwrap();
+
+    assert_eq!(report.expired_events, 64);
+    assert_eq!(report.size.status, MaintenanceStatus::CheckpointBusy);
+    assert_eq!(report.size.rounds, 0);
+    assert_eq!(report.size.deleted_rows, 0);
+    assert!(store.get_label("retained").unwrap().is_some());
 }

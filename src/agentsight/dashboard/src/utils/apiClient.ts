@@ -251,6 +251,8 @@ export interface EnforcementCapabilities {
   policy_handoff: boolean;
   alternate_pid_retarget: boolean;
   test_development: boolean;
+  file_delete_guard?: boolean;
+  file_delete_guard_mode?: string | null;
 }
 
 export interface EnforcementBinding {
@@ -426,11 +428,24 @@ export const createCredentialBinding = (input: CredentialBindingInput) =>
     body: JSON.stringify(input),
   });
 
-export const fetchAgentProtectionPreview = (pid: number, directory?: string) => {
+export const fetchAgentProtectionPreview = async (
+  pid: number,
+  directory?: string,
+): Promise<AgentProtectionPreview> => {
   const query = directory ? `?directory=${encodeURIComponent(directory)}` : '';
-  return enforcementRequest<AgentProtectionPreview>(
+  const preview = await enforcementRequest<AgentProtectionPreview>(
     `/api/enforcement/agent-protection/${pid}${query}`,
   );
+  // The response is typed as an object, but a server that does not implement
+  // this route can answer `200` with a body of another shape — the macOS local
+  // viewer's `/api/*` catch-all returns `[]` — and the caller then stores
+  // `preview.source_paths` (undefined) as its source list, which the protection
+  // dialog renders with `.join`/`.length`. Rejecting here routes that into the
+  // callers' existing catch paths instead of a render-time crash.
+  if (!Array.isArray(preview?.source_paths)) {
+    throw new Error('protection preview is unavailable');
+  }
+  return preview;
 };
 
 export const detachEnforcementBinding = (bindingId: string) =>
@@ -998,14 +1013,22 @@ export interface InterruptionTypeStat {
 
 /**
  * Fetch per-type interruption stats within a time range.
+ *
+ * `agentName` must be forwarded by callers that also filter the severity
+ * badge by agent, otherwise the tooltip breakdown counts every agent while
+ * the badge shows one.
  */
 export async function fetchInterruptionStats(
   startNs: number,
-  endNs: number
+  endNs: number,
+  agentName?: string
 ): Promise<InterruptionTypeStat[]> {
   const params = new URLSearchParams();
   params.set('start_ns', String(startNs));
   params.set('end_ns', String(endNs));
+  if (agentName) {
+    params.set('agent_name', agentName);
+  }
   return apiFetch<InterruptionTypeStat[]>(
     `${API_BASE}/api/interruptions/stats?${params.toString()}`
   );
@@ -2040,19 +2063,33 @@ export async function login(token: string): Promise<boolean> {
     credentials: 'same-origin',
     body: JSON.stringify({ token }),
   });
-  return res.ok;
+  if (res.status === 401) return false;
+  if (!res.ok) throw new Error(`POST /api/auth/login -> ${res.status}`);
+  return true;
 }
 
 // ─── Storage status API ─────────────────────────────────────────────────────
 
 export type StorageAvailability = 'present' | 'missing' | 'error' | 'external';
-export type StorageCoverage = 'full' | 'row_bounded' | 'unmanaged' | 'external';
+export type StorageCoverage = 'full' | 'partial' | 'row_bounded' | 'unmanaged' | 'external';
 export type StorageSizeState =
   | 'within_policy'
   | 'cleanup_due'
   | 'reusable_capacity'
   | 'disabled'
   | 'unknown';
+export type StorageStoreId =
+  | 'primary'
+  | 'genai'
+  | 'interruptions'
+  | 'trajectories'
+  | 'optimization'
+  | 'reuse'
+  | 'causal'
+  | 'security_audit'
+  | 'enforcement'
+  | 'tokenless';
+export type StorageMaintenanceResult = 'success' | 'error' | 'lock_busy' | 'panicked';
 
 export interface StorageSizeStatus {
   database_bytes: number;
@@ -2069,28 +2106,58 @@ export interface StoragePolicyStatus {
   cleanup_trigger_bytes: number;
   cleanup_target_bytes: number;
   check_interval: number;
-  check_interval_unit: 'inserts' | 'seconds' | 'none' | 'external' | string;
+  check_interval_unit: 'seconds' | 'none' | 'external';
   enforced_by: string;
 }
 
+export interface StorageMaintenanceStatus {
+  scheduled: boolean;
+  worker_running: boolean;
+  worker_heartbeat_unix_ms: number | null;
+  last_attempt_unix_ms: number | null;
+  last_success_unix_ms: number | null;
+  last_result: StorageMaintenanceResult | null;
+  consecutive_failures: number;
+  next_run_unix_ms: number | null;
+}
+
 export interface StorageStoreStatus {
-  id: string;
+  id: StorageStoreId;
   availability: StorageAvailability;
   size: StorageSizeStatus | null;
   policy: StoragePolicyStatus;
   coverage: StorageCoverage;
   size_state: StorageSizeState;
+  maintenance: StorageMaintenanceStatus;
 }
 
 export interface StorageStatusResponse {
-  schema_version: number;
+  schema_version: 3;
   observed_at_unix_ms: number;
+  /** Combined size limit in MiB; 0 disables, otherwise the minimum is 9. */
+  max_total_size_mb: number;
+  /** Combined physical bytes of every measured store. */
+  total_physical_bytes: number;
   stores: StorageStoreStatus[];
 }
 
 /** Read effective SQLite policies and current disk allocation. */
 export async function fetchStorageStatus(): Promise<StorageStatusResponse> {
   return apiFetch<StorageStatusResponse>(`${API_BASE}/api/storage/status`);
+}
+
+/** Persist the combined SQLite storage limit into the runtime config file. */
+export async function saveStorageLimit(maxTotalSizeMb: number): Promise<void> {
+  const res = await fetch(`${API_BASE}/api/storage/config`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    credentials: 'same-origin',
+    body: JSON.stringify({ max_total_size_mb: maxTotalSizeMb }),
+  });
+  if (!res.ok) {
+    const detail = await res.text().catch(() => '');
+    throw new Error(detail || `POST /api/storage/config -> ${res.status}`);
+  }
 }
 
 // ─── Optimization analysis API ───────────────────────────────────────────────

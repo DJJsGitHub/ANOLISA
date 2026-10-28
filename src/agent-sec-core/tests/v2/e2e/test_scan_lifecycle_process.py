@@ -60,8 +60,25 @@ class ProcessDaemon:
             AGENT_SEC_TELEMETRY_LOG_PATH=str(self.telemetry),
         )
         self.log = (self.root / "daemon.stderr").open("a")
+        config = self.root / "skillsec.json"
+        config.write_text(
+            json.dumps(
+                {
+                    "stateDir": str(self.root / "skillsec-state"),
+                    "enableDefaultSkillDirs": False,
+                }
+            )
+        )
+        config.chmod(0o600)
         self.process = subprocess.Popen(
-            [binary("agent-sec-daemon"), "serve", "--socket", str(self.socket)],
+            [
+                binary("agent-sec-daemon"),
+                "serve",
+                "--socket",
+                str(self.socket),
+                "--skillsec-config",
+                str(config),
+            ],
             env=env,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,

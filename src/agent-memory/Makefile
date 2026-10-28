@@ -8,6 +8,9 @@
 
 VERSION ?= $(shell grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
 NAME := agent-memory
+SMOKE_TIMEOUT ?= 30
+NPM_INSTALL ?= install
+PLUGIN_BUILD_ARGS ?=
 
 # Remote Linux dev host used by remote-* targets.
 REMOTE_HOST ?= aos2
@@ -49,7 +52,7 @@ SPEC_FILE := $(NAME).spec
 
 .PHONY: all build build-openclaw-plugin sync-versions generate-component-contract test test-openclaw-install lint fmt clean install \
         install-adapter-resources uninstall dist spec rpm srpm \
-        test-openclaw-plugin smoke help
+        test-openclaw-plugin test-auto-capture smoke help
 
 all: build
 
@@ -118,7 +121,7 @@ build-openclaw-plugin: sync-versions generate-component-contract ## Build opencl
 	# constraint is intentionally permissive (the plugin uses only the
 	# stable plugin-sdk surface), so we keep --legacy-peer-deps until
 	# openclaw publishes a semver-compatible package range.
-	cd $(OPENCLAW_PLUGIN_SRC_DIR) && npm install --legacy-peer-deps --no-audit --no-fund
+	cd $(OPENCLAW_PLUGIN_SRC_DIR) && npm $(NPM_INSTALL) --legacy-peer-deps --no-audit --no-fund
 	# esbuild (what `npm run build` runs) strips types without checking them, so
 	# a type error in src/ or tests/ still produces a dist/index.js. Nothing else
 	# in the pipeline would catch it either: agent-memory.spec.in's %build
@@ -129,9 +132,14 @@ build-openclaw-plugin: sync-versions generate-component-contract ## Build opencl
 	# written against, and needs only the devDependencies installed just above.
 	@echo "==> Type-checking $(NAME) OpenClaw plugin (tsc --noEmit)..."
 	cd $(OPENCLAW_PLUGIN_SRC_DIR) && npm run build:check
-	cd $(OPENCLAW_PLUGIN_SRC_DIR) && npm run build
+	cd $(OPENCLAW_PLUGIN_SRC_DIR) && npm run build -- $(PLUGIN_BUILD_ARGS)
 	@test -f $(OPENCLAW_PLUGIN_SRC_DIR)/dist/index.js \
 	    || { echo "ERROR: $(OPENCLAW_PLUGIN_SRC_DIR)/dist/index.js was not produced"; exit 1; }
+
+.PHONY: build-openclaw-plugin-ci
+build-openclaw-plugin-ci: ## Build the plugin from locked dependencies without version repair
+	python3 packaging/raw/verify-release.py .
+	$(MAKE) build-openclaw-plugin NPM_INSTALL=ci PLUGIN_BUILD_ARGS=--metafile=dist/build-meta.json
 
 build-debug: ## Build debug binary
 	cargo build --locked
@@ -167,8 +175,13 @@ test-tools: ## Run Tier A file-tool integration tests only
 # gate on it. The per-PR `Test agent-memory` job also runs this target.
 test-openclaw-plugin: ## Run openclaw adapter TS unit tests (needs npm registry)
 	@echo "==> Running openclaw adapter unit tests..."
-	cd $(OPENCLAW_PLUGIN_SRC_DIR) && npm install --legacy-peer-deps --no-audit --no-fund
+	cd $(OPENCLAW_PLUGIN_SRC_DIR) && npm $(NPM_INSTALL) --legacy-peer-deps --no-audit --no-fund
 	cd $(OPENCLAW_PLUGIN_SRC_DIR) && npm test
+
+# Run after test-openclaw-plugin has installed the pinned adapter dependencies.
+test-auto-capture: build-debug ## Exercise the OpenClaw hook against the real MCP binary
+	@test -x $(OPENCLAW_PLUGIN_SRC_DIR)/node_modules/.bin/tsx || { echo "Run make test-openclaw-plugin first to install adapter dependencies." >&2; exit 1; }
+	AGENT_MEMORY_TEST_BINARY="$(abspath $(or $(CARGO_TARGET_DIR),target))/debug/$(NAME)" npm --prefix $(OPENCLAW_PLUGIN_SRC_DIR) run test:auto-capture
 
 # =============================================================================
 # REMOTE Linux build/test (for cross-platform development)
@@ -381,25 +394,9 @@ clean: ## Clean build artifacts
 version: ## Show current version
 	@echo $(VERSION)
 
-# Quick smoke test: init the mount, then drive 5 MCP tools through stdin.
-# Validates: write → read → append → grep → list, plus path-sandbox enforcement.
+# Check the release server's MCP responses in an isolated userland namespace.
 smoke: build ## Run end-to-end smoke test against release binary
-	@echo "==> Smoke test..."
-	@TMPDIR=$$(mktemp -d) && \
-		MEMORY_BASE_DIR="$$TMPDIR" USER_ID=smoke target/release/$(NAME) init && \
-		MEMORY_BASE_DIR="$$TMPDIR" USER_ID=smoke target/release/$(NAME) info && \
-		MEMORY_BASE_DIR="$$TMPDIR" USER_ID=smoke \
-		printf '%s\n%s\n%s\n%s\n%s\n%s\n%s\n' \
-			'{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"smoke","version":"1.0"}}}' \
-			'{"jsonrpc":"2.0","method":"notifications/initialized"}' \
-			'{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}' \
-			'{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"mem_write","arguments":{"path":"notes/smoke.md","content":"hello smoke world"}}}' \
-			'{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"mem_read","arguments":{"path":"notes/smoke.md"}}}' \
-			'{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"mem_grep","arguments":{"pattern":"smoke"}}}' \
-			'{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"mem_list","arguments":{"recursive":true}}}' \
-		| target/release/$(NAME) | head -10 && \
-		rm -rf "$$TMPDIR" && \
-		echo "==> Smoke test PASSED"
+	python3 tests/smoke.py target/release/$(NAME) --timeout $(SMOKE_TIMEOUT)
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | \

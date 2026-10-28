@@ -3,8 +3,7 @@
 use std::collections::HashMap;
 use std::fs;
 use std::mem::MaybeUninit;
-#[cfg(target_os = "linux")]
-use std::os::unix::fs::MetadataExt;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -31,6 +30,23 @@ use uuid::Uuid;
 use crate::event_hub::SecurityEventHub;
 use crate::{BackendError, EnforcementBackend, EventHub, SubscriberClass};
 
+// Normalization and resolution primitives land before the topology stage that
+// consumes them, so they stay test-scoped until a production caller exists.
+#[cfg(test)]
+mod file_protection_discovery;
+#[cfg(test)]
+mod file_protection_manifest;
+#[cfg(test)]
+mod file_protection_mountinfo;
+#[cfg(test)]
+mod file_protection_policy;
+#[cfg(test)]
+mod file_protection_resolver;
+#[cfg(test)]
+mod file_protection_topology;
+mod inode_policy;
+use inode_policy::InodePolicy;
+
 // Compile-time guard: compiler and engine must agree on CConfig ABI size.
 // If this fails, one crate's CRule definition was modified without updating the other.
 const _: () = assert!(
@@ -41,6 +57,14 @@ const _: () = assert!(
 
 /// Exact official upstream revision compiled into this adapter.
 pub const ACTPLANE_REVISION: &str = "a62e5d9d96f91101cda019519053e950d532380a";
+
+fn validate_actplane_policy_payload(request: &ApplyPolicy) -> Result<(), BackendError> {
+    crate::backend::validate_apply_policy_payload(request)?;
+    if request.file_protection_policy.is_some() {
+        return Err(crate::backend::structured_file_protection_unsupported());
+    }
+    Ok(())
+}
 
 #[derive(Clone)]
 struct ActiveBinding {
@@ -53,16 +77,15 @@ struct ActiveBinding {
     reasons: Vec<String>,
     rule_names: Vec<String>,
     label_names: HashMap<u64, String>,
-    /// Inodes guarded in the BPF inode_guard map for this binding.
-    /// Each entry is `(ino, dev)` and must be cleaned up when the binding
-    /// is detached so the map does not leak stale entries.
-    guarded_inodes: Vec<(u64, u32)>,
+    // Retain file identities through detach, including failed cleanup retries.
+    inode_policy: InodePolicy,
 }
 
 struct PreparedBinding {
     request: ApplyPolicy,
     credential_policy: Option<CredentialExfiltrationPolicy>,
     compiled: Compiled,
+    inode_policy: InodePolicy,
 }
 
 struct RuntimeState {
@@ -119,13 +142,12 @@ impl ActPlaneBackend {
     /// reload handle, self-protection, initial cleanup, or event drain cannot be
     /// established.
     pub fn open() -> Result<Self, BackendError> {
+        let runtime_lock = PinnedEngine::try_lock_runtime()
+            .map_err(|error| kernel_error("lock singleton runtime", error))?;
         let engine = Arc::new(
             PinnedEngine::open_or_install_singleton()
                 .map_err(|error| kernel_error("open pinned singleton", error))?,
         );
-        let runtime_lock = engine
-            .try_lock_runtime()
-            .map_err(|error| kernel_error("lock singleton runtime", error))?;
         let reload = Arc::new(
             engine
                 .reload_handle()
@@ -136,9 +158,15 @@ impl ActPlaneBackend {
             .map_err(|error| kernel_error("protect enforcer pid", error))?;
         let drained = prepare_runtime(
             || {
-                reload
-                    .clear_runtime_state()
-                    .map_err(|error| kernel_error("clear stale runtime state", error))
+                let mut errors = inode_policy::clear(&engine);
+                if let Err(error) = reload.clear_runtime_state() {
+                    errors.push(format!("clear stale runtime state: {error}"));
+                }
+                if errors.is_empty() {
+                    Ok(())
+                } else {
+                    Err(BackendError::KernelFailure(errors.join("; ")))
+                }
             },
             || {
                 engine
@@ -146,12 +174,6 @@ impl ActPlaneBackend {
                     .map_err(|error| kernel_error("drain stale pinned events", error))
             },
         )?;
-
-        // Clear stale inode guards that may survive a crash or SIGKILL so
-        // they do not leak into the next binding.
-        if let Err(e) = engine.clear_inode_guards() {
-            eprintln!("agentsight: failed to clear stale inode guards on startup: {e}");
-        }
 
         let state = Arc::new(RuntimeState::new());
         let stop = Arc::new(AtomicBool::new(false));
@@ -197,6 +219,7 @@ impl ActPlaneBackend {
         if let Err(error) = self.reload.clear_runtime_state() {
             errors.push(format!("clear runtime state: {error}"));
         }
+        errors.extend(inode_policy::clear(&self.engine));
         errors
     }
 
@@ -205,6 +228,7 @@ impl ActPlaneBackend {
         mut request: ApplyPolicy,
         credential_policy: Option<CredentialExfiltrationPolicy>,
     ) -> Result<PreparedBinding, BackendError> {
+        validate_actplane_policy_payload(&request)?;
         // Resolve namespace-local PID to host PID BEFORE start-time validation,
         // so that the stale-process check reads the correct /proc/<host_pid>/stat.
         let host_pid = resolve_to_host_pid(request.root_pid, request.process_start_time);
@@ -222,6 +246,15 @@ impl ActPlaneBackend {
             });
         }
         let compiled = compile_str(&request.policy_dsl).map_err(BackendError::CompileFailure)?;
+        // Surface compile-time warnings (e.g. an endpoint pattern that lowered
+        // to a match-nothing matcher) so the degradation is visible instead of
+        // silently installing a rule that never fires.
+        for warning in &compiled.warnings {
+            log::warn!(
+                "policy compile warning (binding_id={}): {warning}",
+                request.binding_id
+            );
+        }
         if compiled
             .labels
             .get("COMMAND")
@@ -232,10 +265,16 @@ impl ActPlaneBackend {
                 "policy must declare a COMMAND or AGENT source label".into(),
             ));
         }
+        let inode_policy = InodePolicy::prepare(
+            &request.policy_dsl,
+            &compiled,
+            self.engine.inode_guard_mode(),
+        )?;
         Ok(PreparedBinding {
             request,
             credential_policy,
             compiled,
+            inode_policy,
         })
     }
 
@@ -249,6 +288,7 @@ impl ActPlaneBackend {
             request,
             credential_policy,
             compiled,
+            inode_policy,
         } = prepared;
         let label = compiled
             .labels
@@ -263,7 +303,31 @@ impl ActPlaneBackend {
         let id = runtime_domain.unwrap_or_else(|| domain_id(request.binding_id));
         self.engine
             .seed_label_in_domain(request.root_pid, id, label)
-            .map_err(|error| kernel_error("seed target process domain", error))?;
+            .map_err(|error| {
+                let cleanup = self.cleanup_binding(&request, id, None);
+                kernel_error_with_cleanup("seed target process domain", error, cleanup)
+            })?;
+
+        // Rebind coverage: detaching a binding clears cap_task but leaves the
+        // tree's per-domain state behind, so processes that joined the session
+        // under the previous binding silently fall out of every policy when
+        // the binding is recreated. Move the surviving tree into the fresh
+        // domain and keep the outcome visible through the binding message.
+        let migration = self
+            .engine
+            .migrate_session_tree(request.root_pid, id)
+            .map_err(|error| {
+                let cleanup = self.cleanup_binding(&request, id, None);
+                kernel_error_with_cleanup("migrate prior session tree", error, cleanup)
+            })?;
+        if !migration.failed_pids.is_empty() {
+            log::warn!(
+                "binding {} domain {}: {}",
+                request.binding_id,
+                id,
+                migration.summary()
+            );
+        }
 
         let control_pid = std::process::id() as i32;
         let control_state = CapState {
@@ -310,33 +374,45 @@ impl ActPlaneBackend {
             ));
         }
 
-        // Populate inode guard map for kernel-level fast-path protection.
-        // This allows 5.10/6.6 kernels (where bpf_d_path is unavailable in
-        // LSM hooks) to still block file deletion via inode matching.
-        let guarded_inodes = populate_inode_guards(&self.engine, &request.policy_dsl, id);
-
         let binding = Binding {
             request,
             state: BindingState::Enforced,
-            message: None,
+            message: if migration.is_empty() {
+                None
+            } else {
+                Some(migration.summary())
+            },
             domain_id: Some(id),
         };
-        bindings.insert(
-            id,
-            ActiveBinding {
-                binding: binding.clone(),
-                credential_policy,
-                kernel_pid: None,
-                reasons: compiled.reasons,
-                rule_names: compiled.meta.into_iter().map(|meta| meta.name).collect(),
-                label_names: compiled
-                    .labels
-                    .into_iter()
-                    .map(|(name, mask)| (mask, name))
-                    .collect(),
-                guarded_inodes,
-            },
-        );
+        let mut active = ActiveBinding {
+            binding: binding.clone(),
+            credential_policy,
+            kernel_pid: None,
+            reasons: compiled.reasons,
+            rule_names: compiled.meta.into_iter().map(|meta| meta.name).collect(),
+            label_names: compiled
+                .labels
+                .into_iter()
+                .map(|(name, mask)| (mask, name))
+                .collect(),
+            inode_policy,
+        };
+        if let Err(error) = active.inode_policy.install(&self.engine, id) {
+            let cleanup = self.cleanup_binding(&active.binding.request, id, None);
+            if !cleanup.is_empty() {
+                // Keep descriptors and the binding available for a detach retry;
+                // never allow inode reuse while a partial registration survives.
+                active.binding.state = BindingState::Failed;
+                active.binding.message = Some(cleanup.join("; "));
+                bindings.insert(id, active);
+            }
+            return Err(kernel_error_with_cleanup(
+                "install inode policy",
+                error,
+                cleanup,
+            ));
+        }
+        bindings.insert(id, active);
         Ok(binding)
     }
 
@@ -395,13 +471,6 @@ impl ActPlaneBackend {
         else {
             return Err(BackendError::MissingBinding(binding_id));
         };
-        // Clean up inode guard entries before tearing down the domain so the
-        // BPF map does not retain stale entries for a detached binding.
-        for &(ino, dev) in &active.guarded_inodes {
-            if let Err(e) = self.engine.unguard_inode(ino, dev) {
-                eprintln!("failed to unguard inode {ino}:{dev}: {e}");
-            }
-        }
         let cleanup = self.cleanup_binding(&active.binding.request, id, active.kernel_pid);
         if !cleanup.is_empty() {
             return Err(BackendError::KernelFailure(cleanup.join("; ")));
@@ -607,10 +676,9 @@ impl Drop for ActPlaneBackend {
                 );
             }
         }
-        // Batch-clear all remaining inode guard entries so no stale inodes
-        // survive the enforcer shutdown — covers both normal and error paths.
-        if let Err(e) = self.engine.clear_inode_guards() {
-            eprintln!("agentsight-enforcer: failed to clear inode guards during shutdown: {e}");
+        // Also covers failed installs that left no active binding.
+        for error in inode_policy::clear(&self.engine) {
+            log::error!("agentsight-enforcer shutdown: {error}");
         }
         self.stop.store(true, Ordering::Release);
         let poller = self
@@ -636,31 +704,7 @@ fn spawn_poller(
         if let Err(error) = engine.run(&stop, move |raw| {
             let active = callback_state.bindings().get(&raw.domain_id).cloned();
             if let Some(active) = active {
-                callback_state
-                    .events
-                    .publish(convert_violation(raw.clone(), &active));
-                if raw.op == 3
-                    && raw.provenance.is_some()
-                    && let Some(policy) = active.credential_policy.as_ref()
-                {
-                    let label = active
-                        .label_names
-                        .get(&raw.matched_label)
-                        .cloned()
-                        .unwrap_or_else(|| format!("label-0x{:x}", raw.matched_label));
-                    match convert_security_events(raw, &active, policy, &label) {
-                        Ok(events) => {
-                            for event in events {
-                                callback_state.security_events.publish(event);
-                            }
-                        }
-                        Err(error) => {
-                            let message = format!("normalize ActPlane evidence: {error}");
-                            log::error!("{message}");
-                            *callback_state.runtime_error() = Some(message);
-                        }
-                    }
-                }
+                publish_raw_violation(raw, &active, &callback_state);
             }
         }) {
             let message = format!("violation poller stopped: {error}");
@@ -668,6 +712,40 @@ fn spawn_poller(
             *state.runtime_error() = Some(message);
         }
     })
+}
+
+/// Publishes one kernel event on both streams under a single identity.
+///
+/// `/api/enforcement/violations` resolves a violation's case through the
+/// evidence ids stored in `risk_evidence_links`, so the raw violation and its
+/// normalized sink evidence must carry the same `event_id`.
+fn publish_raw_violation(raw: Violation, active: &ActiveBinding, state: &RuntimeState) {
+    let event_id = Uuid::new_v4();
+    state
+        .events
+        .publish(convert_violation(raw.clone(), active, event_id));
+    if raw.op == 3
+        && raw.provenance.is_some()
+        && let Some(policy) = active.credential_policy.as_ref()
+    {
+        let label = active
+            .label_names
+            .get(&raw.matched_label)
+            .cloned()
+            .unwrap_or_else(|| format!("label-0x{:x}", raw.matched_label));
+        match convert_security_events(raw, active, policy, &label, event_id) {
+            Ok(events) => {
+                for event in events {
+                    state.security_events.publish(event);
+                }
+            }
+            Err(error) => {
+                let message = format!("normalize ActPlane evidence: {error}");
+                log::error!("{message}");
+                *state.runtime_error() = Some(message);
+            }
+        }
+    }
 }
 
 fn domain_id(binding_id: Uuid) -> u32 {
@@ -704,8 +782,22 @@ fn parse_process_start_time(stat: &str) -> Result<u64, ProcessStatError> {
         .map_err(|_| ProcessStatError::InvalidStartTime)
 }
 
+/// Reads a `/proc` text file, decoding non-UTF-8 bytes lossily.
+///
+/// `/proc/<pid>/stat` and `/proc/<pid>/status` embed the process name, and the
+/// kernel allows almost any non-NUL bytes in a name (`prctl(PR_SET_NAME)` sets
+/// them directly, and an executable whose name is not valid UTF-8 passes them
+/// on). `read_to_string` rejects such a file outright, which failed binding
+/// preparation (`KernelFailure`) and PID-namespace resolution for a process
+/// purely because of its name, while every field these parsers read (start
+/// time, NSpid) is plain ASCII positioned after the name. Mirrors the
+/// sibling fix in `src/enforcement/target.rs`.
+fn read_proc_text_lossy(path: &str) -> std::io::Result<String> {
+    fs::read(path).map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+}
+
 fn read_process_start_time(pid: i32) -> Result<u64, BackendError> {
-    let stat = fs::read_to_string(format!("/proc/{pid}/stat"))
+    let stat = read_proc_text_lossy(&format!("/proc/{pid}/stat"))
         .map_err(|error| BackendError::KernelFailure(format!("read /proc/{pid}/stat: {error}")))?;
     parse_process_start_time(&stat)
         .map_err(|error| BackendError::KernelFailure(format!("parse /proc/{pid}/stat: {error}")))
@@ -727,6 +819,7 @@ fn credential_apply_request(
             policy_revision: policy.revision.to_string(),
             policy_dsl,
             policy_mode: Some(policy.mode),
+            file_protection_policy: None,
         },
         policy,
     ))
@@ -746,6 +839,7 @@ fn replacement_failure_code(error: &BackendError) -> ReplaceFailureCode {
 fn validation_failure_code(error: &ReplaceValidationError) -> ReplaceFailureCode {
     match error {
         ReplaceValidationError::CredentialPolicy(_)
+        | ReplaceValidationError::PolicyPayload(_)
         | ReplaceValidationError::SourcePolicySnapshot(_) => ReplaceFailureCode::CompileFailure,
         ReplaceValidationError::SameBindingId
         | ReplaceValidationError::SourceNotEnforced
@@ -784,10 +878,13 @@ fn unsupported_runtime_handoff(source: &Binding) -> ReplaceOutcome {
 /// Translates the stable credential-exfiltration model into pinned ActPlane DSL.
 ///
 /// The current ActPlane endpoint-condition ABI can represent one trusted target
-/// per rule. Observe and audit policies use notify rules plus adapter-side TTL
-/// and `public_ipv4` filtering. Enforce mode emits a `block` rule with an
-/// `expires` clause so the pinned ABI honours taint TTL directly, and requires
-/// at least one trusted endpoint to avoid blocking all outbound connections.
+/// per rule, so more than one is rejected. Observe and audit policies use notify
+/// rules plus adapter-side TTL and `public_ipv4` filtering.
+///
+/// Enforce mode is rejected by design: the pinned kernel `block ... endpoint "*"`
+/// rule cannot tell a public destination from a private one, so it would deny
+/// loopback and RFC1918 traffic before userspace could classify it. Compilation
+/// fails closed until the ABI can express public-only scope.
 ///
 /// # Errors
 ///
@@ -886,6 +983,7 @@ fn convert_security_events(
     active: &ActiveBinding,
     policy: &CredentialExfiltrationPolicy,
     taint_label: &str,
+    sink_event_id: Uuid,
 ) -> Result<Vec<SecurityEvent>, BackendError> {
     convert_security_events_at(
         raw,
@@ -894,6 +992,7 @@ fn convert_security_events(
         taint_label,
         now_ns(),
         monotonic_now_ns(),
+        sink_event_id,
     )
 }
 
@@ -904,6 +1003,7 @@ fn convert_security_events_at(
     taint_label: &str,
     observed_at_ns: u64,
     monotonic_now_ns: Option<u64>,
+    sink_event_id: Uuid,
 ) -> Result<Vec<SecurityEvent>, BackendError> {
     let provenance = raw.provenance.as_ref().ok_or_else(|| {
         BackendError::KernelFailure("ActPlane connect violation lacks source provenance".into())
@@ -930,7 +1030,7 @@ fn convert_security_events_at(
         || policy
             .trusted_endpoints
             .iter()
-            .any(|trusted| trusted == &raw.target)
+            .any(|trusted| trusted_endpoint_covers(trusted, &raw.target))
     {
         return Ok(Vec::new());
     }
@@ -964,7 +1064,6 @@ fn convert_security_events_at(
     let sink_identity = event_identity(active, raw.pid, Some(raw.ppid), target_start);
     let source_event_id = Uuid::new_v4();
     let taint_event_id = Uuid::new_v4();
-    let sink_event_id = Uuid::new_v4();
     let decision_event_id = Uuid::new_v4();
     let policy_id = active.binding.request.policy_id.clone();
     let source_path = redact_home_path(&provenance.target);
@@ -1095,10 +1194,50 @@ fn classify_destination(destination: &str) -> DestinationClass {
     classify_public_ipv4_destination(destination)
 }
 
-fn convert_violation(raw: Violation, active: &ActiveBinding) -> ViolationEvent {
+/// Splits a destination into its address and optional port.
+///
+/// Accepts both the bare address the kernel reports for a connect and the
+/// `address:port` spelling product policies are written in.
+fn destination_address(destination: &str) -> Option<(IpAddr, Option<u16>)> {
+    if let Ok(address) = destination.parse::<IpAddr>() {
+        return Some((address, None));
+    }
+    destination
+        .parse::<SocketAddr>()
+        .ok()
+        .map(|socket| (socket.ip(), Some(socket.port())))
+}
+
+/// Whether a policy trusted endpoint exempts a reported destination.
+///
+/// The kernel reports a connect destination as a port-less dotted IPv4 address
+/// (`ebpf-ifc-engine`'s `decode`), while operators author trusted endpoints as
+/// `host:port` (the dashboard suggests `10.0.0.8:443`). Comparing the two as
+/// strings therefore never exempts the target the operator named. Compare
+/// addresses instead: an endpoint without a port covers every port, and one
+/// with a port covers a destination reporting the same address. The kernel
+/// reports no port at all, so a trusted endpoint that names one still exempts
+/// its address. Hostnames are not resolved here and stay untrusted.
+fn trusted_endpoint_covers(trusted: &str, destination: &str) -> bool {
+    if trusted == destination {
+        return true;
+    }
+    let Some((trusted_address, trusted_port)) = destination_address(trusted) else {
+        return false;
+    };
+    let Some((destination_address, destination_port)) = destination_address(destination) else {
+        return false;
+    };
+    if trusted_address != destination_address {
+        return false;
+    }
+    destination_port.is_none_or(|port| trusted_port.is_none_or(|trusted| trusted == port))
+}
+
+fn convert_violation(raw: Violation, active: &ActiveBinding, event_id: Uuid) -> ViolationEvent {
     let monotonic_now_ns = monotonic_now_ns();
     let observed_at_ns = now_ns();
-    convert_violation_at(raw, active, observed_at_ns, monotonic_now_ns)
+    convert_violation_at(raw, active, observed_at_ns, monotonic_now_ns, event_id)
 }
 
 fn convert_violation_at(
@@ -1106,6 +1245,7 @@ fn convert_violation_at(
     active: &ActiveBinding,
     observed_at_ns: u64,
     monotonic_now_ns: Option<u64>,
+    event_id: Uuid,
 ) -> ViolationEvent {
     let rule_index = raw.rule_id as usize;
     let occurred_at_ns = monotonic_now_ns
@@ -1114,7 +1254,7 @@ fn convert_violation_at(
         })
         .unwrap_or(observed_at_ns);
     ViolationEvent {
-        event_id: Uuid::new_v4(),
+        event_id,
         binding_id: active.binding.request.binding_id,
         agent_id: active.binding.request.agent_id.clone(),
         session_id: active.binding.request.session_id.clone(),
@@ -1147,6 +1287,8 @@ fn operation_name(operation: u32) -> &'static str {
         2 => "write",
         3 => "connect",
         4 => "recv",
+        5 => "unlink",
+        6 => "rename",
         _ => "unknown",
     }
 }
@@ -1231,11 +1373,10 @@ fn kernel_error_with_cleanup(
 ///    caller handle the stale-process / not-found case.
 fn resolve_to_host_pid(input_pid: i32, input_start_time: u64) -> i32 {
     // Fast path: pid exists in host /proc and start_time matches.
-    if let Ok(start_time) = proc_start_time(input_pid) {
-        if start_time == input_start_time {
-            return first_nspid(input_pid).unwrap_or(input_pid);
-        }
-        // pid exists but belongs to a different process (namespace collision).
+    if let Ok(start_time) = proc_start_time(input_pid)
+        && start_time == input_start_time
+    {
+        return first_nspid(input_pid).unwrap_or(input_pid);
     }
 
     // Slow path: scan /proc for a process whose innermost NSpid == input_pid
@@ -1259,10 +1400,10 @@ fn resolve_to_host_pid(input_pid: i32, input_start_time: u64) -> i32 {
         if *nspid.last().unwrap() != input_pid {
             continue; // innermost ns PID doesn't match
         }
-        if let Ok(pst) = proc_start_time(host_pid) {
-            if pst == input_start_time {
-                return nspid[0]; // host PID
-            }
+        if let Ok(pst) = proc_start_time(host_pid)
+            && pst == input_start_time
+        {
+            return nspid[0]; // host PID
         }
     }
 
@@ -1273,9 +1414,15 @@ fn resolve_to_host_pid(input_pid: i32, input_start_time: u64) -> i32 {
 /// index 0 is the outermost (host) PID and the last element is the innermost
 /// (namespace-local) PID.
 fn read_nspid_chain(pid: i32) -> Vec<i32> {
-    let Ok(status) = fs::read_to_string(format!("/proc/{pid}/status")) else {
+    let Ok(status) = read_proc_text_lossy(&format!("/proc/{pid}/status")) else {
         return vec![];
     };
+    parse_nspid_from_status(&status)
+}
+
+/// Parse the `NSpid:` chain from a decoded `/proc/<pid>/status` payload;
+/// empty when the line is absent or carries no valid PID.
+fn parse_nspid_from_status(status: &str) -> Vec<i32> {
     for line in status.lines() {
         if let Some(rest) = line.strip_prefix("NSpid:") {
             return rest
@@ -1295,7 +1442,7 @@ fn first_nspid(pid: i32) -> Option<i32> {
 
 /// Read `start_time` (field 22) from `/proc/<pid>/stat`.
 fn proc_start_time(pid: i32) -> Result<u64, ()> {
-    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).map_err(|_| ())?;
+    let stat = read_proc_text_lossy(&format!("/proc/{pid}/stat")).map_err(|_| ())?;
     let after_comm = &stat[stat.rfind(')').ok_or(())? + 2..];
     after_comm
         .split_ascii_whitespace()
@@ -1323,111 +1470,6 @@ fn is_init_pid_namespace() -> bool {
         );
     }
     result
-}
-
-/// Extract concrete file paths from DSL `block (unlink|write|rename) file "..."`
-/// clauses only.  Source definitions (`source X = file "..."`) and non-block
-/// rules (`notify`, `audit`) are excluded so that credential source files and
-/// observation-only policies do not receive unintended delete protection.
-///
-/// Paths containing glob characters (`*`, `?`) are skipped because they cannot
-/// be stat'd for an inode.  Only absolute paths are returned.
-fn extract_guarded_paths(dsl: &str) -> Vec<String> {
-    let mut paths = Vec::new();
-    // Only match `block <op> file "..."` — not `source X = file` or `notify`.
-    let block_file_needles = [
-        "block unlink file \"",
-        "block write file \"",
-        "block rename file \"",
-    ];
-    for needle in &block_file_needles {
-        let mut rest = dsl;
-        while let Some(pos) = rest.find(needle) {
-            let start = pos + needle.len();
-            rest = &rest[start..];
-            if let Some(end) = rest.find('"') {
-                let path = &rest[..end];
-                if path.starts_with('/')
-                    && !path.contains('*')
-                    && !path.contains('?')
-                    && !paths.iter().any(|p| p == path)
-                {
-                    // The inode guard fast path only checks te_pid_active()
-                    // (= process is in any domain), which is semantically
-                    // equivalent to "if AGENT" / "if COMMAND" (all exec in
-                    // domain).  Rules with other labels (e.g. "if CREDENTIAL")
-                    // or with "unless" conditions cannot be faithfully evaluated
-                    // by the fast path and must be excluded.
-                    let line_rest = rest[end + 1..].split('\n').next().unwrap_or("");
-                    let has_unless = line_rest.contains("unless");
-                    let has_non_standard_label = line_rest.contains(" if ")
-                        && !line_rest.contains("if AGENT")
-                        && !line_rest.contains("if COMMAND");
-                    if !has_unless && !has_non_standard_label {
-                        paths.push(path.to_string());
-                    }
-                }
-                rest = &rest[end + 1..];
-            } else {
-                break;
-            }
-        }
-    }
-    paths
-}
-
-/// Stat each guarded file path from the DSL and insert the `(ino, dev)` pair
-/// into the BPF inode guard map with UNLINK | RENAME protection flags.
-///
-/// Returns the list of successfully guarded `(ino, dev)` pairs so the caller
-/// can store them for later cleanup.
-#[cfg(target_os = "linux")]
-fn populate_inode_guards(
-    engine: &PinnedEngine,
-    policy_dsl: &str,
-    domain_id: u32,
-) -> Vec<(u64, u32)> {
-    let mut guarded: Vec<(u64, u32)> = Vec::new();
-    for path in extract_guarded_paths(policy_dsl) {
-        match fs::metadata(&path) {
-            Ok(meta) => {
-                let ino = meta.ino();
-                let dev = userspace_dev_to_kernel(meta.dev());
-                let flags =
-                    ebpf_ifc_engine::INODE_GUARD_UNLINK | ebpf_ifc_engine::INODE_GUARD_RENAME;
-                if let Err(e) = engine.guard_inode(ino, dev, flags, domain_id) {
-                    eprintln!("failed to guard inode {ino}:{dev} for {path}: {e}");
-                } else {
-                    guarded.push((ino, dev));
-                }
-            }
-            Err(e) => eprintln!("cannot stat {path} for inode guard: {e}"),
-        }
-    }
-    guarded
-}
-
-#[cfg(not(target_os = "linux"))]
-fn populate_inode_guards(
-    _engine: &PinnedEngine,
-    _policy_dsl: &str,
-    _domain_id: u32,
-) -> Vec<(u64, u32)> {
-    Vec::new()
-}
-
-/// Convert a userspace `stat.st_dev` value (glibc `new_encode_dev` format) to
-/// the kernel-internal `dev_t` layout used by `super_block.s_dev` and read by
-/// BPF via `BPF_CORE_READ(inode, i_sb, s_dev)`.
-///
-/// Userspace:  `(minor & 0xff) | (major << 8) | ((minor & !0xff) << 12)`
-/// Kernel:     `MKDEV(major, minor)` = `(major << 20) | minor`
-#[cfg(target_os = "linux")]
-fn userspace_dev_to_kernel(dev: u64) -> u32 {
-    let dev = dev as u32;
-    let major = (dev & 0xfff00) >> 8;
-    let minor = (dev & 0xff) | ((dev >> 12) & 0xfff00);
-    (major << 20) | minor
 }
 
 #[cfg(test)]
@@ -1458,6 +1500,7 @@ mod tests {
                     policy_revision: "revision-1".into(),
                     policy_dsl: "fixture".into(),
                     policy_mode: Some(PolicyMode::Audit),
+                    file_protection_policy: None,
                 },
                 state: BindingState::Enforced,
                 message: None,
@@ -1468,8 +1511,37 @@ mod tests {
             reasons: vec!["credential reached an external sink".into()],
             rule_names: vec!["block-exfiltration".into()],
             label_names: HashMap::from([(1, "CREDENTIAL".into())]),
-            guarded_inodes: Vec::new(),
+            inode_policy: InodePolicy::default(),
         }
+    }
+
+    #[test]
+    fn structured_payload_is_rejected_without_resolving_a_process() {
+        use agentsight_enforcement_protocol::{
+            FILE_PROTECTION_POLICY_VERSION, FileProtectionPolicy, FileProtectionTarget,
+            FileProtectionTargetKind, FileProtectionTopologyMode, FileProtections,
+        };
+
+        let mut request = active_binding().binding.request;
+        request.root_pid = 0;
+        request.process_start_time = 0;
+        request.policy_dsl.clear();
+        request.file_protection_policy = Some(FileProtectionPolicy {
+            version: FILE_PROTECTION_POLICY_VERSION,
+            topology_mode: FileProtectionTopologyMode::StaticAtApply,
+            targets: vec![FileProtectionTarget {
+                path: "/missing/file".into(),
+                kind: FileProtectionTargetKind::ExactFile,
+                protections: FileProtections {
+                    delete: true,
+                    ordinary_write: false,
+                },
+                exclusions: vec![],
+            }],
+        });
+        let error = validate_actplane_policy_payload(&request).expect_err("unsupported payload");
+        assert!(matches!(error, BackendError::CompileFailure(message)
+            if message == crate::backend::STRUCTURED_FILE_PROTECTION_UNSUPPORTED));
     }
 
     fn raw_violation(timestamp_ns: u64) -> Violation {
@@ -1507,6 +1579,43 @@ mod tests {
     }
 
     #[test]
+    fn inode_unlink_and_rename_preserve_lowered_rule_reason_and_target() {
+        let compiled = compile_str(
+            "source AGENT = exec \"**\"\nsource OTHER = exec \"**\"\n\
+             rule prior:\n notify connect endpoint \"*\" if AGENT or OTHER\n because \"prior\"\n\
+             rule protect:\n block unlink file \"/protected\" if AGENT\n because \"keep file\"\n",
+        )
+        .unwrap();
+        let mut active = active_binding();
+        active.reasons = compiled.reasons;
+        active.rule_names = compiled.meta.into_iter().map(|meta| meta.name).collect();
+        for (op, name) in [(5, "unlink"), (6, "rename")] {
+            let mut raw = raw_violation(100);
+            raw.op = op;
+            raw.rule_id = 2;
+            raw.target = "/protected".into();
+            let event = convert_violation_at(raw, &active, 200, Some(100), Uuid::new_v4());
+            assert_eq!(event.operation, name);
+            assert_eq!(event.target, "/protected");
+            assert_eq!(event.rule_id.as_deref(), Some("protect"));
+            assert_eq!(event.reason.as_deref(), Some("keep file"));
+            assert_eq!(event.effect, Effect::Block);
+            assert!(event.blocked);
+            assert!(!event.killed);
+        }
+        for (op, name) in [
+            (0, "exec"),
+            (1, "open"),
+            (2, "write"),
+            (3, "connect"),
+            (4, "recv"),
+            (7, "unknown"),
+        ] {
+            assert_eq!(operation_name(op), name);
+        }
+    }
+
+    #[test]
     fn credential_policy_compiles_deterministically_with_trusted_exception() {
         let mut policy = credential_policy();
         policy.mode = PolicyMode::Audit;
@@ -1522,25 +1631,63 @@ mod tests {
     }
 
     #[test]
-    fn enforce_policy_compiles_block_rule_with_expires() {
-        let policy = credential_policy();
-        let dsl = compile_credential_exfiltration_policy(&policy)
-            .expect("enforce policy with a trusted endpoint should compile");
+    fn enforce_policy_is_rejected_until_public_scope_is_representable() {
+        // Enforce (block) compilation is deliberately fail-closed: the pinned
+        // kernel rule blocks every endpoint, private ones included, before
+        // userspace can classify the destination. Pin the rejection so
+        // re-enabling it has to update this test consciously.
+        let error = compile_credential_exfiltration_policy(&credential_policy())
+            .expect_err("enforce mode must fail closed");
 
-        assert!(dsl.contains("block connect endpoint \"*\" if CREDENTIAL"));
-        assert!(dsl.contains("unless target \"10.0.0.8\""));
-        assert!(dsl.contains("expires 900s"));
-        assert!(compile_str(&dsl).is_ok());
+        assert!(
+            error
+                .to_string()
+                .contains("enforce mode is not yet supported"),
+            "unexpected rejection: {error}"
+        );
     }
 
     #[test]
-    fn enforce_policy_requires_trusted_endpoint() {
+    fn enforce_policy_without_a_trusted_endpoint_is_rejected_too() {
+        // Trusted endpoints do not change the verdict: the mode is rejected
+        // whether or not an exception was configured.
         let mut policy = credential_policy();
         policy.trusted_endpoints.clear();
-        let error = compile_credential_exfiltration_policy(&policy)
-            .expect_err("enforce mode without a trusted endpoint must fail closed");
 
-        assert!(error.to_string().contains("trusted_endpoint"));
+        assert!(
+            compile_credential_exfiltration_policy(&policy).is_err(),
+            "enforce mode must fail closed without a trusted endpoint as well"
+        );
+    }
+
+    #[test]
+    fn non_enforcing_policies_compile_without_a_trusted_endpoint() {
+        for mode in [PolicyMode::Observe, PolicyMode::Audit] {
+            let mut policy = credential_policy();
+            policy.mode = mode;
+            policy.trusted_endpoints.clear();
+
+            let dsl = compile_credential_exfiltration_policy(&policy)
+                .expect("non-enforcing policies do not require a trusted endpoint");
+
+            assert!(dsl.contains("notify connect endpoint \"*\" if CREDENTIAL"));
+            assert!(!dsl.contains("unless target"));
+            assert!(compile_str(&dsl).is_ok());
+        }
+    }
+
+    #[test]
+    fn more_than_one_trusted_endpoint_is_rejected() {
+        // The single-exception limit is checked before the mode, so it is
+        // reachable — assert it in audit mode, where compilation proceeds.
+        let mut policy = credential_policy();
+        policy.mode = PolicyMode::Audit;
+        policy.trusted_endpoints = vec!["10.0.0.8".into(), "10.0.0.9".into()];
+
+        let error = compile_credential_exfiltration_policy(&policy)
+            .expect_err("the pinned ABI takes one trusted endpoint per rule");
+
+        assert!(error.to_string().contains("one trusted endpoint"));
     }
 
     #[test]
@@ -1599,6 +1746,7 @@ mod tests {
             "CREDENTIAL",
             1_784_000_000_000_000_000,
             Some(271_000_000_000),
+            Uuid::new_v4(),
         )
         .expect("fixture violation should convert");
 
@@ -1651,9 +1799,19 @@ mod tests {
             "CREDENTIAL",
             1_784_000_000_000_000_000,
             Some(271_000_000_000),
+            Uuid::new_v4(),
         )
         .expect("audit violation should convert");
 
+        let SecurityEventKind::FileAction(source) = &events[0].kind else {
+            panic!("first evidence must be the credential read");
+        };
+        assert_eq!(source.operation, "open");
+        assert_eq!(source.path, "~/.aws/credentials");
+        let SecurityEventKind::TaintTransition(taint) = &events[1].kind else {
+            panic!("second evidence must be the credential taint");
+        };
+        assert_eq!(taint.label, "CREDENTIAL");
         let SecurityEventKind::NetworkAction(network) = &events[2].kind else {
             panic!("third evidence must be a network action");
         };
@@ -1695,6 +1853,7 @@ mod tests {
             "CREDENTIAL",
             1_784_000_000_000_000_000,
             Some(271_000_000_000),
+            Uuid::new_v4(),
         )
         .expect("observe violation should convert");
 
@@ -1734,6 +1893,7 @@ mod tests {
             "CREDENTIAL",
             1_784_000_000_000_000_000,
             Some(271_000_000_000),
+            Uuid::new_v4(),
         )
         .expect("expired taint should normalize safely");
 
@@ -1787,6 +1947,7 @@ mod tests {
                 "CREDENTIAL",
                 1_784_000_000_000_000_000,
                 Some(271_000_000_000),
+                Uuid::new_v4(),
             )
             .expect("out-of-scope destination should normalize safely");
 
@@ -1795,6 +1956,136 @@ mod tests {
                 "{destination} must not be a product sink"
             );
         }
+    }
+
+    #[test]
+    fn one_raw_violation_keeps_one_identity_across_both_streams() {
+        // The production getters read the live monotonic clock, so the taint
+        // must be fresh relative to it for the evidence chain to be emitted.
+        let now = monotonic_now_ns().expect("monotonic clock should be readable");
+        let mut raw = raw_violation(now);
+        raw.provenance = Some(Provenance {
+            label: 1,
+            timestamp_ns: now - 1_000_000_000,
+            pid: 43,
+            op: 1,
+            target: "/root/.ssh/id_rsa".into(),
+        });
+        let mut active = active_binding();
+        active.binding.request.policy_revision = "3".into();
+        let state = RuntimeState::new();
+        let violations = state
+            .events
+            .subscribe(Uuid::new_v4(), SubscriberClass::BestEffort);
+        let evidence = state.security_events.subscribe();
+
+        publish_raw_violation(raw, &active, &state);
+
+        let violation = violations
+            .try_recv()
+            .expect("the raw violation must be published");
+        let sink = evidence
+            .try_iter()
+            .find(|event| matches!(event.kind, SecurityEventKind::NetworkAction(_)))
+            .expect("the evidence chain must contain the sink event");
+        assert_eq!(
+            violation.event_id, sink.event_id,
+            "the raw violation and its normalized sink evidence describe one kernel event; \
+             /api/enforcement/violations resolves case_id through the evidence id"
+        );
+    }
+
+    #[test]
+    fn trusted_endpoints_are_compared_as_addresses_with_optional_ports() {
+        assert!(trusted_endpoint_covers("8.8.8.8", "8.8.8.8"));
+        assert!(trusted_endpoint_covers("8.8.8.8", "8.8.8.8:443"));
+        assert!(trusted_endpoint_covers("8.8.8.8:443", "8.8.8.8"));
+        assert!(trusted_endpoint_covers("8.8.8.8:443", "8.8.8.8:443"));
+        assert!(!trusted_endpoint_covers("8.8.8.8:443", "8.8.8.8:8443"));
+        assert!(!trusted_endpoint_covers("8.8.8.9", "8.8.8.8"));
+        assert!(!trusted_endpoint_covers("git.example.com:443", "8.8.8.8"));
+        assert!(!trusted_endpoint_covers("8.8.8.8", "git.example.com:443"));
+    }
+
+    #[test]
+    fn a_trusted_endpoint_written_as_host_port_exempts_its_destination() {
+        let mut raw = raw_violation(270_000_000_000);
+        raw.effect = 0;
+        raw.blocked = false;
+        raw.target = "8.8.8.8".into();
+        raw.provenance = Some(Provenance {
+            label: 1,
+            timestamp_ns: 269_000_000_000,
+            pid: 43,
+            op: 1,
+            target: "/root/.aws/credentials".into(),
+        });
+        let mut active = active_binding();
+        active.binding.request.policy_revision = "3".into();
+        let policy = active
+            .credential_policy
+            .as_mut()
+            .expect("fixture credential policy should exist");
+        policy.mode = PolicyMode::Audit;
+        policy.trusted_endpoints = vec!["8.8.8.8:443".into()];
+        let policy = policy.clone();
+
+        let events = convert_security_events_at(
+            raw,
+            &active,
+            &policy,
+            "CREDENTIAL",
+            1_784_000_000_000_000_000,
+            Some(271_000_000_000),
+            Uuid::new_v4(),
+        )
+        .expect("trusted destination should normalize safely");
+
+        assert!(
+            events.is_empty(),
+            "the destination an operator named as trusted must not become credential-exfiltration evidence"
+        );
+    }
+
+    #[test]
+    fn an_unlisted_public_destination_still_produces_evidence() {
+        let mut raw = raw_violation(270_000_000_000);
+        raw.effect = 0;
+        raw.blocked = false;
+        raw.target = "8.8.8.8".into();
+        raw.provenance = Some(Provenance {
+            label: 1,
+            timestamp_ns: 269_000_000_000,
+            pid: 43,
+            op: 1,
+            target: "/root/.aws/credentials".into(),
+        });
+        let mut active = active_binding();
+        active.binding.request.policy_revision = "3".into();
+        let policy = active
+            .credential_policy
+            .as_mut()
+            .expect("fixture credential policy should exist");
+        policy.mode = PolicyMode::Audit;
+        policy.trusted_endpoints = vec!["8.8.8.9:443".into()];
+        let policy = policy.clone();
+
+        let events = convert_security_events_at(
+            raw,
+            &active,
+            &policy,
+            "CREDENTIAL",
+            1_784_000_000_000_000_000,
+            Some(271_000_000_000),
+            Uuid::new_v4(),
+        )
+        .expect("audit violation should convert");
+
+        assert_eq!(
+            events.len(),
+            4,
+            "a public destination outside the trusted list must stay evidence"
+        );
     }
 
     #[test]
@@ -1885,6 +2176,41 @@ mod tests {
     }
 
     #[test]
+    fn read_proc_text_lossy_keeps_ascii_fields_across_invalid_bytes() {
+        // /proc/<pid>/stat embeds the comm between parentheses, and the kernel
+        // allows non-NUL non-UTF-8 bytes in a comm. `read_to_string` rejected
+        // the whole file, failing binding preparation (KernelFailure) for a
+        // valid target; the lossy read keeps the ASCII start-time field.
+        let dir = std::env::temp_dir().join(format!("enforcer_stat_{}", std::process::id()));
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join("stat");
+        let mut stat = b"42 (qoder".to_vec();
+        stat.push(0xff);
+        stat.extend_from_slice(
+            b") S 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 45678 1000 100 0 0 0 0 0 0 0 0 0 0 0 0 17 0 0 0 0 0 0\n",
+        );
+        fs::write(&path, &stat).expect("write non-UTF-8 stat");
+
+        let text = read_proc_text_lossy(path.to_str().unwrap()).expect("lossy read must succeed");
+        assert!(text.starts_with("42 (qoder\u{fffd}) S "));
+        assert_eq!(parse_process_start_time(&text), Ok(45678));
+
+        assert!(read_proc_text_lossy("/proc/2000000000/stat").is_err());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parse_nspid_from_status_survives_a_lossy_name_line() {
+        // /proc/<pid>/status leads with `Name:`, so a non-UTF-8 comm decodes
+        // lossily in front of the NSpid line the resolver needs.
+        let status = "Name:\tqoder\u{fffd}\nPid:\t39560\nNSpid:\t39560\t1\nTgid:\t39560\n";
+        assert_eq!(parse_nspid_from_status(status), vec![39560, 1]);
+        // Missing line stays empty.
+        assert!(parse_nspid_from_status("Pid:\t39560\n").is_empty());
+    }
+
+    #[test]
     fn monotonic_event_time_is_converted_to_unix_epoch() {
         let occurred_at_ns =
             monotonic_to_epoch_ns(270_000_000_000, 271_000_000_000, 1_784_000_000_000_000_000);
@@ -1908,6 +2234,7 @@ mod tests {
             &active,
             1_784_000_000_000_000_000,
             Some(271_000_000_000),
+            Uuid::new_v4(),
         );
         assert_eq!(event.binding_id, active.binding.request.binding_id);
         assert_eq!(event.agent_id, "agent-1");
@@ -1941,6 +2268,7 @@ mod tests {
             &active,
             observed_at_ns,
             None,
+            Uuid::new_v4(),
         );
 
         assert_eq!(event.occurred_at_ns, observed_at_ns);
@@ -1955,6 +2283,7 @@ mod tests {
             &active_binding(),
             observed_at_ns,
             Some(271_000_000_000),
+            Uuid::new_v4(),
         );
 
         assert_eq!(event.occurred_at_ns, observed_at_ns);
@@ -1968,6 +2297,7 @@ mod tests {
             &active_binding(),
             observed_at_ns,
             Some(20),
+            Uuid::new_v4(),
         );
 
         assert_eq!(event.occurred_at_ns, observed_at_ns);

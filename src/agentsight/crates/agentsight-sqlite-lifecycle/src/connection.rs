@@ -9,6 +9,8 @@ use crate::LifecycleError;
 pub enum ConnectionMode {
     /// Open for reads and writes, creating the database when absent.
     ReadWriteCreate,
+    /// Open an existing database for reads and writes without creating it.
+    ReadWriteExisting,
     /// Open an existing database without allowing writes or creation.
     ReadOnlyExisting,
 }
@@ -38,8 +40,8 @@ impl Default for ConnectionOptions {
 ///
 /// # Errors
 ///
-/// Returns an error when the database is missing in read-only mode, its parent
-/// directory cannot be created, or SQLite rejects the connection settings.
+/// Returns an error when an existing-only mode cannot find the database, a
+/// create-mode parent directory cannot be created, or SQLite rejects the settings.
 pub fn open_connection(
     path: &Path,
     options: ConnectionOptions,
@@ -56,6 +58,12 @@ pub fn open_connection(
             }
             Connection::open(path)?
         }
+        ConnectionMode::ReadWriteExisting => {
+            if !path.is_file() {
+                return Err(LifecycleError::DatabaseMissing(path.to_path_buf()));
+            }
+            Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)?
+        }
         ConnectionMode::ReadOnlyExisting => {
             if !path.is_file() {
                 return Err(LifecycleError::DatabaseMissing(path.to_path_buf()));
@@ -65,19 +73,19 @@ pub fn open_connection(
     };
 
     connection.busy_timeout(options.busy_timeout)?;
-    if options.enable_wal && options.mode == ConnectionMode::ReadWriteCreate {
+    if options.enable_wal && options.mode != ConnectionMode::ReadOnlyExisting {
         connection.execute_batch("PRAGMA journal_mode=WAL;")?;
     }
 
     Ok(connection)
 }
 
-/// Result of a truncating WAL checkpoint.
+/// Result of a WAL checkpoint.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CheckpointOutcome {
-    /// All WAL frames were checkpointed and the WAL was truncated.
+    /// All WAL frames were checkpointed; truncation depends on the requested mode.
     Completed,
-    /// Another connection prevented the WAL from being truncated.
+    /// Another connection prevented the checkpoint from completing.
     Busy,
 }
 
@@ -90,6 +98,36 @@ pub fn checkpoint_truncate(connection: &Connection) -> Result<CheckpointOutcome,
     let busy: i32 =
         connection.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0))?;
     Ok(if busy == 0 {
+        CheckpointOutcome::Completed
+    } else {
+        CheckpointOutcome::Busy
+    })
+}
+
+/// Disables commit-time checkpoints when a background worker owns WAL maintenance.
+///
+/// Leaves synchronous durability unchanged. Call only after arranging periodic
+/// checkpoints so a long-running writer cannot grow its WAL indefinitely.
+///
+/// # Errors
+///
+/// Returns an error when SQLite rejects the connection setting.
+pub fn disable_auto_checkpoint(connection: &Connection) -> Result<(), LifecycleError> {
+    connection.pragma_update(None, "wal_autocheckpoint", 0)?;
+    Ok(())
+}
+
+/// Copies available WAL frames without waiting for readers or the live writer.
+///
+/// # Errors
+///
+/// Returns an error when SQLite cannot execute the checkpoint query.
+pub fn checkpoint_passive(connection: &Connection) -> Result<CheckpointOutcome, LifecycleError> {
+    let (busy, frames, copied): (i64, i64, i64) =
+        connection.query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })?;
+    Ok(if busy == 0 && copied >= frames {
         CheckpointOutcome::Completed
     } else {
         CheckpointOutcome::Busy
@@ -167,17 +205,109 @@ mod tests {
     }
 
     #[test]
-    fn read_only_open_never_creates_missing_database() {
-        let path = test_path("missing");
-        let result = open_connection(
+    fn existing_only_modes_never_create_missing_database_or_parent() {
+        for mode in [
+            ConnectionMode::ReadWriteExisting,
+            ConnectionMode::ReadOnlyExisting,
+        ] {
+            let parent = test_path("missing-parent");
+            let path = parent.join("database.db");
+            let result = open_connection(
+                &path,
+                ConnectionOptions {
+                    mode,
+                    ..ConnectionOptions::default()
+                },
+            );
+            assert!(matches!(result, Err(LifecycleError::DatabaseMissing(p)) if p == path));
+            assert!(!parent.exists());
+        }
+    }
+
+    #[test]
+    fn read_write_existing_is_writable_and_can_enable_wal() {
+        let path = test_path("existing");
+        let initial = open_connection(
             &path,
             ConnectionOptions {
-                mode: ConnectionMode::ReadOnlyExisting,
+                enable_wal: false,
                 ..ConnectionOptions::default()
             },
+        )
+        .unwrap();
+        drop(initial);
+
+        let connection = open_connection(
+            &path,
+            ConnectionOptions {
+                mode: ConnectionMode::ReadWriteExisting,
+                ..ConnectionOptions::default()
+            },
+        )
+        .unwrap();
+        connection
+            .execute_batch("CREATE TABLE writable (value INTEGER NOT NULL);")
+            .unwrap();
+        let journal: String = connection
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(journal, "wal");
+
+        drop(connection);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn managed_checkpoint_preserves_durability_and_yields_to_readers() {
+        let path = test_path("managed-checkpoint");
+        let writer = open_connection(&path, ConnectionOptions::default()).unwrap();
+        let synchronous: i64 = writer
+            .query_row("PRAGMA synchronous", [], |row| row.get(0))
+            .unwrap();
+        disable_auto_checkpoint(&writer).unwrap();
+        assert_eq!(
+            writer
+                .query_row("PRAGMA wal_autocheckpoint", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            0
         );
-        assert!(matches!(result, Err(LifecycleError::DatabaseMissing(p)) if p == path));
-        assert!(!path.exists());
+        assert_eq!(
+            writer
+                .query_row("PRAGMA synchronous", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            synchronous
+        );
+        writer
+            .execute_batch(
+                "CREATE TABLE records (payload BLOB); INSERT INTO records VALUES (zeroblob(8192));",
+            )
+            .unwrap();
+        assert_eq!(
+            checkpoint_passive(&writer).unwrap(),
+            CheckpointOutcome::Completed
+        );
+        let reader = open_connection(&path, ConnectionOptions::default()).unwrap();
+        reader
+            .execute_batch("BEGIN; SELECT * FROM records;")
+            .unwrap();
+        writer
+            .execute("INSERT INTO records VALUES (zeroblob(8192))", [])
+            .unwrap();
+        assert_eq!(
+            checkpoint_passive(&writer).unwrap(),
+            CheckpointOutcome::Busy
+        );
+        writer
+            .execute("INSERT INTO records VALUES (zeroblob(8192))", [])
+            .unwrap();
+        reader.execute_batch("COMMIT").unwrap();
+        assert_eq!(
+            checkpoint_passive(&writer).unwrap(),
+            CheckpointOutcome::Completed
+        );
+        drop(reader);
+        drop(writer);
+        fs::remove_file(path).unwrap();
     }
 
     #[test]

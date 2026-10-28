@@ -11,11 +11,21 @@ mod reuse;
 mod trajectories;
 
 use actix_cors::Cors;
-use actix_web::{App, HttpRequest, HttpResponse, HttpServer, Responder, get, web};
+use actix_web::{App, HttpRequest, HttpResponse, HttpServer, Responder, get, post, web};
+use agentsight_opt_store::{OptimizationMaintenancePolicy, OptimizationStore};
+use agentsight_sqlite_lifecycle::{LifecycleError, MaintenanceJob};
 use agentsight_trajectory_collector::TrajectoryStore;
 use include_dir::{Dir, include_dir};
+use serde::Deserialize;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
+
+use crate::config::{OPTIMIZATION_DB_NAME, REUSE_DB_NAME, StorageConfig, TRAJECTORY_DB_NAME};
+use crate::database::{
+    DatabaseAccess, DatabaseCoverage, DatabaseId, DatabaseManager, DatabaseManagerError,
+    DatabaseRole, DatabaseSpec,
+};
 
 /// Shared state for the macOS local server.
 ///
@@ -24,6 +34,10 @@ use std::sync::{Arc, RwLock};
 pub struct LocalState {
     pub trajectory_store: Arc<RwLock<Option<Arc<TrajectoryStore>>>>,
     pub db_path: PathBuf,
+    storage_config: StorageConfig,
+    config_path: Option<PathBuf>,
+    storage_budget: Arc<crate::storage_budget::StorageBudget>,
+    database_manager: Arc<DatabaseManager>,
     /// Trajectory reuse labels (`reuse.db`).
     ///
     /// `None` when the private store could not be opened: labels are a
@@ -53,7 +67,10 @@ impl LocalState {
             return None;
         }
 
-        match TrajectoryStore::open_read_only_existing(&self.db_path) {
+        match self.database_manager.open_read_only(
+            DatabaseId::Trajectories,
+            TrajectoryStore::open_read_only_existing,
+        ) {
             Ok(store) => {
                 let mut guard = self
                     .trajectory_store
@@ -226,20 +243,9 @@ async fn agent_process_health() -> impl Responder {
         Ok(summary) => {
             let mut rows = Vec::new();
             for agent in summary.agents {
-                for pid in agent.pids {
-                    rows.push(serde_json::json!({
-                        "pid": pid,
-                        "agent_name": agent.name,
-                        "category": agent.category,
-                        "exe_path": agent.cwd,
-                        "ports": [],
-                        "status": "no_port",
-                        "last_check_time": summary.scanned_at * 1000,
-                        "latency_ms": null,
-                        "error_message": "Local process discovered; HTTP health check is unavailable in local viewer mode",
-                        "role": "gateway",
-                        "has_crash": false
-                    }));
+                // One row per process, built from that process's own paths.
+                for process in &agent.processes {
+                    rows.push(agent_health_row(&agent, process, summary.scanned_at));
                 }
             }
             HttpResponse::Ok().json(serde_json::json!({
@@ -254,6 +260,39 @@ async fn agent_process_health() -> impl Responder {
     }
 }
 
+/// One `/api/agent-process-health` row for a discovered agent process.
+///
+/// `exe_path` is the executable and `workspace_path` the working directory,
+/// matching the Linux endpoint and the dashboard's `AgentHealthStatus`: the
+/// cwd used to be reported as `exe_path`, so the page showed a directory
+/// where it expects a binary and had no default protection directory (it
+/// reads `workspace_path`).
+///
+/// The row is built from the specific `process`: two instances of one agent
+/// (two Cursor windows) have distinct workspaces, and the dashboard seeds its
+/// protection directory from `workspace_path`, so an aggregate first-seen path
+/// would point half the rows at the wrong project.
+fn agent_health_row(
+    agent: &agents::AgentInfo,
+    process: &agents::AgentProcess,
+    scanned_at: u64,
+) -> serde_json::Value {
+    serde_json::json!({
+        "pid": process.pid,
+        "agent_name": agent.name,
+        "category": agent.category,
+        "exe_path": process.exe_path,
+        "workspace_path": process.cwd,
+        "ports": [],
+        "status": "no_port",
+        "last_check_time": scanned_at * 1000,
+        "latency_ms": null,
+        "error_message": "Local process discovered; HTTP health check is unavailable in local viewer mode",
+        "role": "gateway",
+        "has_crash": false
+    })
+}
+
 /// GET /api/export/atif/* — eBPF export is unavailable in local mode.
 #[get("/api/export/atif/{tail:.*}")]
 async fn export_atif_unavailable() -> impl Responder {
@@ -266,11 +305,42 @@ async fn export_atif_unavailable() -> impl Responder {
 /// GET /api/storage/status — local trajectory and optimization databases.
 #[get("/api/storage/status")]
 async fn storage_status(state: web::Data<LocalState>) -> impl Responder {
-    let base = state.db_path.parent().unwrap_or_else(|| Path::new("."));
     HttpResponse::Ok().json(crate::storage_status::collect_local_storage_status(
         &state.db_path,
-        &base.join(crate::config::OPTIMIZATION_DB_NAME),
+        &state.storage_config,
+        Some(&state.database_manager),
+        state.storage_budget.cap_mb(),
     ))
+}
+
+#[derive(Debug, Deserialize)]
+struct StorageConfigRequest {
+    max_total_size_mb: u64,
+}
+
+/// POST /api/storage/config — persist the local combined storage limit.
+#[post("/api/storage/config")]
+async fn update_storage_config(
+    state: web::Data<LocalState>,
+    body: web::Json<StorageConfigRequest>,
+) -> impl Responder {
+    if let Err(error) = StorageConfig::validate_total_size_mb(body.max_total_size_mb) {
+        return HttpResponse::BadRequest().body(error);
+    }
+    let Some(config_path) = state.config_path.as_deref() else {
+        return HttpResponse::ServiceUnavailable()
+            .body("configuration file unavailable: server started without --config");
+    };
+    if let Err(error) =
+        crate::storage_budget::write_total_size_limit(config_path, body.max_total_size_mb)
+    {
+        log::warn!("Failed to persist storage limit to {config_path:?}: {error}");
+        return HttpResponse::InternalServerError()
+            .body(format!("failed to persist configuration: {error}"));
+    }
+    HttpResponse::Ok().json(serde_json::json!({
+        "max_total_size_mb": body.max_total_size_mb
+    }))
 }
 
 /// Catch-all for any other unregistered /api/* path — returns empty array
@@ -350,6 +420,101 @@ pub fn local_trajectory_scan_dirs() -> Option<Vec<std::path::PathBuf>> {
     ])
 }
 
+fn local_database_specs(storage_config: &StorageConfig) -> Vec<DatabaseSpec> {
+    let private = storage_config.base_path.join(".agentsight-private");
+    let tokenless = dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".tokenless")
+        .join("stats.db");
+    vec![
+        DatabaseSpec::new(
+            DatabaseId::Trajectories,
+            storage_config.base_path.join(TRAJECTORY_DB_NAME),
+            DatabaseAccess::ReadOnly,
+            DatabaseCoverage::Partial,
+        ),
+        DatabaseSpec::new(
+            DatabaseId::Optimization,
+            storage_config.base_path.join(OPTIMIZATION_DB_NAME),
+            DatabaseAccess::ReadWrite,
+            DatabaseCoverage::Full,
+        ),
+        DatabaseSpec::new(
+            DatabaseId::Reuse,
+            private.join(REUSE_DB_NAME),
+            DatabaseAccess::ReadWrite,
+            DatabaseCoverage::Partial,
+        ),
+        DatabaseSpec::new(
+            DatabaseId::Tokenless,
+            tokenless,
+            DatabaseAccess::External,
+            DatabaseCoverage::External,
+        ),
+    ]
+}
+
+struct LocalMaintenanceStores {
+    optimization: Option<Arc<OptimizationStore>>,
+    reuse: Option<Arc<crate::reuse::ReuseStore>>,
+}
+
+fn local_maintenance_jobs(
+    manager: &DatabaseManager,
+    storage_config: &StorageConfig,
+    stores: LocalMaintenanceStores,
+    budget: Arc<crate::storage_budget::StorageBudget>,
+) -> Result<Vec<Box<dyn MaintenanceJob>>, DatabaseManagerError> {
+    let mut jobs = Vec::new();
+    for (id, policy) in [
+        (DatabaseId::Optimization, storage_config.optimization),
+        (DatabaseId::Reuse, storage_config.reuse),
+    ] {
+        if policy.check_interval_secs == 0 {
+            continue;
+        }
+        let interval = Duration::from_secs(policy.check_interval_secs);
+        let budget = Arc::clone(&budget);
+        let job = match id {
+            DatabaseId::Optimization => stores.optimization.as_ref().map(|store| {
+                let store = Arc::clone(store);
+                manager.maintenance_job(id, interval, move || {
+                    let limit_mb = budget.effective_limit_mb(id, policy.max_db_size_mb);
+                    store
+                        .maintain(OptimizationMaintenancePolicy {
+                            retention_days: policy.retention_days,
+                            max_db_size_mb: limit_mb,
+                        })
+                        .map(|_| ())
+                        .map_err(|error| LifecycleError::MaintenanceJobFailed(error.to_string()))
+                })
+            }),
+            DatabaseId::Reuse => stores.reuse.as_ref().map(|store| {
+                let store = Arc::clone(store);
+                manager.maintenance_job(id, interval, move || {
+                    let limit_mb = budget.effective_limit_mb(id, policy.max_db_size_mb);
+                    store
+                        .maintain(policy.retention_days, limit_mb)
+                        .map(|_| ())
+                        .map_err(|error| LifecycleError::MaintenanceJobFailed(error.to_string()))
+                })
+            }),
+            DatabaseId::Primary
+            | DatabaseId::GenAi
+            | DatabaseId::Interruptions
+            | DatabaseId::Trajectories
+            | DatabaseId::SecurityAudit
+            | DatabaseId::Enforcement
+            | DatabaseId::Causal
+            | DatabaseId::Tokenless => None,
+        };
+        if let Some(job) = job {
+            jobs.push(job?);
+        }
+    }
+    Ok(jobs)
+}
+
 // ─── Server entry point ───────────────────────────────────────────────────────
 
 /// Start the API server.
@@ -359,7 +524,9 @@ pub fn local_trajectory_scan_dirs() -> Option<Vec<std::path::PathBuf>> {
 pub async fn run_server(
     host: &str,
     port: u16,
+    storage_config: StorageConfig,
     reuse_llm_judge_enabled: bool,
+    config_path: Option<PathBuf>,
 ) -> std::io::Result<()> {
     let has_frontend = FRONTEND.get_file("index.html").is_some();
     log::info!(
@@ -379,21 +546,28 @@ pub async fn run_server(
         );
     }
 
-    // Open trajectory store for reading (collection is handled by `agentsight trace`).
-    // Uses lazy opening: if the DB doesn't exist at startup, handlers will
-    // re-check on each request so data appears once `trace` starts writing.
-    let db_path = dirs::data_local_dir()
-        .unwrap_or_else(|| std::path::PathBuf::from("."))
-        .join("agentsight")
-        .join("trajectories.db");
+    let database_manager = Arc::new(
+        DatabaseManager::new(
+            DatabaseRole::LocalServer,
+            local_database_specs(&storage_config),
+        )
+        .map_err(|error| std::io::Error::other(error.to_string()))?,
+    );
+    let db_path = storage_config.trajectory_path();
+
+    // Collection belongs to `agentsight trace`; serve opens only an existing
+    // read-only store and retries lazily if trace creates the database later.
     let initial_store: Option<Arc<TrajectoryStore>> = if db_path.exists() {
-        match TrajectoryStore::open_read_only_existing(&db_path) {
+        match database_manager.open_read_only(
+            DatabaseId::Trajectories,
+            TrajectoryStore::open_read_only_existing,
+        ) {
             Ok(store) => {
                 log::info!("Trajectory store initialized at {db_path:?}");
                 Some(Arc::new(store))
             }
-            Err(e) => {
-                log::warn!("Failed to open trajectory store: {e}");
+            Err(error) => {
+                log::warn!("Failed to open trajectory store: {error}");
                 None
             }
         }
@@ -402,39 +576,52 @@ pub async fn run_server(
         None
     };
 
-    // Beside the trajectory database but in its own directory: opening tightens
-    // that directory to 0700, and doing so where `trajectories.db` lives would
-    // cut off every other reader of it.
-    let private_dir = db_path
-        .parent()
-        .unwrap_or_else(|| std::path::Path::new("."))
-        .join(".agentsight-private");
-    let reuse_store = match crate::reuse::ReuseStore::open_private(&private_dir) {
+    // Opening the private reuse store creates the shared base directory as a
+    // parent, while keeping owner-only permissions scoped to its own child.
+    let reuse_store = match database_manager.open_read_write(DatabaseId::Reuse, |path| {
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        crate::reuse::ReuseStore::open_private(parent)
+    }) {
         Ok(store) => Some(Arc::new(store)),
         Err(error) => {
             log::warn!("Reuse label store unavailable, labels disabled: {error}");
             None
         }
     };
+    let optimization_store = match database_manager
+        .open_read_write(DatabaseId::Optimization, OptimizationStore::new_with_path)
+    {
+        Ok(store) => Some(Arc::new(store)),
+        Err(error) => {
+            log::warn!("Failed to open local optimization store: {error}");
+            None
+        }
+    };
+    let storage_budget = Arc::new(crate::storage_budget::StorageBudget::new(
+        config_path.clone(),
+        &storage_config,
+    ));
 
     let local_state = web::Data::new(LocalState {
         trajectory_store: Arc::new(RwLock::new(initial_store)),
         db_path,
-        reuse_store,
+        storage_config: storage_config.clone(),
+        config_path,
+        storage_budget: Arc::clone(&storage_budget),
+        database_manager: Arc::clone(&database_manager),
+        reuse_store: reuse_store.as_ref().map(Arc::clone),
         reuse_llm_judge_enabled,
     });
     let optimize_state = optimize::OptimizeState::init(
-        local_state
-            .db_path
-            .parent()
-            .unwrap_or_else(|| std::path::Path::new(".")),
+        &storage_config.base_path,
+        optimization_store.as_ref().map(Arc::clone),
     );
     let optimize_data = web::Data::new(optimize::OptimizeAppState {
         optimize: optimize_state,
         local_state: local_state.clone(),
     });
 
-    HttpServer::new(move || {
+    let server = HttpServer::new(move || {
         let cors = Cors::default()
             .allow_any_origin()
             .allowed_methods(vec!["GET", "DELETE", "POST", "OPTIONS"])
@@ -492,14 +679,33 @@ pub async fn run_server(
             .service(preferences::get_preference_turns)
             .service(export_atif_unavailable)
             .service(storage_status)
+            .service(update_storage_config)
             // Catch-all for unregistered API endpoints (returns empty array)
             .service(api_fallback)
             // Frontend static files (catch-all, must be last)
             .service(serve_frontend)
     })
-    .bind((host, port))?
-    .run()
-    .await
+    .bind((host, port))?;
+
+    let jobs = local_maintenance_jobs(
+        &database_manager,
+        &storage_config,
+        LocalMaintenanceStores {
+            optimization: optimization_store,
+            reuse: reuse_store,
+        },
+        storage_budget,
+    )
+    .map_err(|error| std::io::Error::other(error.to_string()))?;
+    database_manager
+        .start_maintenance(jobs)
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
+
+    let server_result = server.run().await;
+    let maintenance_result = database_manager
+        .stop_maintenance()
+        .map_err(|error| std::io::Error::other(error.to_string()));
+    server_result.and(maintenance_result)
 }
 
 #[cfg(test)]
@@ -531,6 +737,88 @@ mod tests {
         assert_eq!(dirs.len(), 6);
     }
 
+    #[test]
+    fn local_maintenance_schedules_only_writable_owned_databases() {
+        let base = std::env::temp_dir().join(format!(
+            "agentsight-local-maintenance-{}",
+            std::process::id()
+        ));
+        let mut config = StorageConfig::default();
+        config.base_path = base.clone();
+        std::fs::create_dir_all(&base).unwrap();
+        let manager =
+            DatabaseManager::new(DatabaseRole::LocalServer, local_database_specs(&config)).unwrap();
+        assert_eq!(
+            manager.spec(DatabaseId::Trajectories).unwrap().access,
+            DatabaseAccess::ReadOnly
+        );
+        assert_eq!(
+            manager.spec(DatabaseId::Tokenless).unwrap().access,
+            DatabaseAccess::External
+        );
+        let optimization = Arc::new(
+            manager
+                .open_read_write(DatabaseId::Optimization, OptimizationStore::new_with_path)
+                .unwrap(),
+        );
+        let reuse = Arc::new(
+            manager
+                .open_read_write(DatabaseId::Reuse, |path| {
+                    crate::reuse::ReuseStore::open_private(path.parent().unwrap())
+                })
+                .unwrap(),
+        );
+
+        let jobs = local_maintenance_jobs(
+            &manager,
+            &config,
+            LocalMaintenanceStores {
+                optimization: Some(Arc::clone(&optimization)),
+                reuse: Some(Arc::clone(&reuse)),
+            },
+            Arc::new(crate::storage_budget::StorageBudget::new(None, &config)),
+        )
+        .unwrap();
+        let ids = jobs.iter().map(|job| job.id()).collect::<Vec<_>>();
+        assert_eq!(ids, ["optimization", "reuse"]);
+        assert!(!ids.contains(&DatabaseId::Trajectories.as_str()));
+        assert!(!ids.contains(&DatabaseId::Tokenless.as_str()));
+
+        drop(jobs);
+        drop(optimization);
+        drop(reuse);
+        drop(manager);
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn local_maintenance_skips_zero_intervals() {
+        let base = std::env::temp_dir().join(format!(
+            "agentsight-local-maintenance-zero-{}",
+            std::process::id()
+        ));
+        let mut config = StorageConfig::default();
+        config.base_path = base.clone();
+        config.optimization.check_interval_secs = 0;
+        config.reuse.check_interval_secs = 0;
+        let manager =
+            DatabaseManager::new(DatabaseRole::LocalServer, local_database_specs(&config)).unwrap();
+
+        let jobs = local_maintenance_jobs(
+            &manager,
+            &config,
+            LocalMaintenanceStores {
+                optimization: None,
+                reuse: None,
+            },
+            Arc::new(crate::storage_budget::StorageBudget::new(None, &config)),
+        )
+        .unwrap();
+
+        assert!(jobs.is_empty());
+        let _ = std::fs::remove_dir_all(base);
+    }
+
     fn build_stub_app() -> App<
         impl actix_web::dev::ServiceFactory<
             actix_web::dev::ServiceRequest,
@@ -540,13 +828,34 @@ mod tests {
             InitError = (),
         >,
     > {
+        let db_path = std::env::temp_dir().join(format!(
+            "agentsight-missing-trajectory-{}-{}.db",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let database_manager = Arc::new(
+            DatabaseManager::new(
+                DatabaseRole::LocalServer,
+                [DatabaseSpec::new(
+                    DatabaseId::Trajectories,
+                    &db_path,
+                    DatabaseAccess::ReadOnly,
+                    DatabaseCoverage::Partial,
+                )],
+            )
+            .unwrap(),
+        );
+        let storage_config = StorageConfig::default();
         let local_state = web::Data::new(LocalState {
             trajectory_store: Arc::new(RwLock::new(None)),
-            db_path: std::env::temp_dir().join(format!(
-                "agentsight-missing-trajectory-{}-{}.db",
-                std::process::id(),
-                std::thread::current().name().unwrap_or("test")
+            db_path,
+            storage_budget: Arc::new(crate::storage_budget::StorageBudget::new(
+                None,
+                &storage_config,
             )),
+            storage_config,
+            config_path: None,
+            database_manager,
             reuse_store: None,
             reuse_llm_judge_enabled: false,
         });
@@ -568,9 +877,181 @@ mod tests {
             .service(skill_metrics)
             .service(agent_health)
             .service(agent_process_health)
+            // Reuse labels are mounted under /api/reuse, like every other API route.
+            .service(reuse::run_judgements)
+            .service(reuse::apply_label)
+            .service(reuse::confirm_labels)
+            .service(reuse::label_stats)
+            .service(reuse::list_sessions)
+            .service(reuse::run_triage)
             .service(export_atif_unavailable)
+            .service(storage_status)
+            .service(update_storage_config)
             .service(api_fallback)
             .service(serve_frontend)
+    }
+
+    #[test]
+    fn agent_health_rows_carry_exe_and_workspace_paths() {
+        // Two instances of one agent (e.g. two Cursor windows) share an agent
+        // id but not a workspace. Each health row must report the paths of the
+        // PID it describes; stamping the first-seen instance on every row made
+        // the dashboard seed the protection directory from an arbitrary
+        // instance whose "first" position depended on hash-map iteration order.
+        let agent = agents::AgentInfo {
+            id: "qoder".to_string(),
+            name: "Qoder".to_string(),
+            icon: "q".to_string(),
+            category: "coding".to_string(),
+            status: "running".to_string(),
+            pids: vec![42, 43],
+            process_count: 2,
+            cpu_percent: 1.0,
+            mem_mb: 2.0,
+            uptime_secs: 3,
+            cmdline_preview: "qoder --serve".to_string(),
+            cwd: "/Users/dev/project-a".to_string(),
+            exe_path: "/Applications/Qoder.app/Contents/MacOS/Qoder".to_string(),
+            processes: vec![
+                agents::AgentProcess {
+                    pid: 42,
+                    cwd: "/Users/dev/project-a".to_string(),
+                    exe_path: "/Applications/Qoder.app/Contents/MacOS/Qoder".to_string(),
+                    cmdline_preview: "qoder --serve".to_string(),
+                },
+                agents::AgentProcess {
+                    pid: 43,
+                    cwd: "/Users/dev/project-b".to_string(),
+                    exe_path: "/Applications/Qoder.app/Contents/MacOS/QoderHelper".to_string(),
+                    cmdline_preview: "qoder helper --serve".to_string(),
+                },
+            ],
+        };
+
+        let first = agent_health_row(&agent, &agent.processes[0], 1_700_000_000);
+        let second = agent_health_row(&agent, &agent.processes[1], 1_700_000_000);
+
+        assert_eq!(first["pid"], 42);
+        assert_eq!(
+            first["exe_path"],
+            "/Applications/Qoder.app/Contents/MacOS/Qoder"
+        );
+        assert_eq!(
+            first["workspace_path"], "/Users/dev/project-a",
+            "the working directory belongs in workspace_path, which is what the dashboard reads"
+        );
+
+        assert_eq!(second["pid"], 43);
+        assert_eq!(
+            second["exe_path"],
+            "/Applications/Qoder.app/Contents/MacOS/QoderHelper"
+        );
+        assert_eq!(
+            second["workspace_path"], "/Users/dev/project-b",
+            "each row must carry its own instance's workspace, not the first-seen one"
+        );
+    }
+
+    #[actix_web::test]
+    async fn storage_config_rejects_unsafe_cap_before_requiring_a_file() {
+        let app = actix_web::test::init_service(build_stub_app()).await;
+        let request = actix_web::test::TestRequest::post()
+            .uri("/api/storage/config")
+            .set_json(serde_json::json!({"max_total_size_mb": 8}))
+            .to_request();
+        let response = actix_web::test::call_service(&app, request).await;
+        assert_eq!(response.status(), actix_web::http::StatusCode::BAD_REQUEST);
+    }
+
+    #[actix_web::test]
+    async fn local_storage_config_updates_the_live_budget() {
+        let config_path = std::env::temp_dir().join(format!(
+            "agentsight-local-storage-config-{}.json",
+            std::process::id()
+        ));
+        std::fs::write(&config_path, r#"{"storage":{"max_total_size_mb":100}}"#).unwrap();
+        let db_path = config_path.with_file_name("missing-trajectories.db");
+        let database_manager = Arc::new(
+            DatabaseManager::new(
+                DatabaseRole::LocalServer,
+                [DatabaseSpec::new(
+                    DatabaseId::Trajectories,
+                    &db_path,
+                    DatabaseAccess::ReadOnly,
+                    DatabaseCoverage::Partial,
+                )],
+            )
+            .unwrap(),
+        );
+        let storage_config = StorageConfig::default();
+        let storage_budget = Arc::new(crate::storage_budget::StorageBudget::new(
+            Some(config_path.clone()),
+            &storage_config,
+        ));
+        let local_state = web::Data::new(LocalState {
+            trajectory_store: Arc::new(RwLock::new(None)),
+            db_path,
+            storage_config,
+            config_path: Some(config_path.clone()),
+            storage_budget: Arc::clone(&storage_budget),
+            database_manager,
+            reuse_store: None,
+            reuse_llm_judge_enabled: false,
+        });
+        let app = actix_web::test::init_service(
+            App::new()
+                .app_data(local_state)
+                .service(update_storage_config),
+        )
+        .await;
+
+        let request = actix_web::test::TestRequest::post()
+            .uri("/api/storage/config")
+            .set_json(serde_json::json!({"max_total_size_mb": 9}))
+            .to_request();
+        let response = actix_web::test::call_service(&app, request).await;
+        assert_eq!(response.status(), actix_web::http::StatusCode::OK);
+        assert_eq!(storage_budget.cap_mb(), 9);
+
+        std::fs::remove_file(config_path).unwrap();
+    }
+
+    #[actix_web::test]
+    async fn test_local_reuse_endpoints_are_mounted_under_api() {
+        let app = actix_web::test::init_service(build_stub_app()).await;
+
+        // The dashboard calls every reuse endpoint under /api. Mounted
+        // without the prefix the POSTs 404 and the GETs are swallowed by
+        // api_fallback, which answers 200 with an empty list.
+        for path in &[
+            "/api/reuse/triage",
+            "/api/reuse/judge",
+            "/api/reuse/sessions/abc/label",
+            "/api/reuse/sessions/labels:batch-confirm",
+        ] {
+            let req = actix_web::test::TestRequest::post()
+                .uri(path)
+                .set_json(serde_json::json!({}))
+                .to_request();
+            let resp = actix_web::test::call_service(&app, req).await;
+            assert_ne!(
+                resp.status(),
+                actix_web::http::StatusCode::NOT_FOUND,
+                "POST {path} is not mounted"
+            );
+        }
+
+        // Without a reuse store the handlers must answer "unavailable", not
+        // the api_fallback empty list that hides the miss.
+        for path in &["/api/reuse/label-stats", "/api/reuse/sessions"] {
+            let req = actix_web::test::TestRequest::get().uri(path).to_request();
+            let resp = actix_web::test::call_service(&app, req).await;
+            assert_eq!(
+                resp.status(),
+                actix_web::http::StatusCode::SERVICE_UNAVAILABLE,
+                "{path} did not reach the reuse handler"
+            );
+        }
     }
 
     #[actix_web::test]

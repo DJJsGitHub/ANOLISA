@@ -9,8 +9,9 @@
 use std::borrow::Cow;
 use std::time::Instant;
 
+use crate::engine::run_regex_rules_for_inputs;
 use crate::errors::CodeScanError;
-use crate::extractor::extract_inline_code;
+use crate::extractor::{extract_inline_code, extract_python_shell_commands};
 use crate::findings::{Finding, Verdict, build_summary, compute_verdict};
 use crate::rules::{Language, load_rules};
 use crate::run_regex_rules;
@@ -21,7 +22,7 @@ use crate::run_regex_rules;
 /// the daemon, so it reports the daemon workspace version instead. The value
 /// legitimately differs from V1 — the goldens only require it to be present and
 /// not the literal `"unknown"`.
-const ENGINE_VERSION: &str = env!("CARGO_PKG_VERSION");
+pub(crate) const ENGINE_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// The mode literal that selects the LLM engine.
 ///
@@ -45,7 +46,7 @@ pub struct ScanResult {
     pub verdict: Verdict,
     /// Human-readable one-line summary; wording is part of the contract.
     pub summary: String,
-    /// Every matching rule, in rule-load order; empty on pass or error.
+    /// Matching rules in load order, with embedded Shell findings after Python findings.
     pub findings: Vec<Finding>,
     /// Language the code was scanned as, after any inline rewrite.
     pub language: Language,
@@ -62,7 +63,7 @@ impl ScanResult {
     /// [`Verdict::Error`], the summary is `scan error: {message}`, and no
     /// findings are carried. `language` is whatever the caller was scanning as
     /// when the failure occurred.
-    fn error(language: Language, elapsed_ms: u64, error: &CodeScanError) -> Self {
+    pub(crate) fn error(language: Language, elapsed_ms: u64, error: &CodeScanError) -> Self {
         Self {
             ok: false,
             verdict: Verdict::Error,
@@ -78,10 +79,11 @@ impl ScanResult {
 /// Scans `code` written in `language` for security issues.
 ///
 /// This is the sole public entry point of the capability. When `rules` is
-/// `Some`, only rules whose id appears in it are run; `None` runs the whole set
-/// for the language. `mode` selects the engine: only the literal `"llm"` asks
-/// for the LLM engine, which this crate does not ship, so that request returns
-/// an error result; any other value runs the regex engine.
+/// `Some`, only rules whose id appears in it are run; `None` runs the language's
+/// rules plus Bash rules for direct Python command literals. The action executor routes `"llm"` to the
+/// injected local-model client; this direct regex entry point returns its
+/// V1-compatible unavailable result for that mode. Any other value runs the
+/// regex engine.
 ///
 /// Never returns `Err`: every failure is folded into an error [`ScanResult`],
 /// because the caller must always be able to act on a verdict.
@@ -94,7 +96,11 @@ pub fn scan(code: &str, language: Language, rules: Option<&[String]>, mode: &str
     }
 
     if mode == LLM_MODE {
-        return ScanResult::error(language, elapsed_ms(start), &CodeScanError::LlmUnavailable);
+        return ScanResult::error(
+            language,
+            elapsed_ms(start),
+            &CodeScanError::LlmUnavailable("LLM model not available".to_owned()),
+        );
     }
 
     // Resolved before the pipeline runs so that a failure reports the language
@@ -151,11 +157,26 @@ fn scan_with_regex(
     if let Some(enabled) = rules {
         rule_set.retain(|rule| enabled.iter().any(|id| id == &rule.rule_id));
     }
-    run_regex_rules(code, &rule_set, language)
+    let mut findings = run_regex_rules(code, &rule_set, language)?;
+    if language == Language::Python {
+        let commands = extract_python_shell_commands(code)?;
+        if !commands.is_empty() {
+            let mut shell_rules = load_rules(Language::Bash)?;
+            if let Some(enabled) = rules {
+                shell_rules.retain(|rule| enabled.iter().any(|id| id == &rule.rule_id));
+            }
+            findings.extend(run_regex_rules_for_inputs(
+                &commands,
+                &shell_rules,
+                Language::Bash,
+            )?);
+        }
+    }
+    Ok(findings)
 }
 
 /// Whole milliseconds elapsed since `start`, saturating rather than wrapping.
-fn elapsed_ms(start: Instant) -> u64 {
+pub(crate) fn elapsed_ms(start: Instant) -> u64 {
     u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
@@ -246,25 +267,32 @@ mod tests {
 
     #[test]
     fn rule_filter_narrows_the_active_set() {
-        let all = scan("rm -rf /tmp/test", Language::Bash, None, "regex");
-        let matched = all
-            .findings
-            .first()
-            .expect("a finding exists")
-            .rule_id
-            .clone();
-        let narrowed = scan(
-            "rm -rf /tmp/test",
-            Language::Bash,
-            Some(std::slice::from_ref(&matched)),
-            "regex",
-        );
-        assert!(narrowed.findings.iter().all(|f| f.rule_id == matched));
+        for (code, language) in [
+            ("rm -rf /tmp/test", Language::Bash),
+            (r#"os.system("rm -rf /tmp/test")"#, Language::Python),
+            (
+                r#"pickle.loads(data); os.system("rm -rf /tmp/test")"#,
+                Language::Python,
+            ),
+        ] {
+            let all = scan(code, language, None, "regex");
+            assert!(!all.findings.is_empty());
+            for finding in &all.findings {
+                let narrowed = scan(
+                    code,
+                    language,
+                    Some(std::slice::from_ref(&finding.rule_id)),
+                    "regex",
+                );
+                assert_eq!(narrowed.verdict, Verdict::Warn);
+                assert_eq!(narrowed.findings.as_slice(), std::slice::from_ref(finding));
+            }
 
-        let empty = scan("rm -rf /tmp/test", Language::Bash, Some(&[]), "regex");
-        assert!(empty.ok);
-        assert_eq!(empty.verdict, Verdict::Pass);
-        assert!(empty.findings.is_empty());
+            let empty = scan(code, language, Some(&[]), "regex");
+            assert!(empty.ok);
+            assert_eq!(empty.verdict, Verdict::Pass);
+            assert!(empty.findings.is_empty());
+        }
     }
 
     #[test]
@@ -288,6 +316,17 @@ mod tests {
             "tail rule was not reported: {:?}",
             result.findings
         );
+    }
+
+    #[test]
+    fn long_python_literals_do_not_exhaust_command_extraction() {
+        for quote in ["\"", "'", "\"\"\"", "'''"] {
+            let code = format!("example = {quote}{}{quote}", "a".repeat(600_000));
+            let result = scan(&code, Language::Python, None, "regex");
+            assert!(result.ok, "{}", result.summary);
+            assert_eq!(result.verdict, Verdict::Pass);
+            assert!(result.findings.is_empty());
+        }
     }
 
     #[test]

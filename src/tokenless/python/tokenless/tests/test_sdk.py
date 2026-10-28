@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import csv
+import io
 import json
 import re
 import tempfile
@@ -131,7 +133,7 @@ class TokenlessSdkTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(TokenlessError, "not authorized"):
             await sdk.retrieve(RetrieveRequest(marker.group(1), frozenset(), self.attribution))
 
-    async def test_html_extraction_is_opt_in_and_recovers_the_page(self) -> None:
+    async def test_html_extraction_is_on_by_default_and_recovers_the_page(self) -> None:
         original = (
             "<!DOCTYPE html><html><head><title>Guide</title></head><body>"
             "<nav><a href='/'>Home</a></nav><main><h1>Guide</h1>"
@@ -140,15 +142,19 @@ class TokenlessSdkTests(unittest.IsolatedAsyncioTestCase):
             "</body></html>"
         )
         default_sdk = self.sdk(rtk_enabled=False)
-        enabled_sdk = self.sdk(rtk_enabled=False, html_extraction_enabled=True)
-        for sdk, origin, applied in (
-            (default_sdk, ContentOrigin.COMMAND_OUTPUT, False),
-            (enabled_sdk, ContentOrigin.COMMAND_OUTPUT, True),
-            (enabled_sdk, ContentOrigin.API_RESPONSE, True),
-            (enabled_sdk, ContentOrigin.FILE_CONTENT, False),
-            (enabled_sdk, ContentOrigin.FILE_READ, False),
+        disabled_sdk = self.sdk(rtk_enabled=False, html_extraction_enabled=False)
+        for sdk, origin, command, applied in (
+            (disabled_sdk, ContentOrigin.COMMAND_OUTPUT, None, False),
+            (default_sdk, ContentOrigin.COMMAND_OUTPUT, None, True),
+            (default_sdk, ContentOrigin.COMMAND_OUTPUT, "cat page.html", False),
+            (default_sdk, ContentOrigin.COMMAND_OUTPUT, "cat page.html | head -c 9000", True),
+            (default_sdk, ContentOrigin.API_RESPONSE, "cat page.html", True),
+            (default_sdk, ContentOrigin.FILE_CONTENT, None, False),
+            (default_sdk, ContentOrigin.FILE_READ, None, False),
         ):
-            with self.subTest(enabled=sdk.config.html_extraction_enabled, origin=origin):
+            with self.subTest(
+                enabled=sdk.config.html_extraction_enabled, origin=origin, command=command
+            ):
                 attribution = Attribution("sdk-agent", "sdk-session", "html-1")
                 result = await sdk.post_tool(
                     PostToolRequest(
@@ -162,6 +168,7 @@ class TokenlessSdkTests(unittest.IsolatedAsyncioTestCase):
                             True, RecoveryMethod.tool("tokenless_retrieve"), True
                         ),
                         attribution=attribution,
+                        command=command,
                     )
                 )
                 self.assertEqual(result.content_type, ContentType.HTML)
@@ -211,6 +218,19 @@ class TokenlessSdkTests(unittest.IsolatedAsyncioTestCase):
             package_files.return_value.joinpath.return_value = object()
             with self.assertRaisesRegex(RuntimeError, "unpacked wheel"):
                 self.sdk()
+
+    def test_packaged_rtk_uses_the_platform_executable_name(self) -> None:
+        package = Path(self.temporary_directory.name) / "package"
+        (package / "_bin").mkdir(parents=True)
+        for platform, name in (("win32", "rtk.exe"), ("linux", "rtk"), ("darwin", "rtk")):
+            with self.subTest(platform=platform):
+                executable = package / "_bin" / name
+                executable.touch(mode=0o755)
+                with patch("sys.platform", platform), patch(
+                    "anolisa_tokenless.sdk.files", return_value=package
+                ):
+                    self.assertEqual(self.sdk()._rtk_path, executable)
+                executable.unlink()
 
     async def test_pre_tool_uses_core_rewrite_and_preserves_input(self) -> None:
         sdk = self.sdk()
@@ -421,7 +441,7 @@ class TokenlessSdkTests(unittest.IsolatedAsyncioTestCase):
         )
         default_sdk = self.sdk(rtk_enabled=False)
         self.assertFalse(default_sdk.config.diff_compression_enabled)
-        self.assertFalse(default_sdk.config.html_extraction_enabled)
+        self.assertTrue(default_sdk.config.html_extraction_enabled)
         enabled_sdk = self.sdk(rtk_enabled=False, diff_compression_enabled=True)
         for sdk, optimization, applied in (
             (default_sdk, OutputOptimization.NONE, False),
@@ -467,7 +487,7 @@ class TokenlessSdkTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(stats, sdk.stats)
         self.assertEqual(stats.status.data_dir, sdk.runtime.data_dir)
 
-    async def test_tabular_pipeline_preserves_raw_recovery_and_bypasses_retrieved_output(self) -> None:
+    async def test_tabular_pipeline_preserves_all_cells_without_recovery(self) -> None:
         sdk = self.sdk(rtk_enabled=False)
         for delimiter in (",", "\t"):
             with self.subTest(delimiter=delimiter):
@@ -492,14 +512,15 @@ class TokenlessSdkTests(unittest.IsolatedAsyncioTestCase):
                         attribution=Attribution("sdk-agent", "table-session", "table-call"),
                     )
                 )
-                self.assertEqual(result.applied_operations, (AppliedOperation.TABULAR_ROW_REDUCTION,))
+                self.assertEqual(result.applied_operations, (AppliedOperation.TABULAR_COMPACTION,))
                 self.assertEqual(result.content_type.value, "tabular")
-                self.assertEqual(result.recoverability.value, "retrievable")
-                self.assertIn("Incomplete table", result.output)
-                restored = await sdk.retrieve(
-                    RetrieveRequest(result.stash_keys[0], frozenset(result.stash_keys), self.attribution)
+                self.assertEqual(result.recoverability.value, "lossless")
+                self.assertEqual(result.stash_keys, ())
+                self.assertNotIn("Incomplete table", result.output)
+                self.assertEqual(
+                    list(csv.reader(io.StringIO(result.output), delimiter=delimiter)),
+                    list(csv.reader(io.StringIO(original), delimiter=delimiter)),
                 )
-                self.assertEqual(restored.payload.encode(), original.encode())
                 for kind, optimization in (
                     (ResultKind.RETRIEVE, OutputOptimization.NONE),
                     (ResultKind.TOOL, OutputOptimization.RTK),
@@ -508,7 +529,7 @@ class TokenlessSdkTests(unittest.IsolatedAsyncioTestCase):
                         PostToolRequest(
                             result_kind=kind,
                             tool_name="tokenless_retrieve",
-                            content=restored.payload,
+                            content=original,
                             status=ToolResultStatus.SUCCESS,
                             content_origin=ContentOrigin.API_RESPONSE,
                             output_optimization=optimization,

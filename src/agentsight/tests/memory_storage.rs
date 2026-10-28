@@ -23,7 +23,7 @@ fn make_llm_call(idx: usize) -> LLMCall {
         messages: vec![InputMessage {
             role: "user".to_string(),
             parts: vec![MessagePart::Text {
-                content: format!("hello world request number {}", idx),
+                content: format!("hello world request number {idx}"),
             }],
             name: None,
         }],
@@ -44,7 +44,7 @@ fn make_llm_call(idx: usize) -> LLMCall {
         messages: vec![OutputMessage {
             role: "assistant".to_string(),
             parts: vec![MessagePart::Text {
-                content: format!("hello world response number {}", idx),
+                content: format!("hello world response number {idx}"),
             }],
             name: None,
             finish_reason: Some("stop".to_string()),
@@ -54,7 +54,7 @@ fn make_llm_call(idx: usize) -> LLMCall {
     };
 
     let mut call = LLMCall::new(
-        format!("call-{}", idx),
+        format!("call-{idx}"),
         0,
         "openai".to_string(),
         "gpt-4o".to_string(),
@@ -112,7 +112,7 @@ fn run_with_batch(path: &PathBuf, batch: Option<BatchConfig>) -> RunResult {
     let store = GenAISqliteStore::new_with_path_and_batch(
         &db,
         batch,
-        agentsight::config::InsertStoragePolicy::default(),
+        agentsight::config::PeriodicStoragePolicy::default(),
     )
     .expect("create store");
 
@@ -147,8 +147,8 @@ fn sqlite_batch_lowers_write_overhead() {
         }),
     );
 
-    println!("no batch:  {:?}", no_batch);
-    println!("with batch: {:?}", with_batch);
+    println!("no batch:  {no_batch:?}");
+    println!("with batch: {with_batch:?}");
 
     // NOTE: We do NOT assert batch is faster than no-batch because in CI
     // environments (shared runners, cold disk cache) the difference can be

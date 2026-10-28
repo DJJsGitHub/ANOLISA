@@ -381,13 +381,21 @@ build_agent_sec_core_v2() {
     # wrapper scripts, which are therefore absent from this tarball.
     tar -cf - -C "${SEC_DIR}" \
         --exclude='target' \
-        v2/ | tar -xf - -C "$pkg_dir/"
+        v2/ \
+        packaging/systemd/skillsec.json | tar -xf - -C "$pkg_dir/"
 
     tar -czf "${BUILD_DIR}/SOURCES/${tarball_name}" -C "$tmp_dir" "${pkg_name}-${version}"
+
+    # Source1 is produced by the same helper used by package-vendor in CI.
+    local vendor_tarball="${pkg_name}-${version}-vendor.tar.gz"
+    local vendor_staging="${tmp_dir}/vendor"
+    log "Step 3/4: Creating vendor tarball ${vendor_tarball}..."
+    bash "${SEC_DIR}/scripts/package-v2-rpm-vendor.sh" "$pkg_dir" "$vendor_staging"
+    tar -czf "${BUILD_DIR}/SOURCES/${vendor_tarball}" -C "$vendor_staging" .
     rm -rf "$tmp_dir"
 
-    # Step 3: rpmbuild (--nodeps: BuildRequires are handled by yum-builddep in CI)
-    log "Step 3/3: Running rpmbuild..."
+    # Step 4: rpmbuild (--nodeps: BuildRequires are handled by yum-builddep in CI)
+    log "Step 4/4: Running rpmbuild..."
     "$RPMBUILD" -ba --nodeps \
         --define "_topdir ${BUILD_DIR}" \
         "$spec_file"
@@ -497,7 +505,10 @@ build_agentsight() {
         log "clang not found, installing..."
         install_package clang || { err "Failed to install clang"; return 1; }
     fi
-    (
+    local ENFORCER_BIN
+    ENFORCER_BIN=$(
+        set -e
+        exec 3>&1 1>&2
         cd "$SIGHT_DIR"
         # Build frontend (embed into Rust binary via include_dir!)
         if [ -d "${SIGHT_DIR}/dashboard" ] && command -v npm &>/dev/null; then
@@ -515,7 +526,7 @@ build_agentsight() {
             exit 1
         fi
         cargo build --release --bin agentsight
-        ./scripts/build-enforcer.sh
+        ./scripts/build-enforcer.sh >&3
     )
 
     # Step 2: Process spec template and create tarball
@@ -526,7 +537,7 @@ build_agentsight() {
     local tmp_dir
     tmp_dir=$(mktemp -d)
     local pkg_dir="${tmp_dir}/${pkg_name}-${version}"
-    "${SIGHT_DIR}/scripts/stage-rpm-payload.sh" "$pkg_dir"
+    ENFORCER_BIN="$ENFORCER_BIN" "${SIGHT_DIR}/scripts/stage-rpm-payload.sh" "$pkg_dir"
 
     tar -czf "${BUILD_DIR}/SOURCES/${tarball_name}" -C "$tmp_dir" "${pkg_name}-${version}"
     rm -rf "$tmp_dir"
@@ -1329,8 +1340,9 @@ usage() {
     echo ""
     echo "Packages:"
     echo "  copilot-shell             Build copilot-shell RPM"
-    echo "  agent-sec-core            Build agent-sec-core RPM"
-    echo "  agent-sec-core-v2         Build agent-sec-core RPM with the V2 Rust CLI/daemon"
+    echo "  agent-sec-core            Build agent-sec-core RPM with the V2 Rust CLI/daemon"
+    echo "  agent-sec-core-v1         Build agent-sec-core RPM with the legacy V1 Python CLI"
+    echo "  agent-sec-core-v2         Build agent-sec-core RPM with the V2 Rust CLI/daemon (alias)"
     echo "  os-skills                 Build os-skills RPM"
     echo "  agentsight                Build agentsight RPM"
     echo "  tokenless                 Build tokenless RPM"
@@ -1378,6 +1390,9 @@ case "$TARGET" in
         build_copilot_shell
         ;;
     agent-sec-core)
+        build_agent_sec_core_v2
+        ;;
+    agent-sec-core-v1)
         build_agent_sec_core
         ;;
     agent-sec-core-v2)
@@ -1427,7 +1442,7 @@ case "$TARGET" in
         ;;
     all)
         build_copilot_shell
-        build_agent_sec_core
+        build_agent_sec_core_v2
         build_agentic_os_skills
         build_agentsight
         build_tokenless

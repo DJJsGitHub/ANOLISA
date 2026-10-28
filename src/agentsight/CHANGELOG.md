@@ -1,13 +1,137 @@
 # Changelog
 
-## Unreleased
+## 0.15.0
+
+### Features
+- Discover Gemini CLI JSONL chats under `~/.gemini/tmp/<project>/chats/` in the trajectory collector and local viewer, including sub-agent transcripts and project names; the viewer also opens legacy whole-file chats. Sub-agent composite IDs do not link back to the parent row.
+- Add `--stats-only` to the standalone `analyze` CLI and batch-analysis wrapper for local `perf`/`cost` statistics without API credentials or LLM requests; `accuracy --stats-only` is rejected, and omitting the option retains model-backed analysis.
+- Expose the probe-independent `PipelineCore` Rust library API for parsing, correlating and analyzing events without attaching probes, and re-export `HttpContext` as `agentsight::analyzer::HttpContext` so library callers can name the HTTP data carried by `AnalysisResult::HttpContext`; existing command syntax and capture behavior are preserved.
 
 ### Fixes
-- Let `agentsight-enforcer` recover by itself when an upgrade leaves an
-  enforcement layout the new binary cannot reuse: the stale layout is now
-  detected and replaced automatically, so file-delete guard and enforcement
-  health no longer stay down until someone removes the old layout by hand.
-  (#3445)
+- Bound the Tokenless savings numerator by the request window when timestamps are available, excluding older optimizations when the Dashboard range narrows. Legacy local `stats.db` tables without `timestamp` retain all matching records, so their savings can still include out-of-window optimizations.
+- Count Tokenless records with a missing, null or upper-case mode as applied savings; only dry-run records are excluded.
+- Keep Anthropic server-tool and MCP tool calls, including their arguments, when a stream is reconstructed after the connection drains.
+- Treat a tool result that opens with a JVM or SQL exception as a tool failure in conversation grading and interruption detection, matching the grounding classifier.
+- Preserve non-streaming Anthropic, Responses, Gemini and legacy-completion answers and tool calls in token breakdowns instead of reporting zero output.
+- Preserve Gemini prompts, answers, tools and finish reasons when building calls from parsed messages without raw HTTP bodies.
+- Render the DeepSeek Harness `agentsight_status` tool result through text content blocks so the host and model receive the validated status.
+- Detect SSL symbols in Python executables and shared libpython images for the existing TLS capture path; retain retryable image reads and startup error causes.
+- Reject fault attempts that were not fully delivered instead of reporting a passing benchmark campaign. (#8890)
+- Recover interrupted benchmark campaigns by validating resume checkpoints, archiving unusable results and atomically replacing checkpoints. (#8857)
+- Reject invalid benchmark time controls before network/file operations and prevent PID reuse from corrupting process-survival and resource evidence. (#8889, #8856)
+- Preserve literal capture-database paths containing URI punctuation and valid JSONL records around damaged lines, with warnings for discarded records.
+- Treat missing or invalid recovery observations as gaps, reject invalid final drop counters, and report unproven recovery gates instead of claiming an improvement.
+- Read modern h2load request-latency summaries correctly, preserving mean, median, p95 and p99 without borrowing fields from adjacent rows.
+
+### Performance
+- Compute benchmark latency percentiles from one sorted snapshot and release unused fallback samples to reduce long-run work and memory use. (#8888)
+
+### Docs
+- Flatten the user manual layout.
+- Move the integrated ANOLISA container image sources from `docker/` to `distribution/docker/` and update the AgentSight deployment guide's entrypoint path; CLI syntax, image tags and container behavior are unchanged.
+
+## 0.14.3
+
+Combined release notes for the 0.14.2 and 0.14.3 release work. Previously shipped fixes recorded in 0.14.2 are identified separately below.
+
+### Features
+- Add read-only Hermes `state.db` trajectory collection and Claude SDK session discovery, including tool-result matching by call ID. (#8713)
+- Add Gemini CLI chat-file conversion to ATIF, including legacy JSON files and replay of conversation corrections; automatic discovery of `~/.gemini` chat files is not included. (#8801)
+- Add type, state and agent filters to interruption queries where applicable, agent-scoped summary totals, and JSON output for interruption resolution.
+- Add batch ATIF export without analysis and configurable parallel batch analysis.
+- Add `token --db`, `summary --tokenless-db`, and per-agent metrics in JSON for offline queries and scripts.
+- Add remote Tokenless statistics, refresh savings before queries, and count only savings from applied transformations.
+- Add daily skill-hotness reporting and RSS/CPU benchmark metrics.
+
+### Performance
+- Reduce capture overhead and database work, stream batch JSONL conversion, and reuse benchmark metric snapshots.
+- Add cooperative CPU pacing through `runtime_limits.cpu_budget_percent` (default 25% of one logical CPU; `0` disables pacing) and increase the default connection capacity from 32 to 128.
+
+### Fixes
+- Resolve gateway prefixes, vendor names and dated model aliases to usable tokenizers, including Gemini 2.5/latest/preview, GLM 4.5, Qwen 3.6, Kimi K2, GPT-5, and OpenAI audio/realtime families.
+- Preserve response text, reasoning, refusals, server-tool blocks and stop reasons across Anthropic, Gemini, Responses, OpenAI-compatible, GLM, Codex and DashScope providers, including incomplete, filtered and non-streaming responses.
+- Count streamed, cached and replayed token usage without duplication; retain complete token observations and fall back to raw-token counting when template rendering fails.
+- Keep parallel tool calls and results associated by choice and call ID, preserve partial tool inputs, and report tool outcomes and first-output timing accurately.
+- Preserve pending SysOM metadata and session attribution; retain main sessions, reasoning-only steps and parallel tool results during batch conversion, and isolate individual analysis failures.
+- Keep slow TLS handshakes from blocking new connections, isolate cancelled HTTP/2 streams, preserve final headers after interim HTTP responses, and report HTTP/2 first-token latency.
+- Include custom `serve --db` files in the storage budget and support BOM-prefixed storage, optimization and Tokenless configs.
+- Require credentials for storage settings and LLM-spending endpoints, use the Agent Security V2 socket, handle IPv4-mapped rule addresses, and bound Agent Security response lines.
+- Keep collected trajectories inspectable without GenAI records, refresh audit filters and trajectory savings, preserve UTF-8 previews, and retire stale model labels when content changes.
+- Improve session search, preference counting and causal evidence matching; distinguish handled tool failures from unresolved failures and require continuous evidence for recovery claims.
+- Record idle-agent OOM interruptions without duplicate kill reports, preserve truncated-turn state, and handle malformed counters, missing CPU measurements and failed reads explicitly.
+- Reuse the global Prometheus recorder and initialize metrics before workers; skip Python executables during static-SSL probing.
+
+### Previously shipped fixes recorded in 0.14.2
+- Preserve calls with no response body when an agent exits, and keep recap-only sessions inspectable with correct analyzer-row classification and per-session aggregates. These fixes were already present in 0.14.1 and are included here for the combined release summary, not as new 0.14.3 behavior. (#7271)
+
+### Upgrade notes
+- Review CPU pacing and connection limits before rollout; explicit existing connection limits are preserved, and CPU pacing is a cooperative target rather than a hard quota.
+- Scripts changing storage settings or invoking LLM-spending endpoints must supply credentials. Trajectory collection remains opt-in; Hermes collection requires access to its database and WAL files.
+
+## 0.14.2
+
+### Fixes
+- Record previously shipped fixes for calls with no response body at agent exit and recap-only session inspection, analyzer-row classification and per-session aggregates; the code was already included in 0.14.1. (#7271)
+
+## 0.14.1
+
+### Features
+- Accept `--db` in the query commands. (#7478)
+- Content-probe unknown executables for static BoringSSL, with negative caching of misses.
+- Support explicit prebuilt targets and build prebuilt agentsight artifacts in CI.
+
+### Fixes
+- Map OpenAI, Claude, Qwen3, InternLM, Baichuan, phi-3-small and yi-9b-chat model names to real, loadable tokenizers.
+- Parse Gemini streaming responses, honor final Anthropic usage, fold whole-message chat SSE snapshots, and parse CR-ended SSE lines. (#7329, #7193, #7398)
+- Aggregate HTTP/2 responses that finish before the request, cut chunked terminators only at line boundaries, and honor previously inert HTTP config options. (#6562)
+- Keep unindexed and nameless tool calls apart, match late results by tool call, and retain mixed tool results. (#7385)
+- Exempt trusted sinks by address, let exec wildcard basenames match any command, and map every legacy rule verb to an enforcement mode.
+- Preserve numeric JSON keys, null payload members, evidence numbers, and full cost signatures; keep every skill in reports and tolerate null agent names in CSV export. (#7451, #7032, #7403, #7413)
+- Treat CJK punctuation and pipes as literal delimiters, and keep health reporting working with a pre-epoch clock. (#7488, #7479, #7239)
+- Merge case-variant agents and models across filters, token breakdowns and model series. (#7456, #7184)
+- Isolate SQLite maintenance, serialize opt-store migration, and warn when purge stalls within the size limit.
+- Bound payload memory lifetimes and the protection scan directory. (#6781)
+- Harden audit windows, ATIF token totals and session ids, containment snapshots, and grounding evidence matching. (#7326, #7467)
+- Fix dashboard pagination, ranking refresh, cached-only step metrics, idle gaps, and timestamp precision. (#7183, #7093, #7091, #7089, #7095)
+- Let recap-only sessions materialize, retain captured session children, and split analyzer call kinds.
+- Gate server-only modules behind the server feature.
+
+## 0.14.0
+
+### Features
+- Unify SQLite storage under one configurable total cap (default 2200 MB); the largest databases are trimmed first and the cap is re-read without a restart.
+
+### Fixes
+- Preserve and correctly count streamed content, reasoning, tool calls, response IDs, finish reasons, and token usage across Anthropic, Gemini, Codex, and Responses providers.
+- Make agent discovery, trajectory filtering, reuse labels, semantic search, dashboard metrics, savings, and interruption aggregates more accurate and robust.
+- Harden enforcement, credential discovery, IMDSv2 access, BPF polling, process restart, OOM detection, and audit/event validation paths.
+- Make SQLite maintenance, storage budgeting, UTF-8 handling, SSE/HPACK parsing, and time handling resilient to malformed or edge-case input.
+- Support legacy kernel enforcement, wrapped inode guard labels, legacy function-call tool requests, and additional process/file reference formats.
+
+### Tests
+- Expand provider, SLS, trajectory, dashboard filter, storage-budget, and enforcement regression coverage.
+
+## 0.13.1
+
+### Features
+- Add JSON output and graceful CLI errors.
+
+### Fixes
+- Resolve namespace PIDs to host PIDs with an init-namespace self-check. (#3041)
+- Honor the RUST_LOG regex in the main logger. (#3186)
+- Add inode guard support for file-delete-guard on 5.10/6.6 kernels.
+- Drop the trace_id alias in the traces list. (#3261)
+- Fix a stale file descriptor in the enforcer ringbuf consumer after mmap advance.
+- Harden credential discovery.
+- Pin the drain trigger to membarrier.
+- Add a token-plan provider preset.
+- Recover empty tool_call names from request tool definitions.
+- Log semantic-search degradation causes. (#3443)
+- Harden the SQLite lifecycle.
+- Map qwen3.8-max to its tokenizer. (#3409)
+- Restore `agentsight-enforcer` automatically when an upgrade leaves a stale enforcement layout, so file-delete guard and enforcement health do not require manual cleanup. (#3445)
+- Keep an application's process tree under policy when its binding is recreated. (#3370)
+- Reject unsupported event filters on audit cases instead of silently ignoring them.
 
 ## 0.13.0
 

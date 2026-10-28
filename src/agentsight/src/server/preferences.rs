@@ -7,19 +7,16 @@
 //! cache, LLM merging, Markdown export) live in `crate::preferences::api`
 //! and are shared with the macOS local server.
 
-use std::collections::HashSet;
-
 use actix_web::{HttpResponse, Responder, get, web};
 use agentsight_opt::preference::{LlmPreference, analyze_user_turns};
 
 use super::AppState;
 use crate::preferences::api::{
-    AutoResolution, DEFAULT_TURNS_LIMIT, MAX_TURNS_LIMIT, PreferenceSourceParam, PreferencesQuery,
-    TurnsQuery, cache_get, cache_put, clamp_window_days, merge_llm_preferences, render_markdown,
-    resolve_auto, window_start_ns,
+    AutoResolution, PreferenceSourceParam, PreferencesQuery, TurnsQuery, cache_get, cache_put,
+    clamp_window_days, llm_input_turns, merge_llm_preferences, render_markdown, resolve_auto,
+    select_unique_turns, window_start_ns,
 };
 use crate::preferences::{aggregator, analyze_rows, detector, genai_source, trajectory_source};
-use crate::storage::sqlite::GenAISqliteStore;
 
 // ─── Source loading ──────────────────────────────────────────────────────────
 
@@ -30,22 +27,15 @@ fn load_genai_rows(
     data: &AppState,
     since_ns: i64,
 ) -> Result<Vec<detector::PreferenceEventRow>, String> {
-    if !data.storage_path.exists() {
-        return Err(
-            "SQLite storage is not enabled or no events have been captured yet.".to_string(),
-        );
-    }
-    let store = GenAISqliteStore::new_with_path(
-        &data.storage_path,
-        crate::config::InsertStoragePolicy::default(),
-    )
-    .map_err(|e| e.to_string())?;
+    let store = data.genai_store.as_deref().ok_or_else(|| {
+        "SQLite storage is not enabled or no events have been captured yet.".to_string()
+    })?;
     let raw = store
         .get_preference_window_events(since_ns)
         .map_err(|e| e.to_string())?;
     // Interpret raw columns here rather than in the store: the mapping strips
     // agent template noise and mines tool names, which is analysis, not storage.
-    Ok(raw
+    let mut rows: Vec<detector::PreferenceEventRow> = raw
         .iter()
         .map(|row| {
             genai_source::row_from_event(
@@ -57,7 +47,13 @@ fn load_genai_rows(
                 row.output_messages.as_deref(),
             )
         })
-        .collect())
+        .collect();
+    // The store returns chronological rows; the shared turn-selection contract
+    // (preferences::api) requires newest-first. Normalizing in the loader makes
+    // every source it returns newest-first, so both handlers hand rows
+    // straight to the shared selectors — exactly like the macOS handler.
+    rows.reverse();
+    Ok(rows)
 }
 
 /// Fetch one trajectory window from `trajectories.db` (lazily opened by the
@@ -82,7 +78,9 @@ fn source_unavailable(source: PreferenceSourceParam, reason: &str) -> HttpRespon
 
 /// Resolve the requested source and load its window. Returns the rows
 /// together with the source that actually served them (never `Auto`), so
-/// handlers can report real provenance in the response body.
+/// handlers can report real provenance in the response body. Rows arrive
+/// newest-first whatever the source: the genai loader reverses the store's
+/// chronological order and the trajectory source emits newest-first.
 fn load_rows(
     data: &AppState,
     source: PreferenceSourceParam,
@@ -218,7 +216,9 @@ async fn llm_findings(
     let client = state
         .build_client()
         .map_err(|_| "LLM not configured".to_string())?;
-    let turns: Vec<String> = rows.iter().filter_map(|r| r.user_text.clone()).collect();
+    // The loader returns newest-first rows (the shared selection contract);
+    // llm_input_turns answers in prompt order: most recent last.
+    let turns = llm_input_turns(rows.iter());
     analyze_user_turns(&client, &turns)
         .await
         .map_err(|e| e.to_string())
@@ -270,19 +270,9 @@ pub async fn get_preference_turns(
         Ok(loaded) => loaded,
         Err(resp) => return resp,
     };
-    let limit = query
-        .limit
-        .unwrap_or(DEFAULT_TURNS_LIMIT)
-        .clamp(1, MAX_TURNS_LIMIT);
-    let mut seen: HashSet<String> = HashSet::new();
-    let turns: Vec<String> = rows
-        .iter()
-        .filter_map(|r| r.user_text.clone())
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .filter(|s| seen.insert(s.clone()))
-        .take(limit)
-        .collect();
+    // Rows arrive newest-first from the loader — the order the turns
+    // contract documents.
+    let turns = select_unique_turns(rows.iter(), query.limit);
     HttpResponse::Ok().json(serde_json::json!({
         "window_days": window_days,
         "source": resolved.as_str(),

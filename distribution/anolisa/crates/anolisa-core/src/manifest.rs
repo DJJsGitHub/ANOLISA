@@ -468,6 +468,13 @@ pub struct ManifestHookSpec {
     /// Failure handling. When false (default), a failure warns and the verb
     /// continues; when true, it aborts and the installer rolls back. ws-ckpt's
     /// pre-uninstall recover stays false to match the RPM `recover || warn`.
+    ///
+    /// The same flag is the explicit contract for hook *phases* the
+    /// running CLI cannot execute: a strict declaration of such a phase
+    /// refuses the install/update (the author requires the hook to run and
+    /// this CLI cannot run it), while a non-strict declaration proceeds
+    /// with a warning naming the phase. Phases every CLI executes are
+    /// unaffected by this rule.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub strict: bool,
 }
@@ -1931,7 +1938,7 @@ mod tests {
             display_name = "Tokenless"
             owner = "tokenless-team"
             license = "MIT"
-            repository = "https://github.com/alibaba/anolisa"
+            repository = "https://github.com/agentic-os-org/ANOLISA"
 
             [component.contract]
             schema_version = "1.0"

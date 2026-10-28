@@ -23,7 +23,10 @@ fn anolisa_prefix_from_executable(executable: &Path) -> Option<&Path> {
     let cosh_ng_dir = executable.parent()?;
     let anolisa_dir = cosh_ng_dir.parent()?;
     let libexec_dir = anolisa_dir.parent()?;
-    if executable.file_name()? != "cosh-core"
+    let name = executable.file_name()?;
+    // Linux marks an unlinked executable this way even when launched through its pinned descriptor.
+    let core = name == "cosh-core" || (cfg!(target_os = "linux") && name == "cosh-core (deleted)");
+    if !core
         || cosh_ng_dir.file_name()? != "cosh-ng"
         || anolisa_dir.file_name()? != "anolisa"
         || libexec_dir.file_name()? != "libexec"
@@ -61,6 +64,23 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn system_data_roots_follow_unlinked_installation() {
+        for executable in [
+            "/opt/anolisa/usr/local/libexec/anolisa/cosh-ng/cosh-core (deleted)",
+            "/opt/anolisa/usr/libexec/anolisa/cosh-ng/cosh-core (deleted)",
+        ] {
+            assert_eq!(
+                system_data_dirs_for_executable(Some(Path::new(executable))),
+                vec![
+                    PathBuf::from("/opt/anolisa/usr/local/share/anolisa"),
+                    PathBuf::from("/opt/anolisa/usr/share/anolisa"),
+                ],
+            );
+        }
+    }
+
     #[test]
     fn system_data_roots_default_to_host() {
         for executable in [
@@ -70,6 +90,7 @@ mod tests {
             Some("/home/user/.local/lib/anolisa/libexec/cosh-ng/cosh-core"),
             Some("/work/target/debug/cosh-core"),
             Some("/opt/anolisa/usr/local/libexec/other/cosh-ng/cosh-core"),
+            Some("/opt/anolisa/usr/libexec/anolisa/cosh-ng/not-core (deleted)"),
         ] {
             assert_eq!(
                 system_data_dirs_for_executable(executable.map(Path::new)),

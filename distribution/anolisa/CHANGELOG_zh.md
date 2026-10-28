@@ -9,6 +9,123 @@
 
 ## [未发布]
 
+## [0.3.19] - 2026-10-25
+
+### 变更
+
+- 遥测和 `anolisa register status` 将容器部署识别为 `container`，避免继承宿主机的
+  云产品类型。读取 `product_type` 的程序需接受此新增值。`/etc/anolisa-release` 中
+  显式声明的 `PRODUCT_TYPE` 仍优先；构建容器镜像时需更新或移除过期声明
+  （[#8206](https://github.com/agentic-os-org/ANOLISA/pull/8206)）。
+- 组件目录更新至 Agent Memory `0.2.10`、AgentSight `0.14.3`、cosh-ng `0.28.0`、
+  Copilot Shell `2.8.0`、OS Skills `0.6.3`、SkillFS `0.5.3`、Tokenless `0.8.8`
+  和 ws-ckpt `0.6.0`。
+
+### 修复
+
+- 禁用 OpenClaw 和 Hermes skills 时保留用户新增或修改的文件；启用时拒绝写入
+  ANOLISA 不拥有的已有目录。祖先目录被重定向或成为悬空链接时停止清理并保留安装
+  记录，恢复原路径后可重试。没有逐文件归属信息的旧记录在通过相同路径检查后，
+  仍按整个目录清理
+  （[#6221](https://github.com/agentic-os-org/ANOLISA/pull/6221)）。
+- 移动包含平台依赖的完整 npm 安装目录后，启动器仍可运行。已有安装可通过重新
+  执行 postinstall 获得相对路径启动器
+  （[#8278](https://github.com/agentic-os-org/ANOLISA/pull/8278)）。
+- 遥测 enable、disable、link、unlink、upload 和 init 操作成功后遵循 `--json`，
+  同时支持 `--quiet --json`。标准响应包含对应操作的状态，警告仍写入 stderr
+  （[#8706](https://github.com/agentic-os-org/ANOLISA/pull/8706)）。
+- Raw 安装或更新遇到 CLI 无法执行的 hook 阶段时给出提示：非严格 hook 允许操作
+  继续，`strict = true` hook 则在下载或替换文件前拒绝操作。含不受支持 hook 声明
+  的旧安装仍可执行修复
+  （[#6447](https://github.com/agentic-os-org/ANOLISA/pull/6447)）。
+
+## [0.3.18] - 2026-10-15
+
+### 新增
+
+- 通过 `anolisa adapter enable tokenless qwenwork` 管理 QwenWorkCN macOS 本地模式的
+  Tokenless 插件。支持 QwenWorkCN `1.2.5`，保留操作中断后的归属记录；已有脚本安装
+  需先卸载再由 CLI 接管。完成后重启桌面应用并在应用内检查激活状态；CLI 验证文件，
+  但加载与激活状态均报告为 `unknown`
+  （[#7368](https://github.com/agentic-os-org/ANOLISA/pull/7368)）。
+
+### 变更
+
+- 组件目录中的 Tokenless 版本更新至 `0.8.7`。
+- 组件目录中的 Agent Memory 版本更新至 `0.2.9`。
+- 组件目录中的 SkillFS 版本更新至 `0.5.2`，可在兼容制品可用时识别 Linux ARM64 发布包。
+- 识别 ws-ckpt 的 Linux ARM64 发布包，并按预构建包布局查找 OpenClaw 和 Hermes 插件。
+
+### 修复
+
+- Raw 更新在替换文件前拒绝与已安装组件冲突的新版本，保留原版本及其管理记录
+  （[#7635](https://github.com/agentic-os-org/ANOLISA/pull/7635)）。
+- Raw 组件文件移除后仍可执行包内的 post-uninstall hooks；共享 hooks 保持原路径，
+  成功或失败后均清理临时 hook 副本，且不跟随暂存路径中的符号链接
+  （[#6450](https://github.com/agentic-os-org/ANOLISA/pull/6450)）。
+- OpenClaw 安装在修改宿主前被拒绝，或已确认插件不存在时，可正常禁用并重试；
+  宿主状态无法核实时保留清理记录，重试中断后也能继续恢复
+  （[#7197](https://github.com/agentic-os-org/ANOLISA/pull/7197)）。
+- 即使在 `umask 077` 下，新建安装目录也使用 `0755` 权限；保留已有目录及符号链接
+  目标的权限。
+- `--repo` 覆盖在获取仓库元数据前拒绝未展开的变量引用，并提示传入已解析的 URL。
+- sandbox 安装与 dry-run 预览执行相同的内核要求检查，保留显式 `--force` 预览，
+  并在报告计划成功前拒绝无效的要求格式
+  （[#7294](https://github.com/agentic-os-org/ANOLISA/pull/7294)）。
+- 拒绝未知的旧版注册记录版本，保留原记录与同意状态，避免执行不受支持的迁移。
+
+## [0.3.17] - 2026-10-11
+
+### 新增
+
+- OpenClaw 适配器启用新增 `--no-accept-capabilities`，可在安装和激活两个阶段
+  跳过自动 capability consent；该选项不撤销已有授权，也不启用 unsafe-install
+  覆盖权限（[#3554](https://github.com/agentic-os-org/ANOLISA/pull/3554)）。
+- 组件目录增加 `sec-core` raw 后端，可在发布索引提供兼容制品时通过 raw 路径安装
+  （[#6551](https://github.com/agentic-os-org/ANOLISA/pull/6551)）。
+
+### 变更
+
+- 组件目录中的 SkillFS 版本更新至 `0.5.1`。
+- 项目仓库地址更新为 `agentic-os-org/ANOLISA`，修正源码构建的克隆目录指引。
+- 修正 Intel Mac 安装说明：官网安装脚本已同时接受 ARM Mac 和 macOS 11 及以上的
+  Intel Mac；预构建包和 npm 安装需要使用包含 `darwin-x64` 制品的版本。
+
+### 修复
+
+- RPM 安装和预览在 preflight 检查前校验仓库后端配置，缺少配置时提前报错，
+  并保留显式仓库覆盖的行为。
+- 安装脚本只调整本次安装文件的权限，保留已有共享文件和目录的权限；
+  在 `umask 077` 下新建的安装路径也能正常访问。
+- npm 安装修复指向缺失目标的旧启动器，恢复 `anolisa` 命令可用性。
+- 归档安装准确匹配显式文件路径，避免选中其他同名文件；正确区分本地文件写入错误
+  与网络错误，避免无效下载重试。
+- 仓库 URL 在变量展开后再次校验，更新仓库配置时使用独立临时文件。
+- raw 仓库与自更新的终端错误不再泄露敏感 URL 信息。
+- 修正升级建议：CLI 自更新使用 `anolisa update self`，组件升级使用有效的
+  `anolisa update <component>` 命令。
+- Codex 各组件使用独立 marketplace 目录，避免相互覆盖；禁用插件时同步撤销
+  对应的 hook 信任。
+- Hermes 禁用操作失败时先核实宿主状态；插件仍启用时保留安装文件和管理记录，
+  便于重试。
+- 正确识别适配器父目录的路径别名，保留对最终插件链接的检查；仅采用绝对路径的
+  `XDG_CONFIG_HOME`。
+- `anolisa logs --since <RFC3339>` 按实际时间比较，正确处理时区偏移、小数秒和
+  包含边界的筛选。
+- 日志查询跳过损坏或截断的记录；追加日志前补齐上一条残缺记录的换行，
+  保留后续新记录。
+- 遥测续读轮转日志前核实文件身份；HTTP 408/429 上传失败可重试，
+  失败批次不推进读取偏移。
+- 收到 SIGTERM 后完成退出前的遥测处理，降低末批日志丢失风险；每轮重置可重试的
+  元数据获取状态，cloud-init 暂时失败可在后续轮次恢复。
+- 正确统计包含多个区间或单个编号的 CPU 列表。
+- hook 执行期间持续读取输出，避免管道堵塞造成误超时；privileged helper 在回复
+  关闭请求后能及时退出。
+- 修改注册状态时拒绝无法解析的 schema version；已有记录不可读时保留原记录及
+  同意状态。
+- 拒绝无效或溢出的内核版本要求，避免把错误要求视为已满足。
+- `cosh-ng` 故障报告指引明确要求在受影响的 cosh 会话内执行诊断。
+
 ## [0.3.16] - 2026-09-23
 
 ### 新增

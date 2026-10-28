@@ -15,6 +15,24 @@ use crate::commands::common;
 use crate::commands::tier1::rpm_install;
 
 #[test]
+fn no_deps_rejects_recorded_rpm_before_observation() {
+    for dry_run in [false, true] {
+        let (_tmp, ctx) = system_ctx_with_raw_repo(dry_run);
+        seed_tracked_rpm(&ctx, "copilot-shell", Ownership::RpmObserved);
+        let query = FakeQuery {
+            command_missing: true,
+            ..Default::default()
+        };
+        let mut args = args("copilot-shell");
+        args.no_deps = true;
+        let err = handle_one_with_query("copilot-shell".to_string(), args, &ctx, &query)
+            .expect_err("recorded RPM provenance must reject --no-deps");
+        assert_eq!(err.code(), "INVALID_ARGUMENT");
+        assert!(err.reason().contains("only supported by the raw backend"));
+    }
+}
+
+#[test]
 fn candidates_cli_override_matching_package_map_is_accepted() {
     let repo = repo_with_rpm_map(&[("cosh", "site-copilot")]);
     let backend = repo.backends.get("rpm");
@@ -956,6 +974,37 @@ fn delegated_install_requires_configured_rpm_backend() {
             "refused install must not write state"
         );
     }
+}
+
+#[test]
+fn dry_run_with_failing_preflight_still_refuses_unconfigured_backend_first() {
+    // Regression for the review finding on #3483: when the rpm backend is
+    // unconfigured AND the DNF preflight would fail, the refusal must be
+    // INVALID_ARGUMENT (BackendNotConfigured), not the preflight's
+    // EXECUTION_FAILED — and no host repository may be queried at all.
+    let (_tmp, ctx) = system_ctx_with_raw_repo(true);
+    let mut fake = FakeInstaller::new(
+        "copilot-shell",
+        pkg_info("copilot-shell", "2.3.0", Some("1.al8"), "x86_64"),
+    );
+    fake.preflight_failure_on_call = Some(1);
+    let mut a = args("copilot-shell");
+    a.backend = Some("rpm".to_string());
+
+    let err = install_component_with_deps("copilot-shell", &a, &ctx, &fake, &fake, true)
+        .expect_err("backend config check must precede the failing preflight");
+    assert_eq!(err.code(), "INVALID_ARGUMENT");
+    assert!(
+        err.reason().contains("backend 'rpm' is not configured"),
+        "got: {}",
+        err.reason()
+    );
+    assert_eq!(
+        fake.preflight_calls.get(),
+        0,
+        "preflight must not run without a configured backend"
+    );
+    assert_eq!(fake.install_calls.get(), 0);
 }
 
 #[test]

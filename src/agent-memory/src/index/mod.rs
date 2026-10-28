@@ -88,15 +88,19 @@ impl IndexHandle {
         store.search(query, top_k, self.exclude_cold)
     }
 
-    /// Search with agent scope filter.
+    /// Search with agent scope filter and optional fact-category filter.
+    ///
+    /// `category` is pushed into SQL so it applies *before* the `top_k` limit;
+    /// see `BM25Store::search_scoped`.
     pub fn search_scoped(
         &self,
         query: &str,
         top_k: usize,
         agent_scope: Option<&str>,
+        category: Option<&str>,
     ) -> Result<Vec<SearchHit>> {
         let store = self.store.lock().unwrap_or_else(|e| e.into_inner());
-        store.search_scoped(query, top_k, self.exclude_cold, agent_scope)
+        store.search_scoped(query, top_k, self.exclude_cold, agent_scope, category)
     }
 
     /// Deep search: include cold files too.
@@ -105,6 +109,10 @@ impl IndexHandle {
         store.search(query, top_k, false)
     }
 
+    /// Rank vector matches with the configured cold-file policy.
+    /// Superseded rows and cold rows excluded by `exclude_cold_on_search`
+    /// are filtered before ranking and never consume the `top_k` budget.
+    /// Vector rows without a matching file entry remain eligible.
     pub fn search_vec(&self, query_vec: &[f32], top_k: usize) -> Result<Vec<SearchHit>> {
         let store = self.store.lock().unwrap_or_else(|e| e.into_inner());
         let raw = store.search_vec(query_vec, top_k)?;
