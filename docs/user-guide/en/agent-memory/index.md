@@ -95,7 +95,7 @@ Add to your MCP config:
 }
 ```
 
-`/usr/share/anolisa/mcp-servers/agent-memory.json` lists all 37 tool names for auto-discovering clients.
+`/usr/share/anolisa/mcp-servers/agent-memory.json` lists tool names for auto-discovering clients.
 
 ### OpenClaw
 
@@ -223,7 +223,7 @@ The plugin passes a minimal env allowlist to the subprocess (`PATH`, `HOME`, `US
 
 ---
 
-## MCP tool set (37 tools)
+## MCP tool set (38 tools)
 
 All tools are invoked via MCP `tools/call` with JSON object arguments. Errors return `CallToolResult { isError: true }` so clients can distinguish business errors from "successful but content contains 'failed'". Profile is enforced at both `tools/list` and `tools/call`.
 
@@ -243,12 +243,40 @@ All tools are invoked via MCP `tools/call` with JSON object arguments. Errors re
 | `mem_promote` | `session_path`, `store_path` | — | atomically move session scratch file into the persistent store |
 | `mem_session_log` | — | — | current session JSONL |
 
-### Tier B — structured retrieval (6)
+`mem_edit` and `mem_write` with `overwrite=true` prepare a complete
+replacement for an existing regular file before publishing it. A write failure
+before publication leaves the original content intact. New files retain normal
+exclusive-create behavior and their destination parent's default ACL and group.
+
+Replacement requires readable/writable destination and metadata directories on
+the same filesystem, Linux procfs, and enough free space for the complete new
+content. Temporary files stay under `.anolisa/`, outside ordinary listings,
+searches, Git history and snapshots. File mode, POSIX access ACLs and `user.*`
+attributes must be preserved; failures abort before replacement. Owner and group
+are preserved when permitted; otherwise a warning records that writer ownership
+or the staging group is retained. Changed ownership can change owner/group-based
+access. Host-managed labels and integrity signatures
+are not copied: the replacement uses host defaults, so custom SELinux/IMA/EVM
+policies require host-specific validation. Set-ID bits and file capabilities are
+not retained. Other hard links and already-open handles keep the old content.
+An error saying the replacement was published but directory sync failed means
+new content is already visible; read the file before retrying.
+
+### Tier B — structured retrieval (7)
+
+For keyword search, pass ordinary text to `memory_search`, for example
+`{"query":"config.toml","mode":"bm25"}`. Dotted filenames, domains, and version
+numbers remain searchable terms. `AND`, `NOT`, and `OR` are literal words:
+searching `NOT NULL` looks for that text. Separate search terms with spaces
+instead of inserting `OR`. Multiple terms first require all terms to match; if none do, the existing fallback can return
+partial matches. Short terms, including two-character CJK words, retain their
+substring-search fallback.
 
 | Tool | Required | Optional | Returns |
 |------|------|------|------|
 | `memory_search` | `query` | `top_k` (default 5), `mode` (bm25/vector/hybrid), `category` | `{path, score, snippet, suspicious}` array |
 | `memory_observe` | `content` | `hint`, `type` | `observed at notes/observed/<ulid>.md` |
+| `memory_capture` | `content` | `hint`, `type` | observation path, or `automatic capture skipped by consent` |
 | `memory_get_context` | — | `max_tokens` (default 2048) | markdown preview of recently modified files; each entry has `suspicious` |
 | `memory_sessions` | — | `limit` (default 10) | historical session list |
 | `memory_timeline` | `session_id` | `limit` (default 50) | tool-call timeline for a specific session |
@@ -262,9 +290,11 @@ All tools are invoked via MCP `tools/call` with JSON object arguments. Errors re
 | `mem_snapshot_list` | — | — | array sorted by `created_at` |
 | `mem_snapshot_restore` | `id` | — | `restored <id>` |
 | `mem_log` | — | `limit` (default 20), `path` | `{hash, summary, author, time}` array (requires git) |
-| `mem_revert` | `path` | — | `reverted <path> (commit <hash>)` (requires git) |
+| `mem_revert` | `path` | — | `reverted <path> (from commit <hash>)` (requires git) |
 | `mem_consolidate` | — | — | `consolidation complete: N facts written` |
 | `mem_compact` | — | — | `compacted N files to cold storage` |
+
+`mem_revert` restores only the requested file's working-tree content from HEAD. It leaves Git history and the index unchanged, including any staged changes to that file, and returns the source HEAD hash. A later manual commit without restaging can therefore commit the pre-restore index contents; stage the restored file explicitly if that is what you intend to commit. Other files remain available for separate undo operations. This applies with either value of `memory.git.auto_commit`; ordinary write tools retain their existing auto-commit behavior.
 
 ### Sovereignty & import/export (13)
 
@@ -283,6 +313,45 @@ All tools are invoked via MCP `tools/call` with JSON object arguments. Errors re
 | `memory_summary` | — | `recent_limit` (default 10) | memory store statistics overview JSON |
 | `memory_session_context` | — | `limit` | session-start context injection |
 | `mem_dream` | — | — | user profile synthesis JSON |
+
+`memory_consent` with `{"action":"deny","scope":"capture"}` (or scope `all`)
+stops automatic OpenClaw observations. The hook uses `memory_capture`, which reads
+the persisted consent on each call, including changes made by another MCP client.
+Missing settings retain the default allow policy; unreadable or malformed settings
+report an error without writing. Allowed captures carry `source: auto-capture`
+and appear in `memory_auto_created` and the automatic count in `memory_summary`.
+Revocation applies to subsequent captures; it does not abort a capture that has
+already passed its consent check. This opt-out governs the hook, not all writes:
+`memory_observe` and `mem_write` remain ungated, including when an agent calls
+them on its own initiative. A denied or failed attempt can be retried by a later
+hook invocation; successful captures and overlapping identical calls remain
+deduplicated.
+
+The source field identifies automatic notes; audit entries and git commit labels
+still use `memory_observe` to preserve existing versioning and consolidation
+behavior. The existing consent query and consolidation reader keep their prior
+policies: malformed settings can be reported as default allow by the query even
+though automatic capture rejects them. For a malformed regular settings file,
+repair it with an explicit `memory_consent` allow/deny operation. If the
+settings path is a symlink, safe writes reject it too: inspect and remove the
+link itself (not its target), then repeat the allow/deny operation to create
+a regular settings file. The server does not remove symlinks automatically.
+
+Upgrade the server and adapter together. The four tools exposed to the OpenClaw
+agent remain unchanged; `memory_capture` is used by the hook. If the server lacks
+this tool, the hook logs the failure and does not fall back to `memory_observe`.
+Previously stored observations are not relabeled or deleted.
+
+`memory_summary` counts the `concepts` and `files` frontmatter lists in
+`top_concepts` and `top_files`. It accepts JSON string arrays and the block lists
+written by `mem_import`, so these rankings survive an AMA export/import round trip.
+For example, `concepts: ["parser, writer", "rust"]` contains two concepts, and
+`files: ["src/a,b.rs"]` contains one file reference. Commas, quotes and backslashes
+inside each single-line JSON string remain part of that entry.
+
+Import replaces ASCII control characters, including newlines, with spaces
+before storing frontmatter. Summary rankings reflect those normalized entries;
+control characters are not preserved by an AMA import round trip.
 
 ### Error code semantics
 
@@ -466,7 +535,7 @@ Every config key has a matching `MEMORY_*` env var. Priority: **env > config.tom
 | `MEMORY_MAX_WRITE_BYTES` | per-write cap | 16 MiB |
 | `MEMORY_MAX_APPEND_BYTES` | per-append cap | 4 MiB |
 | `MEMORY_INDEX_ENABLED` | enable FTS5 index | true |
-| `MEMORY_INDEX_TIME_DECAY_LAMBDA` | time decay (≥0) | 0.01 |
+| `MEMORY_INDEX_TIME_DECAY_LAMBDA` | time decay (finite, ≥0) | 0.01 |
 | `MEMORY_INDEX_TIME_DECAY_ALPHA` | time weight ratio (0–1) | 0.3 |
 | `MEMORY_INDEX_COLD_AFTER_DAYS` | cold archive days | 30 |
 | `MEMORY_INDEX_EXCLUDE_COLD` | exclude cold from search | true |
@@ -495,9 +564,9 @@ Data storage: `~/.anolisa/memory/<namespace>/`.
 
 Profiles are UX hints, not security boundaries, but enforced at both `tools/list` and `tools/call`:
 
-- **basic** — all 37 tools shown; weaker models can use the Tier B structured API.
-- **advanced** (default) — all 37 tools shown; stronger models should prefer Tier A file ops.
-- **expert** — hides Tier B (`memory_search`, `memory_observe`, `memory_get_context`, `mem_consolidate`, `memory_forget`, `memory_consent`); `tools/call` returns `METHOD_NOT_FOUND`. For proficient models that only need Tier A and Tier C.
+- **basic** — all 38 tools shown; weaker models can use the Tier B structured API.
+- **advanced** (default) — all 38 tools shown; stronger models should prefer Tier A file ops.
+- **expert** — hides Tier B (`memory_search`, `memory_observe`, `memory_capture`, `memory_get_context`, `mem_consolidate`, `memory_forget`, `memory_consent`); `tools/call` returns `METHOD_NOT_FOUND`. For proficient models that only need Tier A and Tier C.
 
 `expert` is a setting for direct MCP clients, which drive the Tier A file tools
 themselves. The OpenClaw adapter rejects

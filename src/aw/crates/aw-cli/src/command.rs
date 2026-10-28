@@ -66,7 +66,7 @@ enum Command {
         after_help = "No system service is installed. serve runs in the foreground."
     )]
     Service(Service),
-    /// Update an opted-in idle instance's policy, not installed software
+    /// Update a supported idle instance's runtime policy
     Update(Update),
     /// Query service and optional Provider views; may execute view commands
     Inspect(Inspect),
@@ -92,12 +92,15 @@ enum Command {
     /// Internal reloadable native lifecycle protocol
     #[command(hide = true)]
     Bridge(Bridge),
+    /// Internal resident SDK task lifecycle protocol
+    #[command(hide = true)]
+    Scope(Scope),
 }
 
 #[derive(Subcommand, Debug, PartialEq)]
 enum Agent {
     /// Connect supported native Hooks; does not install Agent software
-    Connect(Native),
+    Connect(Connect),
 }
 
 #[derive(Subcommand, Debug, PartialEq)]
@@ -141,6 +144,25 @@ struct Native {
     /// Native framework profile, not an AW deployment profile
     #[arg(long, value_name = "NAME")]
     native_profile: Option<String>,
+}
+
+#[derive(Args, Debug, PartialEq)]
+struct Connect {
+    #[command(flatten)]
+    native: Native,
+    #[command(flatten)]
+    attachment: Attachment,
+}
+
+#[derive(Args, Debug, PartialEq)]
+#[group(multiple = true)]
+struct Attachment {
+    /// Attach to an idle caller-owned Qoder TUI or QwenPaw App process
+    #[arg(long, value_name = "PID", value_parser = clap::value_parser!(u32).range(1..), requires_all = ["config", "agent"], conflicts_with = "native_profile")]
+    pid: Option<u32>,
+    /// Detach owned Hooks while idle; leave the native process running
+    #[arg(long, requires = "pid")]
+    remove: bool,
 }
 
 #[derive(Args, Debug, PartialEq)]
@@ -210,9 +232,9 @@ struct Update {
     /// Select an instance, optionally intersecting --agent
     #[arg(long, value_name = "ID", required_unless_present = "agent")]
     instance: Option<String>,
-    /// Candidate policy document; does not replace the launch configuration
-    #[arg(long, value_name = "FILE")]
-    policy: String,
+    /// Separate candidate; defaults to --config for an existing connection
+    #[arg(long, value_name = "FILE", required_unless_present = "config")]
+    policy: Option<String>,
     /// Optimistic concurrency precondition; no automatic retry on conflict
     #[arg(long, value_name = "SHA256")]
     expected_revision: Option<String>,
@@ -260,10 +282,24 @@ struct Hook {
     close_event: Option<String>,
 }
 
+#[derive(Args, Debug, PartialEq)]
+struct Scope {
+    #[command(flatten)]
+    bridge: Bridge,
+    #[arg(long, value_parser = ["open", "acknowledge", "close", "invoke"])]
+    action: String,
+    #[arg(long)]
+    event: Option<String>,
+    #[arg(long)]
+    step: Option<String>,
+    #[arg(long)]
+    on_error: Option<String>,
+}
+
 pub(crate) fn run(arguments: Vec<String>) -> crate::cli::Result<crate::cli::Exit> {
     if let Some(protocol) = arguments
         .first()
-        .filter(|name| matches!(name.as_str(), "hook" | "bridge"))
+        .filter(|name| matches!(name.as_str(), "hook" | "bridge" | "scope"))
     {
         // Native callbacks have fail-closed replies and exit codes even for
         // malformed arguments. Keep their exact parser and protocol boundary.

@@ -6,7 +6,8 @@
 # Actions is the only writer: it validates the decision against repository
 # metadata, applies the component label, optionally assigns owners for
 # allowlisted reporters, comments as github-actions[bot], and notifies the
-# component owners in the same run.
+# component owners in the same run. Applied SecCore routes also call the source
+# analysis workflow to review the Issue and publish its result.
 ###############################################################################
 
 name: Automation / Issue Router
@@ -61,6 +62,9 @@ jobs:
   triage:
     name: Validate and apply triage
     runs-on: anolisa-k8s-general-ci-x64
+    outputs:
+      mutated: ${{ steps.triage.outputs.mutated }}
+      component_label: ${{ steps.triage.outputs.component_label }}
     env:
       AUTOMATION_MODE: ${{ vars.COMMUNITY_AUTOMATION_MODE || 'apply' }}
       MIN_CONFIDENCE: ${{ vars.ISSUE_TRIAGE_MIN_CONFIDENCE || '0.80' }}
@@ -198,3 +202,23 @@ jobs:
               commentId: process.env.TRIAGE_COMMENT_ID,
               decisionId: process.env.DECISION_ID,
             });
+
+  sec-core-analysis:
+    name: Analyze the routed SecCore issue
+    needs: triage
+    if: >-
+      !cancelled() &&
+      github.repository_id == '1195873793' &&
+      needs.triage.outputs.mutated == 'true' &&
+      needs.triage.outputs.component_label == 'component:sec-core'
+    permissions:
+      contents: read
+      issues: write
+      actions: read
+    uses: ./.github/workflows/sec-core-issue-analysis.yml
+    with:
+      issue_number: ${{ fromJSON(inputs.issue_number) }}
+      target_ref: main
+      publish: true
+    secrets:
+      QODER_PERSONAL_ACCESS_TOKEN: ${{ secrets.QODER_PERSONAL_ACCESS_TOKEN }}

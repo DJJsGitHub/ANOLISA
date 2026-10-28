@@ -240,6 +240,119 @@ static __always_inline const struct inode_guard_val *te_inode_guarded(
 	return domain && *domain == val->domain_id ? val : NULL;
 }
 
+/* Mount- and domain-scoped path identity shared by every structured policy map.
+ * Registration must hold O_PATH identities so the recorded (ino, dev, mnt_id)
+ * cannot drift; mnt_id = 0 is reserved for the underlying-directory form that
+ * anchors a directory independently of the mounts exposing it. The generation
+ * makes a staged topology invisible until its activation record is published. */
+struct te_path_key {
+	__u64 ino;
+	__u32 dev;
+	__u32 mnt_id;
+	__u32 domain_id;
+	__u32 generation;
+};
+
+/* Production structured-policy map ABI. Root ids are stable normalized target
+ * ids in [1,64]. Masks keep exclusions scoped to their owning directory target,
+ * so an overlapping target can still protect an entry excluded by another root. */
+#define TE_POLICY_MAX_TARGETS 64
+#define TE_POLICY_NAME_MAX 255
+#define TE_POLICY_TARGET_DELETE 1
+#define TE_POLICY_TARGET_TREE   2
+
+struct te_policy_root_val {
+	__u64 root_mask;
+};
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 4096);
+	__type(key, struct te_path_key);
+	__type(value, struct te_policy_root_val);
+} te_policy_roots SEC(".maps");
+
+struct te_policy_dir_val {
+	__u64 root_mask;
+};
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 4096);
+	__type(key, struct te_path_key); /* mnt_id = 0 */
+	__type(value, struct te_policy_dir_val);
+} te_policy_dirs SEC(".maps");
+
+struct te_policy_stable_val {
+	__u64 target_mask;
+};
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 4096);
+	__type(key, struct te_path_key);
+	__type(value, struct te_policy_stable_val);
+} te_policy_stable SEC(".maps");
+
+struct te_policy_slot_key {
+	struct te_path_key parent;
+	__u32 name_len;
+	char name[TE_POLICY_NAME_MAX + 1];
+	__u32 _pad; /* Map-key tail bytes must be deterministic across languages. */
+};
+struct te_policy_slot_val {
+	__u64 direct_mask;
+	__u64 exact_exclude_mask;
+	__u64 subtree_exclude_mask;
+};
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 4096);
+	__type(key, struct te_policy_slot_key);
+	__type(value, struct te_policy_slot_val);
+} te_policy_slots SEC(".maps");
+
+struct te_policy_target_key {
+	__u32 domain_id;
+	__u32 generation;
+	__u32 target_id;
+	__u32 _pad;
+};
+struct te_policy_target_val {
+	struct inode_guard_val guard;
+	__u32 flags;
+	__u32 target_id;
+};
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 4096);
+	__type(key, struct te_policy_target_key);
+	__type(value, struct te_policy_target_val);
+} te_policy_targets SEC(".maps");
+
+struct te_policy_domain_val {
+	__u32 generation;
+	__u32 target_count;
+	__u64 tree_mask;
+	__u64 delete_mask;
+	__u64 ordinary_write_mask;
+	__u64 protection_set_id;
+	struct inode_guard_val guard;
+};
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 4096);
+	__type(key, __u32);
+	__type(value, struct te_policy_domain_val);
+} te_policy_domains SEC(".maps");
+
+struct te_policy_slot_scratch {
+	struct te_policy_slot_key key;
+};
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, __u32);
+	__type(value, struct te_policy_slot_scratch);
+} te_policy_slot_scratch SEC(".maps");
+
 static __always_inline int te_pid_protected(pid_t pid)
 {
 	__u32 *v = bpf_map_lookup_elem(&te_protected_pids, &pid);
@@ -2556,13 +2669,72 @@ int BPF_PROG(enforce_path_unlink, const struct path *dir, struct dentry *dentry)
 #endif
 }
 
-SEC("lsm/path_rename")
-int BPF_PROG(enforce_path_rename, const struct path *old_dir,
-	     struct dentry *old_dentry, const struct path *new_dir,
-	     struct dentry *new_dentry, unsigned int flags)
-{
-	(void)flags;
+/* Old path_rename hooks omit flags. Keep syscall context per thread, never
+ * interpret the chained LSM return slot as a fifth hook argument. Every syscall
+ * entry invalidates old context, including non-rename syscalls and compat ABIs.
+ * Missing/expired context cannot authorize a tree-affecting rename. */
+struct te_rename_context {
+	__u64 entered_ns;
+	__u32 flags;
+	__u32 _pad;
+};
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 4096);
+	__type(key, __u64);
+	__type(value, struct te_rename_context);
+} te_rename_context SEC(".maps");
 
+SEC("tracepoint/raw_syscalls/sys_enter")
+int guard_rename_enter(struct trace_event_raw_sys_enter *ctx)
+{
+	__u64 tid = bpf_get_current_pid_tgid();
+	bpf_map_delete_elem(&te_rename_context, &tid);
+	pid_t pid = tid >> 32;
+	if (!enforce_mode || !te_pid_active(pid))
+		return 0;
+	struct te_rename_context value = { .entered_ns = bpf_ktime_get_ns() };
+#if defined(__TARGET_ARCH_x86)
+	/* Native x86-64 only; compat/x32 numbers deliberately fail closed. */
+	if (ctx->id == 316)
+		value.flags = ctx->args[4];
+	else if (ctx->id != 82 && ctx->id != 264)
+		return 0;
+#elif defined(__TARGET_ARCH_arm64)
+	if (ctx->id == 276)
+		value.flags = ctx->args[4];
+	else if (ctx->id != 38)
+		return 0;
+#else
+	return 0;
+#endif
+	bpf_map_update_elem(&te_rename_context, &tid, &value, BPF_ANY);
+	return 0;
+}
+
+SEC("tracepoint/raw_syscalls/sys_exit")
+int guard_rename_exit(struct trace_event_raw_sys_exit *ctx)
+{
+	__u64 tid = bpf_get_current_pid_tgid();
+	bpf_map_delete_elem(&te_rename_context, &tid);
+	return 0;
+}
+
+SEC("tracepoint/sched/sched_process_exit")
+int guard_rename_task_exit(void *ctx)
+{
+	__u64 tid = bpf_get_current_pid_tgid();
+	bpf_map_delete_elem(&te_rename_context, &tid);
+	return 0;
+}
+
+static __always_inline int te_guard_rename(const struct path *old_dir,
+	struct dentry *old_dentry, const struct path *new_dir,
+	struct dentry *new_dentry, unsigned int flags, bool flags_valid)
+{
+	/* Both callers pass the syscall flags; only later stages classify them. */
+	(void)flags;
+	(void)flags_valid;
 	/* Inode guard fast path for the source (renamed-from) file */
 	pid_t pid = bpf_get_current_pid_tgid() >> 32;
 	const struct inode_guard_val *guard = NULL;
@@ -2585,6 +2757,30 @@ int BPF_PROG(enforce_path_rename, const struct path *old_dir,
 #else
 	return 0;
 #endif
+}
+
+SEC("lsm/path_rename")
+int BPF_PROG(enforce_path_rename, const struct path *old_dir,
+	     struct dentry *old_dentry, const struct path *new_dir,
+	     struct dentry *new_dentry, unsigned int flags, int ret)
+{
+	if (ret)
+		return ret;
+	return te_guard_rename(old_dir, old_dentry, new_dir, new_dentry, flags, true);
+}
+
+SEC("lsm/path_rename")
+int BPF_PROG(enforce_path_rename_legacy, const struct path *old_dir,
+	     struct dentry *old_dentry, const struct path *new_dir,
+	     struct dentry *new_dentry, int ret)
+{
+	if (ret)
+		return ret;
+	__u64 tid = bpf_get_current_pid_tgid();
+	struct te_rename_context *value = bpf_map_lookup_elem(&te_rename_context, &tid);
+	bool valid = value && bpf_ktime_get_ns() - value->entered_ns < 30000000000ULL;
+	unsigned int flags = valid ? value->flags : 0;
+	return te_guard_rename(old_dir, old_dentry, new_dir, new_dentry, flags, valid);
 }
 
 SEC("lsm/socket_connect")

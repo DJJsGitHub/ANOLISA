@@ -3,7 +3,9 @@
 [English](../../en/aw/security.md)
 
 sec-core 在工具执行前检查命令。发现风险或必需检查失败时，AW 可以阻止该次调用。
-包生成的配置检查 Qoder 的 `Bash` 和 OpenClaw 的 `exec`，其他工具需要另行配置。
+生成的 `scan-code` 步骤使用 `native:qoder:Bash` 和 `native:openclaw:exec` 选择
+Qoder 的 `Bash` 和 OpenClaw 的 `exec`，只包含生成时选定的 Agent。
+扫描其他工具须另行配置选择器和输入映射。
 这项能力通过原生 Hook 生效，不提供 OS 沙箱隔离。
 
 ## 准备程序与后台
@@ -73,15 +75,7 @@ git -c http.sslVerify=false --version
 校验的选项应被规则识别，Agent 应报告 AW 策略阻断。
 模型自行拒绝或没有调用工具不能算作 AW 检查通过；检查仍未执行时，查看 Agent 的原生提示。
 
-后台连接失败时，生成的安全配置会阻断调用。可以显式检查后台连接。
-
-```bash
-export AW_SEC_PROVIDER="$AW_PREFIX/libexec/aw/providers/sec-core"
-"$AW_SEC_PROVIDER/aw-provider-sec-core" --health \
-  --helper "$AW_SEC_PROVIDER/agent-sec-daemon-health" --socket "$AW_SEC_SOCKET"
-```
-
-`backend: authenticated_reachable` 表示后台可访问，不能代替实际工具调用的检查结果。
+检查失败时先确认 sec-core 后台与 socket。选中工具的输入或扫描错误按生成配置阻断，未选中的工具跳过扫描。
 
 ## 停止与扩展
 
@@ -89,6 +83,4 @@ export AW_SEC_PROVIDER="$AW_PREFIX/libexec/aw/providers/sec-core"
 前台试用后台用 Ctrl-C 停止；共享系统服务由其管理者维护。
 卸载 AW 保留外部后台配置和数据。
 
-需要检查其他工具或只记录不阻断时，阅读
-[工具映射与扫描模式](../../../developer-guide/zh/aw/sec-core.md#配置-provider)。
-未映射工具只产生观察记录，不会扫描。
+检查其他工具时，同时修改[步骤选择器](configuration.md#为-hook-步骤选择工具)和[Provider 输入映射](../../../developer-guide/zh/aw/providers/sec-core.md#配置-provider)。

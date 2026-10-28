@@ -62,7 +62,7 @@ fn runtime(command: &str, args: &cli::Arguments) -> cli::Result<cli::Exit> {
     }
     if matches!(
         command,
-        "run" | "hook" | "install" | "policy" | "update" | "bridge"
+        "run" | "hook" | "install" | "policy" | "update" | "bridge" | "scope"
     ) {
         return cli::dispatch(command, args);
     }
@@ -88,7 +88,9 @@ fn runtime(command: &str, args: &cli::Arguments) -> cli::Result<cli::Exit> {
             let baseline =
                 load(required("--against")?).map_err(|error| format!("baseline: {error}"))?;
             baseline.validate_policy_update(&candidate)?;
+            let projected_out_steps = output::projection::collect(&candidate)?;
             println!("policy update scope valid; runtime activation is not checked");
+            output::projection::human(&projected_out_steps, &mut std::io::stdout().lock())?;
         }
         "validate" | "serve" => {
             let mut bytes = Vec::new();
@@ -96,8 +98,10 @@ fn runtime(command: &str, args: &cli::Arguments) -> cli::Result<cli::Exit> {
                 .take(4 * 1024 * 1024 + 1)
                 .read_to_end(&mut bytes)?;
             if command == "validate" {
-                aw_config::Validator::new()?.parse(&bytes)?;
+                let config = aw_config::Validator::new()?.parse(&bytes)?;
+                let projected_out_steps = output::projection::collect(&config)?;
                 println!("configuration valid");
+                output::projection::human(&projected_out_steps, &mut std::io::stdout().lock())?;
             } else {
                 let server = Server::bind(bytes, PathBuf::from(required("--state-dir")?))?;
                 install_stop_signals()?;
@@ -131,6 +135,11 @@ fn runtime(command: &str, args: &cli::Arguments) -> cli::Result<cli::Exit> {
             let expires = Instant::now() + Duration::from_millis(budget);
             let client = cli::connect_service(args, expires)?;
             let result = client.call(operation, expires)?;
+            if command == "stop" {
+                if let Some(config) = args.flags.get("--config") {
+                    cli::connection::forget(std::path::Path::new(config), client.identity())?;
+                }
+            }
             println!(
                 "{}",
                 serde_json::to_string_pretty(

@@ -265,12 +265,22 @@ export class McpStdioClient {
       detached: false,
     });
 
-    this.proc.stdout?.on("data", (chunk: Buffer) => {
-      this.handleData(chunk.toString("utf8"));
+    // Decode both child streams through the stream's own incremental UTF-8
+    // decoder. A pipe can split one JSON-RPC reply anywhere, including inside
+    // a multibyte character, and decoding each Buffer chunk on its own turns
+    // both halves of that character into U+FFFD before JSON.parse ever runs —
+    // silently corrupting Chinese text, accents and emoji in tool results.
+    // setEncoding("utf8") keeps a trailing partial code point buffered until
+    // its remaining bytes arrive; the newline framing in handleData is
+    // unchanged, and each spawn gets a fresh stream decoder.
+    this.proc.stdout?.setEncoding("utf8");
+    this.proc.stdout?.on("data", (chunk: string) => {
+      this.handleData(chunk);
     });
 
-    this.proc.stderr?.on("data", (chunk: Buffer) => {
-      this.appendStderr(chunk.toString("utf8"));
+    this.proc.stderr?.setEncoding("utf8");
+    this.proc.stderr?.on("data", (chunk: string) => {
+      this.appendStderr(chunk);
     });
 
     this.proc.on("exit", (code, signal) => {

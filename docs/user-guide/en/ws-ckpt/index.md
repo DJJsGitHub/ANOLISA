@@ -62,6 +62,8 @@ ws-ckpt plugin uninstall --runtime openclaw
 
 `plugin install` first runs a detect script to verify prerequisites (exit 2 = missing prerequisite, abort; exit 1 = not installed but installable, continue), then runs the install script. Scripts live under `/usr/share/anolisa/adapters/ws-ckpt/<runtime>/`.
 
+For Hermes, each `plugins enable` or `plugins disable` call has a 30-second timeout, followed by up to 5 seconds before forced termination. If enabling fails or times out, installation retains the plugin link and warns you to run `hermes plugins enable ws-ckpt` manually once Hermes responds. If disabling fails or times out, uninstall warns and continues removing the local plugin, configuration entries, and skill. A running gateway may still need `hermes gateway restart` to apply the change. These limits apply to the Hermes CLI calls, not the whole installation or uninstall.
+
 The OpenClaw plugin requires OpenClaw >= 2026.2.13, the first release whose config write path avoids persisting runtime defaults and restores unchanged `${VAR}` references before writing to disk. OpenClaw >= 2026.9.1 uses conditional config writes. Versions from 2026.2.13 to <2026.9.1 use plain JSON writes only when the root config does not contain `$include`; otherwise installation stops before installing the plugin and requires an OpenClaw upgrade. An unparseable version, missing write capability, or failed allowlist update also aborts installation rather than leaving a partial integration. Uninstall remains best-effort: it removes local plugin files but warns and skips plugin unregister and allowlist cleanup when no safe config write is available.
 
 ---
@@ -108,16 +110,18 @@ snapshots. Keep this filter unchanged when continuing a cursor.
 Explicit-page JSON is an object with `snapshots` and `next_cursor`. Pages sort
 oldest first by `(created_at, workspace_id, snapshot_id)`. A cursor is opaque,
 versioned, scoped to the original workspace query, and carries the first page's
-upper bound, the maximum key observed in its index scan (not the current time).
+upper bound, the maximum key observed on the first page (not the current time).
 Inserts newer than that bound do not appear; inserts within the
 bound and deletions can still affect later pages. For a mutation-free,
 point-in-time listing, pause checkpoint and cleanup operations during the scan.
 
-The daemon reads each page from its in-memory snapshot index and does not scan
-snapshot file contents. Each page scans the query scope again: N snapshots over
-P pages require O(N * P) index visits, plus candidate maintenance and rendering.
-Only selected candidate keys are copied, but the repeated scan remains; no
-fixed latency is guaranteed. Pages target about 1 MiB and never exceed the 16 MiB IPC frame limit.
+The daemon seeks past the cursor in an in-memory ordered index for each queried
+workspace instead of rescanning every snapshot on each page. The order is rebuilt
+at startup and maintained as snapshots change; it uses additional memory
+proportional to the number of snapshots. Orphan-only queries may still inspect
+non-orphan keys within the remaining range. Listing does not read snapshot file
+contents, and no fixed latency is guaranteed. Pages target about 1 MiB and never
+exceed the 16 MiB IPC frame limit.
 If one entry's optional `message` or `metadata` would exceed that limit, the
 entry is returned as `detail: "summary"` with `omitted_fields`. Its retained
 `created_at`, `pinned`, and `missing` fields stay under `meta`, as in full entries;
@@ -289,6 +293,85 @@ There is no user-side global config file. Auto-checkpoint and cleanup behavior a
 ```bash
 hermes config set plugins.ws-ckpt.workspace /home/user/projects/my-project
 ```
+
+### Automatic checkpoints after rollback
+
+A successful, non-preview plugin rollback suppresses the next turn-end
+checkpoint only for the workspace that was restored. For example, rolling
+back an explicit workspace B leaves the configured workspace A's automatic
+checkpoint enabled. If you change the workspace before the hook runs, the
+suppression applies only when the hook actually targets a restored workspace.
+Pending suppression is then cleared, even if automatic checkpoints
+are disabled or the plugin is unavailable. Later turns checkpoint normally.
+Preview and failed rollbacks do not arm suppression. Turns with no
+pending rollback do not resolve registration paths for this check.
+
+OpenClaw binds the rollback tool to the host's `sessionKey`, and also to
+`sessionId` when the tool factory supplies it. Another session's `agent_end`
+cannot consume that state. OpenClaw 2026.2.13 omits `sessionId` from tool factories,
+so its compatibility path uses `sessionKey` alone; it cannot distinguish resets
+that reuse that key. Newer contexts with `sessionId` distinguish those conversation
+instances. If the host supplies no `sessionKey`, rollback remains available but
+does not arm suppression, and an unidentified hook cannot clear another session's
+state. Tool factories do not supply `runId`, so this does not distinguish
+concurrent runs within one session. Pending state stays in memory until its
+matching turn ends or the plugin process exits. Hermes retains workspace-scoped state; this change does not add session
+ownership to its hooks.
+
+You can address a rollback by workspace ID or registered path. A bare selector
+(with no path separator, except `.` and `..`) is resolved through
+`ws-ckpt status -w <selector> --format json` before a non-preview rollback.
+If that lookup fails, no rollback is executed; check daemon status or use the
+registered absolute path. A bare configured workspace also needs this lookup
+when a turn-end hook has pending suppression. If that lookup fails, the hook
+logs the failure, consumes the pending state and attempts its normal checkpoint.
+Path-addressed operations and turns without pending suppression add no status
+query. These lookups are separate daemon requests, not an atomic transaction
+with concurrent workspace unregister/re-registration.
+
+For path addressing, use the workspace's registered path, including its final
+symlink, rather than the live snapshot directory behind that link.
+Parent-directory aliases and equivalent path spellings still identify the same
+registration.
+
+### Hermes snapshot list pagination
+
+For a large history, call the existing `ws-ckpt-list` tool with a bounded first
+page, then request another page only when needed:
+
+```json
+{"limit":20}
+```
+
+A successful page is a JSON string containing
+`{"success":true,"snapshots":[...],"next_cursor":"..."}`. Copy the returned cursor
+unchanged into the next call:
+
+```json
+{"limit":20,"cursor":"<next_cursor>"}
+```
+
+Only `next_cursor:null` means completion. A short or empty page can still have a
+continuation cursor. Keep the configured workspace unchanged between calls.
+`limit` must be an integer from 1 to 10000; booleans, fractional values, strings,
+and explicit null are invalid. `cursor` must be a non-empty string; explicit null
+is invalid. Supplying only a cursor uses the CLI default limit of 1000.
+
+With neither key supplied, `{}` preserves the complete table and the existing
+`{"success":true,"output":"..."}` response. Explicit pagination performs one CLI
+call and returns `snapshots` and `next_cursor`, with no `output` wrapper or
+automatic traversal. It requires a pagination-capable CLI and matching daemon;
+no minimum release version is asserted here. Missing CLI, unsupported flags,
+invalid or cross-workspace cursors, daemon failures, timeouts, and malformed
+page output return `{"success":false,"error":"..."}` without retrying a full list.
+
+Each snapshot object is preserved, including nested `meta`, unknown fields,
+`detail:"summary"`, and `omitted_fields`. Omitted fields remain absent. Additional
+CLI envelope fields such as `elapsed_secs` are ignored. The count limit does not
+override the daemon byte budget: summaries and short pages remain possible.
+Pages follow the snapshot listing's ascending order and weak consistency; they
+are not a frozen view while snapshots are created or deleted. This option changes neither checkpoint/rollback state
+nor plugin configuration. OpenClaw's list tool is unchanged.
 
 ### CLI-Based Configuration
 

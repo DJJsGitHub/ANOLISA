@@ -7,6 +7,9 @@ use serde_json::{json, Value};
 use std::{fs, path::Path, process::Command};
 use support::{Fixture, Service};
 
+#[path = "pi/tool_scope.rs"]
+mod tool_scope;
+
 fn setup(fixture: &Fixture) -> Value {
     let node = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
         .map(|p| p.join("node"))
@@ -62,6 +65,56 @@ fn foreground_factory_installs_both_hooks_and_releases_binding() {
     assert_eq!(events[1]["name"], "tool.after");
     assert_eq!(events[0]["tool"]["call_id"], events[1]["tool"]["call_id"]);
     assert_eq!(events[0]["session_id"], "session-1");
+    assert!(fixture.root.join("side-effect").exists());
+    service.released(&fixture);
+}
+
+#[test]
+fn resident_observation_is_rejected_before_ready_but_off_is_allowed() {
+    for mode in ["auto", "off"] {
+        let fixture = Fixture::new();
+        let mut document = setup(&fixture);
+        document["spec"]["agents"]["pi"]["evidence"] = json!({
+            "source_id":"fixture", "endpoint":"http://127.0.0.1:1", "mode":mode,
+            "query_timeout_ms":100,
+            "query_bytes":1048576,"max_items":32,"max_bytes":262144,
+        });
+        fs::write(fixture.root.join("app.mjs"),
+            "import {writeFileSync} from 'node:fs'; import {join} from 'node:path';\nexport async function createSession(){throw new Error('factory must stay lazy');}\nexport async function runWorker(){writeFileSync(join(process.env.FAKE_ROOT,'worker-started'),'started');}\n").unwrap();
+        let service = Service::start(&fixture, &document);
+        let output = fixture.run(launch(&fixture));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if mode == "auto" {
+            assert!(!output.status.success());
+            assert!(
+                stderr.contains("AW resident Pi does not support AgentSight evidence"),
+                "{stderr}"
+            );
+            assert!(!stderr.contains("native hooks ready"));
+            assert!(!fixture.root.join("worker-started").exists());
+        } else {
+            assert!(output.status.success(), "{stderr}");
+            assert!(fixture.root.join("worker-started").exists());
+        }
+        service.released(&fixture);
+    }
+}
+
+#[test]
+fn legacy_pi_observation_remains_supported() {
+    let fixture = Fixture::new();
+    let mut document = setup(&fixture);
+    document["spec"]["agents"]["pi"]["evidence"] = json!({
+        "source_id":"fixture", "endpoint":"http://127.0.0.1:1", "query_timeout_ms":100,
+        "query_bytes":1048576,"max_items":32,"max_bytes":262144,
+    });
+    let service = Service::start(&fixture, &document);
+    let output = fixture.run(launch(&fixture));
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert!(fixture.root.join("side-effect").exists());
     service.released(&fixture);
 }
@@ -252,6 +305,38 @@ fn bridge_accepts_only_authorized_text_and_preserves_native_overrides() {
         output.status.success(),
         "{}\n{}",
         String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn model_producer_rejects_replayed_changed_and_overloaded_calls() {
+    let fixture = Fixture::new();
+    let mut command = Command::new("node");
+    command
+        .args(["--test", "--test-reporter=tap"])
+        .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/pi_producer.mjs"));
+    let output = fixture.run(command);
+    let report = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success() && report.contains("# pass 6") && report.contains("# fail 0"),
+        "{report}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn execution_drain_fences_registration_and_transport_failures() {
+    let fixture = Fixture::new();
+    let mut command = Command::new("node");
+    command
+        .args(["--test", "--test-reporter=tap"])
+        .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/pi_scope.mjs"));
+    let output = fixture.run(command);
+    let report = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success() && report.contains("# pass 5") && report.contains("# fail 0"),
+        "{report}\n{}",
         String::from_utf8_lossy(&output.stderr)
     );
 }

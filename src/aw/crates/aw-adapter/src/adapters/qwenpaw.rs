@@ -1,4 +1,4 @@
-//! QwenPaw App 2.2.2b4 middleware; the native runtime owns tool scheduling.
+//! QwenPaw App 2.2.2.post1 middleware; the native runtime owns tool scheduling.
 
 use crate::{
     adapter::{
@@ -19,7 +19,7 @@ use std::{
     time::Duration,
 };
 
-const VERSION: &str = "2.2.2b4";
+const VERSION: &str = "2.2.2.post1";
 pub(crate) struct QwenPaw;
 
 struct Prepared {
@@ -32,6 +32,7 @@ struct OwnedPlugin {
     path: PathBuf,
     identity: (u64, u64),
     created_parent: bool,
+    cleanup_on_drop: bool,
 }
 
 impl OwnedPlugin {
@@ -56,6 +57,7 @@ impl OwnedPlugin {
             path,
             identity: (metadata.dev(), metadata.ino()),
             created_parent,
+            cleanup_on_drop: true,
         };
         for (name, bytes) in [
             (
@@ -65,6 +67,26 @@ impl OwnedPlugin {
             (
                 "plugin.py",
                 include_bytes!("../../native/qwenpaw/plugin.py").as_slice(),
+            ),
+            (
+                "aw_private.py",
+                include_bytes!("../../native/qwenpaw/aw_private.py").as_slice(),
+            ),
+            (
+                "aw_resident.py",
+                include_bytes!("../../native/qwenpaw/aw_resident.py").as_slice(),
+            ),
+            (
+                "aw_mcp.py",
+                include_bytes!("../../native/qwenpaw/aw_mcp.py").as_slice(),
+            ),
+            (
+                "aw_native.py",
+                include_bytes!("../../native/qwenpaw/aw_native.py").as_slice(),
+            ),
+            (
+                "aw_scope.py",
+                include_bytes!("../../native/claude-sdk/aw_scope.py").as_slice(),
             ),
         ] {
             let mut file = OpenOptions::new()
@@ -102,7 +124,9 @@ impl OwnedPlugin {
 
 impl Drop for OwnedPlugin {
     fn drop(&mut self) {
-        let _ = self.cleanup();
+        if self.cleanup_on_drop {
+            let _ = self.cleanup();
+        }
     }
 }
 
@@ -179,10 +203,23 @@ impl Adapter for QwenPaw {
 
 impl PreparedLaunch for Prepared {
     fn capabilities(&self) -> Capabilities {
-        super::super::adapter::catalog::QWENPAW.capabilities(VERSION, "app")
+        let mut capabilities = super::super::adapter::catalog::QWENPAW.capabilities(VERSION, "app");
+        if !self.input.options.reloadable {
+            capabilities
+                .failure_actions
+                .insert("tool.after".into(), vec!["withhold_result".into()]);
+        }
+        capabilities
     }
 
     fn validate_steps(&self, steps: &[AdmittedStep]) -> Result<()> {
+        if !self.input.options.reloadable
+            && adapter::observation_enabled(&self.input.document, &self.input.target)
+        {
+            return Err(
+                "QwenPaw resident task scopes do not support native evidence capture".into(),
+            );
+        }
         if self.input.options.reloadable {
             crate::reload::validate(
                 &self.input.document,
@@ -199,6 +236,70 @@ impl PreparedLaunch for Prepared {
     }
 
     fn configure(&mut self, context: &LaunchContext<'_>) -> Result<LaunchPlan> {
+        self.configure_in(context, &self.working.clone())
+    }
+
+    fn attachment(
+        &mut self,
+        context: &LaunchContext<'_>,
+    ) -> Result<crate::attachment::Registration> {
+        let plan = self.configure_in(context, context.files.directory())?;
+        let descriptor: Value = serde_json::from_slice(&read_file(
+            context.files.directory().join("qwenpaw-hooks.json"),
+            1024 * 1024,
+        )?)?;
+        let source = context.files.directory().join("plugins/aw-native");
+        let mut output = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(source.join("aw-attachment.json"))?;
+        output.write_all(&serde_json::to_vec(&descriptor)?)?;
+        output.sync_all()?;
+        let args = &plan.command.args;
+        let mut port = 8088;
+        for (index, arg) in args.iter().enumerate() {
+            if arg == "--port" {
+                port = args
+                    .get(index + 1)
+                    .and_then(|arg| arg.to_str())
+                    .ok_or("missing App port")?
+                    .parse::<u16>()
+                    .map_err(|_| "invalid App port")?;
+            }
+            if let Some(value) = arg.to_str().and_then(|arg| arg.strip_prefix("--port=")) {
+                port = value.parse::<u16>().map_err(|_| "invalid App port")?;
+            }
+        }
+        // The attachment directory now owns staging, including failed-cleanup
+        // retries. Ordinary aw run retains Prepared's drop cleanup.
+        self.plugin
+            .as_mut()
+            .ok_or("missing staged plugin")?
+            .cleanup_on_drop = false;
+        Ok(crate::attachment::Registration::Qwenpaw {
+            profile: self.working.clone(),
+            port,
+            source,
+            descriptor,
+        })
+    }
+
+    fn finish(&mut self) -> Result<()> {
+        if let Some(plugin) = self.plugin.as_ref() {
+            plugin.cleanup()?;
+        }
+        self.plugin = None;
+        Ok(())
+    }
+}
+
+impl Prepared {
+    fn configure_in(
+        &mut self,
+        context: &LaunchContext<'_>,
+        plugin_root: &std::path::Path,
+    ) -> Result<LaunchPlan> {
         let (events, hooks) = if self.input.options.reloadable {
             (crate::reload::routes(), Vec::new())
         } else {
@@ -218,9 +319,11 @@ impl PreparedLaunch for Prepared {
                 "executable": context.executable, "binding": context.binding_path,
                 "ready_path": ready, "ready_token": token, "hooks": hooks,
                 "reloadable":self.input.options.reloadable,
+                "resident": !self.input.options.reloadable,
+                "resident_policy_reload": !self.input.options.reloadable,
             }))?,
         )?;
-        self.plugin = Some(OwnedPlugin::create(&self.working)?);
+        self.plugin = Some(OwnedPlugin::create(plugin_root)?);
         let mut command = self.input.command.clone();
         command.environment.insert(
             "QWENPAW_WORKING_DIR".into(),
@@ -242,14 +345,6 @@ impl PreparedLaunch for Prepared {
                 timeout: Duration::from_secs(30),
             }),
         })
-    }
-
-    fn finish(&mut self) -> Result<()> {
-        if let Some(plugin) = self.plugin.as_ref() {
-            plugin.cleanup()?;
-        }
-        self.plugin = None;
-        Ok(())
     }
 }
 
@@ -279,7 +374,7 @@ fn check_args(args: &[std::ffi::OsString]) -> Result<()> {
     Ok(())
 }
 
-fn event_routes(
+pub(crate) fn event_routes(
     document: &Value,
     steps: &[AdmittedStep],
     observe: bool,
@@ -307,7 +402,14 @@ fn event_routes(
             registration.reverse();
         }
         for step in registration {
-            hooks.push(json!({"event": event, "step": step.step_id, "on_error": step.on_error, "budget_ms": budget}));
+            let admitted = steps
+                .iter()
+                .find(|candidate| candidate.event == event && candidate.step_id == step.step_id);
+            let all_tools = vec!["*".to_owned()];
+            hooks.push(json!({"event": event, "step": step.step_id,
+                "on_error": step.on_error, "budget_ms": budget,
+                "event_tools": admitted.map(|step| &step.event_tools).unwrap_or(&all_tools),
+                "step_tools": admitted.map(|step| &step.step_tools).unwrap_or(&all_tools)}));
         }
         events.insert(
             event.into(),
@@ -339,7 +441,18 @@ fn normalize(binding: &NativeContext, event: &str, native: &Value) -> Result<Val
         return Err("QwenPaw callback event does not match the binding".into());
     }
     let session = identifier(&native["session_id"], "session_id")?;
-    let call = identifier(&native["tool_call"]["id"], "tool_call.id")?;
+    let native_call = identifier(&native["tool_call"]["id"], "tool_call.id")?;
+    let call = if let Some(value) = native.get("aw_invocation_id") {
+        let value = value
+            .as_str()
+            .ok_or("QwenPaw requires an invocation UUID")?;
+        if !super::sdk_tools::invocation_uuid(value) {
+            return Err("QwenPaw requires a canonical invocation UUID v4".into());
+        }
+        value
+    } else {
+        native_call
+    };
     let tool = identifier(&native["tool_call"]["name"], "tool_call.name")?;
     let input: Value = serde_json::from_str(
         native["tool_call"]["input"]
@@ -365,6 +478,43 @@ mod tests {
     use aw_provider::admission::StepExecution;
 
     #[test]
+    fn withholding_is_limited_to_the_ordinary_resident_launch() {
+        for reloadable in [false, true] {
+            let prepared = Prepared {
+                input: LaunchInput {
+                    document: json!({}),
+                    target: "target".into(),
+                    options: adapter::NativeOptions {
+                        reloadable,
+                        ..Default::default()
+                    },
+                    command: aw_exec::CommandSpec {
+                        program: "/not-launched".into(),
+                        args: vec![],
+                        cwd: "/".into(),
+                        environment: BTreeMap::new(),
+                    },
+                },
+                working: "/".into(),
+                plugin: None,
+            };
+            assert_eq!(
+                prepared
+                    .capabilities()
+                    .failure_actions
+                    .contains_key("tool.after"),
+                !reloadable
+            );
+        }
+        for profile in super::super::super::adapter::catalog::PROFILES {
+            assert!(profile
+                .capabilities("fixture", "fixture")
+                .failure_actions
+                .is_empty());
+        }
+    }
+
+    #[test]
     fn replacement_registers_outermost_so_observers_unwind_first() {
         let steps: Vec<_> = ["observe", "user", "compress"]
             .into_iter()
@@ -372,6 +522,8 @@ mod tests {
                 event: "tool.after".into(),
                 step_id: id.into(),
                 provider: id.into(),
+                event_tools: vec!["*".into()],
+                step_tools: vec!["*".into()],
                 on_error: "report".into(),
                 execution: if id == "user" {
                     StepExecution::Native
@@ -401,6 +553,9 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["compress", "user", "observe"]
         );
+        assert!(hooks
+            .iter()
+            .all(|hook| hook["event_tools"] == json!(["*"]) && hook["step_tools"] == json!(["*"])));
         assert_eq!(
             events["tool.after"].replacement_step.as_deref(),
             Some("compress")

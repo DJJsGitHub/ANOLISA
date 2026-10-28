@@ -3,7 +3,7 @@
 [English](../../en/tokenless/framework-integration.md)
 
 Tokenless 通过 Plugin、Hook 和 Extension 接入具体 Agent 产品。本文只说明产品 Adapter。
-Python SDK 及其 AgentScope 专用子文档放在 [Python SDK 指南](sdk.md) 下。
+Python SDK 及其 AgentScope 专用子文档放在 [Python SDK 指南](../../../developer-guide/zh/sdk/tokenless/index.md) 下。
 
 当解析器无法保留某个 JSON 数字的值时，PostTool 会保持整个响应原样。其他响应仍可进行清理和 Record Reduction；Core 仅在 TOON 解码后保留相同的值与类型时采用它。
 
@@ -79,9 +79,43 @@ Core。只有宿主槽支持文本且 Core 找到更小的合法表示时才会�
 
 Common Hook 与 OpenClaw 会把 RTK 所有权传给匹配的 PostTool 调用。Hermes 为兼容旧宿主版本
 采用阻止后建议重试；最终结果 Hook 会从 Hermes 实际执行的命令中识别带 Attribution 的 RTK
-Wrapper。因此三者都会让 RTK 输出绕过第二次压缩。
+Wrapper（含可选的执行批次参数）。只有完整回执确认成功调用的输出字节未变，Core 才恢复 PostTool，并用保存的原命令
+检查文件来源。宿主必须在 PostTool 的 `command` 中传回注册的完整执行命令；命令缺失或被修改，
+以及输出已改变或无法确认时，均保持旁路。三种 Adapter 在回执查询前均为 RTK 输出声明
+`recovery: none`，因此回退仅接受无损候选，不会为这些调用启用 Stash/retrieve 恢复。
 
 Claude Code 需要 2.1.121 或更高版本才能使用 `updatedToolOutput`。版本更旧或无法确定时，响应压缩会关闭，以免重复注入原文。结构化工具输出会保留宿主 Schema，不会转换成文本 TOON；以字符串承载的 JSON 在 TOON 更小时可以使用 TOON。
+
+### 千问办公（Windows x64 本地模式）
+
+Tokenless 可在千问办公中自动精简受支持的命令和工具输出，保留文件读取原文。
+Windows 支持范围为 x64 上的千问办公 1.3.2 本地会话，需要安装 Node.js/npm 和
+Python 3.10+。不支持 Windows ARM64 和安全工作区／VM 会话，其他 Windows Agent
+尚未验证。
+
+Windows 安装包尚未发布，目前需按
+[Windows 构建说明](../../../developer-guide/zh/tokenless/windows.md#在-windows-上构建和测试)构建并安装本地 npm 包。
+
+安装 npm 包后，退出千问办公，在 PowerShell 中执行：
+
+```powershell
+$adapter = Join-Path (npm root -g) 'anolisa-tokenless/adapters/tokenless/qwenwork/scripts/lifecycle.ps1'
+& $adapter -Action detect
+& $adapter -Action install
+```
+
+重启千问办公，在应用内按需启用 Tokenless 插件，再开启新的本地会话。
+之后照常使用千问办公，受支持的输出会自动精简。
+
+如果找不到 Python，可在上述命令后添加 `-Python 'C:/path/to/python.exe'`。
+千问办公安装在自定义位置时，先将 `TOKENLESS_QWENWORK_APP` 设置为包含
+`QwenWorkCN.exe` 的目录，再执行安装命令。
+
+卸载时先退出千问办公，执行以下命令后再重启应用：
+
+```powershell
+& $adapter -Action uninstall
+```
 
 ### 千问办公（macOS）
 
@@ -504,7 +538,7 @@ SDK Wheel；0.7.14 Wheel 不提供这些 API。工作目录与 QwenPaw 本身的
 ## AgentScope 框架集成
 
 AgentScope 是 Python SDK 的第二层，不是产品 Adapter。完整的构建、版本、挂载、配置与验证说明
-现已放在 [AgentScope SDK 集成](sdk/agentscope.md) 子文档。本标题继续保留，作为已有链接的兼容入口。
+现已放在 [AgentScope SDK 集成](../../../developer-guide/zh/sdk/tokenless/agentscope.md) 子文档。本标题继续保留，作为已有链接的兼容入口。
 
 ## 验证 Agent Adapter
 
@@ -521,8 +555,8 @@ tokenless stats list --limit 5
 ## 相关文档
 
 - [快速开始](index.md)
-- [Python SDK](sdk.md)
-- [AgentScope SDK 集成](sdk/agentscope.md)
+- [Python SDK](../../../developer-guide/zh/sdk/tokenless/index.md)
+- [AgentScope SDK 集成](../../../developer-guide/zh/sdk/tokenless/agentscope.md)
 - [效果度量](measuring-savings.md)
 - [配置与数据隐私](configuration-and-privacy.md)
 - [故障排查](troubleshooting.md)

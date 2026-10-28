@@ -13,6 +13,8 @@ pub(super) struct HookBinding {
     pub adapter: String,
     #[serde(default)]
     pub reloadable: bool,
+    #[serde(default)]
+    pub resident_policy_reload: bool,
     pub binding: Binding,
     pub socket: PathBuf,
     pub cwd: PathBuf,
@@ -20,6 +22,30 @@ pub(super) struct HookBinding {
 }
 
 impl HookBinding {
+    pub(super) fn read(path: &str) -> Result<Self> {
+        use std::io::Read;
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(path)?;
+        let metadata = file.metadata()?;
+        // SAFETY: geteuid reads the process identity without changing it.
+        if !metadata.is_file()
+            || metadata.uid() != unsafe { libc::geteuid() }
+            || metadata.mode() & 0o7777 != 0o600
+            || metadata.len() > 1024 * 1024
+        {
+            return Err("unsafe or oversized hook binding".into());
+        }
+        let mut bytes = Vec::new();
+        file.take(1024 * 1024 + 1).read_to_end(&mut bytes)?;
+        if bytes.len() > 1024 * 1024 {
+            return Err("oversized hook binding".into());
+        }
+        Ok(serde_json::from_slice(&bytes)?)
+    }
+
     pub(super) fn native_context(&self) -> NativeContext {
         NativeContext {
             target: self.binding.target.clone(),
@@ -30,6 +56,9 @@ impl HookBinding {
 }
 
 pub(super) fn install(args: &Arguments) -> Result<Exit> {
+    if args.flags.contains_key("--pid") || args.flags.contains_key("--remove") {
+        return super::attachment::install(args);
+    }
     args.check(&["--config", "--agent", "--native-profile"], false)?;
     let bytes = read_file(args.required("--config")?, 4 * 1024 * 1024)?;
     let config = aw_config::Validator::new()?.parse(&bytes)?;

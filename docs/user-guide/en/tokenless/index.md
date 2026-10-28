@@ -90,7 +90,7 @@ npm uninstall -g anolisa-tokenless
 
 `scripts/uninstall.sh` is the **curl installer's** uninstaller (Method C). It is driven by the receipt at `~/.local/share/tokenless/install-receipt`, which only that installer writes, so on a direct npm install it stops immediately with `No install receipt found` and changes nothing. Use it only for a curl install.
 
-Supported platforms:
+Release package targets:
 
 | Platform | Architecture | npm package |
 |----------|-------------|-------------|
@@ -98,8 +98,9 @@ Supported platforms:
 | Linux (glibc) | aarch64 | `@anolisa/tokenless-linux-arm64` |
 | macOS | x86_64 (Intel) | `@anolisa/tokenless-darwin-x64` — declared build target, **not published yet** |
 | macOS | aarch64 (Apple Silicon) | `@anolisa/tokenless-darwin-arm64` |
+| Windows | x86_64 | `@anolisa/tokenless-win32-x64` — declared build target, **not published yet** |
 
-`@anolisa/tokenless-darwin-x64` is a release build target only: it is not on the registry, so the npm route cannot deliver an Intel macOS binary. Method C cannot either — its source-build fallback is Linux-only, and `scripts/install.sh` exits with an error on macOS instead of running `cargo`. Until that package is published, Intel macOS has no supported install route; see [Platform support](#platform-support).
+Tokenless 0.9.0 builds packages for all five targets. At release preparation, the npm registry's latest root package is still 0.8.8, and the Intel Mac and Windows platform packages are not published. Generating release assets does not publish them to npm: npm installation requires the root package and the matching platform package at the same version. Check availability with `npm view anolisa-tokenless version` and `npm view @anolisa/tokenless-darwin-x64 version` or `npm view @anolisa/tokenless-win32-x64 version` before installing on these new targets. See [Platform support](#platform-support) for the currently available installation routes.
 
 #### Method C: curl standalone install
 
@@ -307,22 +308,22 @@ that does not shrink is returned unchanged and is not recorded.
 | Linux x86_64/aarch64 (glibc) | Supported | Supported | Supported (npm path) | Supported (follows curl) |
 | Linux with musl, such as Alpine | Not currently supported | Not currently supported | Source build only, needs a Rust toolchain | Source build only, needs a Rust toolchain |
 | macOS Apple Silicon | Supported | Supported | Supported (npm path) | Supported (follows curl) |
-| macOS x86_64 | Not currently supported | Not currently supported | Not currently supported | Not currently supported |
-| Windows | Not currently supported | Not currently supported | Not supported, use WSL2 | Not supported, use WSL2 |
+| macOS x86_64 | Not currently supported | Pending registry publication | Pending registry publication | Pending registry publication |
+| Windows | Not currently supported | x64: pending registry publication | Not supported, use WSL2 | Not supported, use WSL2 |
 
 Notes on the boundaries above:
 
-- macOS x86_64 has no supported route in this release. `@anolisa/tokenless-darwin-x64` is a release build target that is not on the registry, so neither npm nor the curl npm path can deliver a binary there, and the curl source-build fallback is refused on macOS — `scripts/install.sh` exits with an error instead of running `cargo`. Use Linux or Apple Silicon macOS until that package is published.
+- macOS x86_64 is a supported 0.9.0 build target. Its npm and curl npm routes require `@anolisa/tokenless-darwin-x64` to be published alongside the matching root package. Until then, those routes cannot deliver a binary there. The curl source-build fallback is refused on macOS — `scripts/install.sh` exits with an error instead of running `cargo`.
 - curl on macOS relies on its npm path. Its source-build fallback is validated on Linux only, and the installer refuses to run it on macOS, so a macOS machine without npm has no supported curl path.
-- The npm package declares `os: linux, darwin`, so Windows is unsupported by every method here. Inside WSL2 the Linux rows apply.
+- The 0.9.0 npm manifest declares `os: win32, linux, darwin` and includes a Windows x64 package; Windows ARM64 is unsupported. Native Windows npm installation awaits registry publication. The curl installer rejects Windows in `scripts/install.sh`; run that installer inside WSL2, where the Linux rows apply. The bundled installation Skill also documents a Linux/macOS Bash workflow.
 - The Skill method delegates to the anolisa CLI, npm, or curl, so its support follows the method it selects.
 
 To build the standalone CLI from source, see [User manual · Build the standalone CLI from source](index.md#build-the-standalone-cli-from-source).
 
 ### Next steps
 
-- [Python SDK](sdk.md): framework-neutral and AgentScope layers with runnable examples
-- [AgentScope SDK integration](sdk/agentscope.md): AgentScope 1.x, 2.x, and App attachment
+- [Python SDK](../../../developer-guide/en/sdk/tokenless/index.md): framework-neutral and AgentScope layers with runnable examples
+- [AgentScope SDK integration](../../../developer-guide/en/sdk/tokenless/agentscope.md): AgentScope 1.x, 2.x, and App attachment
 - [Agent integration](framework-integration.md): product adapter activation
 - [Capabilities and boundaries](#capabilities-and-boundaries): runtime behavior and limits
 - [CLI reference](cli-reference.md): all subcommands and options
@@ -361,7 +362,7 @@ was built.
 The Python SDK has two layers. The `anolisa-tokenless` package exposes the framework-neutral
 `TokenlessSdk`, direct `TokenlessRuntime` operations, and typed `TokenlessStats` queries. The
 same-version `anolisa-tokenless-agentscope` package maps that generic lifecycle to AgentScope. See
-the [Python SDK guide](sdk.md) for both layers, runnable examples, and configuration.
+the [Python SDK guide](../../../developer-guide/en/sdk/tokenless/index.md) for both layers, runnable examples, and configuration.
 
 ## Capabilities and boundaries
 
@@ -456,7 +457,7 @@ Per-path differences worth noting:
 - The OpenClaw plugin reads the same `tool_categories.json` lists to map each tool to a content origin (file content, command output, or API response), falling back to its built-in lists when that file is missing or invalid; Core then applies the matching thresholds. Its former `skip_tools` and `shell_tools` overrides have been removed and no longer control the adapter. See [Configuration and data privacy](configuration-and-privacy.md) for the current options.
 - TOON encoding is a separate trigger decision: it runs only on payloads of at least 500 characters and only when the host slot accepts text, and it is adopted only when the encoded result is smaller than the current content.
 - Git diff context cropping is a separate opt-in decision, disabled by default: with `TOKENLESS_DIFF_COMPRESSION_ENABLED=1` in the agent process environment (or the SDK's `diff_compression_enabled` option), Core crops unchanged context from command-output Git diffs when the slot accepts text; every changed line is preserved, the complete original output is stashed behind a recovery hint, and a candidate is rejected unless it saves at least 16 estimated tokens net of that wrapper text.
-- The Python SDK and AgentScope layers do not set these thresholds through Python configuration: compression thresholds, content detection, and TOON selection are Core behavior. Direct `TokenlessRuntime.compress_response` calls can still override the truncation limits per call. See the [Python SDK](sdk.md) and [AgentScope integration](sdk/agentscope.md) docs.
+- The Python SDK and AgentScope layers do not set these thresholds through Python configuration: compression thresholds, content detection, and TOON selection are Core behavior. Direct `TokenlessRuntime.compress_response` calls can still override the truncation limits per call. See the [Python SDK](../../../developer-guide/en/sdk/tokenless/index.md) and [AgentScope integration](../../../developer-guide/en/sdk/tokenless/agentscope.md) docs.
 
 ### Controlling search path sharing
 
@@ -595,8 +596,8 @@ Command rewriting also changes the shell command submitted by the host. Most ada
 | Install and verify for the first time | [Quick Start](index.md) |
 | Install via npm, curl, or Skill | [Quick Start · Install Tokenless](index.md#install-tokenless) |
 | Build the standalone CLI from source | [This page · Build the standalone CLI from source](#build-the-standalone-cli-from-source) |
-| Use the in-process Python SDK | [Python SDK](sdk.md) |
-| Integrate AgentScope | [AgentScope SDK integration](sdk/agentscope.md) |
+| Use the in-process Python SDK | [Python SDK](../../../developer-guide/en/sdk/tokenless/index.md) |
+| Integrate AgentScope | [AgentScope SDK integration](../../../developer-guide/en/sdk/tokenless/agentscope.md) |
 | Connect an Agent product | [Agent integration](framework-integration.md) |
 | Compress or retrieve manually | [CLI reference](cli-reference.md) |
 | Understand when compression triggers and what the thresholds are | [This page · Compression trigger conditions and thresholds](#compression-trigger-conditions-and-thresholds) |

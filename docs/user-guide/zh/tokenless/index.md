@@ -86,7 +86,7 @@ npm uninstall -g anolisa-tokenless
 
 `scripts/uninstall.sh` 是 **curl 安装器（方式 C）**的卸载脚本。它依赖 `~/.local/share/tokenless/install-receipt` 回执，而该回执只由 curl 安装器写入；因此在直接 npm 安装上运行会立即以 `No install receipt found` 退出且不做任何修改。请仅在 curl 安装下使用它。
 
-支持的平台：
+发布包构建目标：
 
 | 平台 | 架构 | npm 包 |
 |------|------|--------|
@@ -94,8 +94,9 @@ npm uninstall -g anolisa-tokenless
 | Linux (glibc) | aarch64 | `@anolisa/tokenless-linux-arm64` |
 | macOS | x86_64 (Intel) | `@anolisa/tokenless-darwin-x64` —— 仅为发布构建目标，**尚未发布** |
 | macOS | aarch64 (Apple Silicon) | `@anolisa/tokenless-darwin-arm64` |
+| Windows | x86_64 | `@anolisa/tokenless-win32-x64` —— 仅为发布构建目标，**尚未发布** |
 
-`@anolisa/tokenless-darwin-x64` 只是发布构建目标：registry 中并没有该包，因此 npm 路径无法在 Intel Mac 上提供二进制。方式 C 同样不行——它的源码构建回退只支持 Linux，`scripts/install.sh` 在 macOS 上会直接报错退出而不执行 `cargo`。在该软件包发布之前，Intel Mac 没有受支持的安装路径，详见[平台适配性](#平台适配性)。
+Tokenless 0.9.0 为这五个目标构建软件包。准备发布时，npm registry 中主包的最新版本仍为 0.8.8，Intel Mac 和 Windows 平台包尚未发布。生成发布产物不会自动将其发布到 npm：npm 安装需要主包与同版本的平台包。在这些新增目标上安装前，可用 `npm view anolisa-tokenless version` 以及 `npm view @anolisa/tokenless-darwin-x64 version` 或 `npm view @anolisa/tokenless-win32-x64 version` 确认发布状态。当前可用的安装路径详见[平台适配性](#平台适配性)。
 
 #### 方式 C：curl 独立安装
 
@@ -299,22 +300,22 @@ tokenless stats list --limit 1
 | Linux x86_64/aarch64（glibc） | 支持 | 支持 | 支持（npm 路径） | 支持（跟随 curl） |
 | 使用 musl 的 Linux（例如 Alpine） | 暂不支持 | 暂不支持 | 仅源码构建，需要 Rust 工具链 | 仅源码构建，需要 Rust 工具链 |
 | macOS Apple Silicon | 支持 | 支持 | 支持（npm 路径） | 支持（跟随 curl） |
-| macOS x86_64 | 暂不支持 | 暂不支持 | 暂不支持 | 暂不支持 |
-| Windows | 暂不支持 | 暂不支持 | 暂不支持，请使用 WSL2 | 暂不支持，请使用 WSL2 |
+| macOS x86_64 | 暂不支持 | 等待 registry 发布 | 等待 registry 发布 | 等待 registry 发布 |
+| Windows | 暂不支持 | x64：等待 registry 发布 | 暂不支持，请使用 WSL2 | 暂不支持，请使用 WSL2 |
 
 上述边界的补充说明：
 
-- macOS x86_64 在当前版本没有受支持的安装路径。`@anolisa/tokenless-darwin-x64` 只是发布构建目标，registry 中并没有该包，因此 npm 与 curl 的 npm 路径都无法在该平台提供二进制；curl 的源码构建回退在 macOS 上会被拒绝——`scripts/install.sh` 会直接报错退出而不执行 `cargo`。在该软件包发布之前，请使用 Linux 或 Apple Silicon macOS。
+- macOS x86_64 是 0.9.0 支持的构建目标。其 npm 与 curl 的 npm 路径需要 `@anolisa/tokenless-darwin-x64` 和同版本主包一同发布，发布前这些路径无法提供二进制。curl 的源码构建回退在 macOS 上会被拒绝——`scripts/install.sh` 会直接报错退出而不执行 `cargo`。
 - macOS 上的 curl 依赖 npm 路径。其源码构建回退只在 Linux 上验证过，并且安装脚本在 macOS 上拒绝执行该回退，因此没有 npm 的 macOS 机器没有受支持的 curl 路径。
-- npm 包声明了 `os: linux, darwin`，所以本页所有方式都不支持 Windows。在 WSL2 内按 Linux 各行处理。
+- 0.9.0 的 npm manifest 声明了 `os: win32, linux, darwin`，并包含 Windows x64 平台包；不支持 Windows ARM64。原生 Windows 的 npm 安装仍等待 registry 发布。curl 安装器 `scripts/install.sh` 会拒绝 Windows，请在 WSL2 内运行该安装器，并按 Linux 各行处理。随附安装 Skill 也面向 Linux/macOS 的 Bash 流程。
 - Skill 方式会委托给 anolisa CLI、npm 或 curl，其支持范围跟随实际选中的方式。
 
 需要从源码构建独立 CLI 时，请参阅[用户手册 · 从源码构建独立 CLI](index.md#从源码构建独立-cli)。
 
 ### 下一步
 
-- [Python SDK](sdk.md)：通用与 AgentScope 两层及可运行示例
-- [AgentScope SDK 集成](sdk/agentscope.md)：AgentScope 1.x、2.x 与 App 挂载
+- [Python SDK](../../../developer-guide/zh/sdk/tokenless/index.md)：通用与 AgentScope 两层及可运行示例
+- [AgentScope SDK 集成](../../../developer-guide/zh/sdk/tokenless/agentscope.md)：AgentScope 1.x、2.x 与 App 挂载
 - [Agent 集成](framework-integration.md)：产品 Adapter 激活
 - [能力与边界](#能力与边界)：运行行为和适用范围
 - [CLI 参考](cli-reference.md)：全部子命令和参数
@@ -351,7 +352,7 @@ python3 -m venv /tmp/tokenless-python
 Python SDK 分为两层。`anolisa-tokenless` 包开放通用 `TokenlessSdk`、可直接调用的
 `TokenlessRuntime` 操作和 typed `TokenlessStats` 查询；相同版本的
 `anolisa-tokenless-agentscope` 包把该通用生命周期映射到 AgentScope。两层结构、可运行示例与
-配置见 [Python SDK 指南](sdk.md)。
+配置见 [Python SDK 指南](../../../developer-guide/zh/sdk/tokenless/index.md)。
 
 ## 能力与边界
 
@@ -444,7 +445,7 @@ Adapter 不会压缩每一次工具结果。以响应压缩为例，只有以下
 - OpenClaw Plugin 读取同一份 `tool_categories.json` 分类，把工具映射为内容来源（文件内容、命令输出或 API 响应），该文件缺失或无效时回退到内置列表，再由 Core 套用对应阈值；它原有的 `skip_tools`、`shell_tools` 覆盖项已删除，不再控制 Adapter。当前选项见[配置与数据隐私](configuration-and-privacy.md)。
 - TOON 编码是独立的触发判断：只对至少 500 字符的负载、且宿主槽位接受文本时运行，并且只有编码结果比当前内容更小时才会采用。
 - Git Diff 上下文裁剪是独立的可选判断，默认关闭：在 Agent 进程环境设置 `TOKENLESS_DIFF_COMPRESSION_ENABLED=1`（或 SDK 的 `diff_compression_enabled` 选项）后，槽位接受文本时 Core 才会裁剪命令输出中 Git Diff 的未变更上下文；每条变更行都保留，完整原始输出写入 Stash 并附取回提示，计入该包装文本后净节省不足 16 个估算 Token 的候选会被拒绝。
-- Python SDK 与 AgentScope 层不通过 Python 配置设置上述阈值：压缩阈值、内容检测和 TOON 选择都是 Core 行为；直接调用 `TokenlessRuntime.compress_response` 时仍可按次覆盖截断参数。详见 [Python SDK](sdk.md) 与 [AgentScope 集成](sdk/agentscope.md)文档。
+- Python SDK 与 AgentScope 层不通过 Python 配置设置上述阈值：压缩阈值、内容检测和 TOON 选择都是 Core 行为；直接调用 `TokenlessRuntime.compress_response` 时仍可按次覆盖截断参数。详见 [Python SDK](../../../developer-guide/zh/sdk/tokenless/index.md) 与 [AgentScope 集成](../../../developer-guide/zh/sdk/tokenless/agentscope.md)文档。
 
 ### 控制搜索路径共享
 
@@ -567,8 +568,8 @@ JSON 响应压缩保留诊断类名称的字段、`null` 和空值。Stash 并�
 | 第一次安装并验证 | [快速开始](index.md) |
 | 使用 npm、curl 或 Skill 安装 | [快速开始 · 安装 Tokenless](index.md#安装-tokenless) |
 | 从源码构建独立 CLI | [本页 · 从源码构建独立 CLI](#从源码构建独立-cli) |
-| 使用进程内 Python SDK | [Python SDK](sdk.md) |
-| 集成 AgentScope | [AgentScope SDK 集成](sdk/agentscope.md) |
+| 使用进程内 Python SDK | [Python SDK](../../../developer-guide/zh/sdk/tokenless/index.md) |
+| 集成 AgentScope | [AgentScope SDK 集成](../../../developer-guide/zh/sdk/tokenless/agentscope.md) |
 | 接入 Agent 产品 | [Agent 集成](framework-integration.md) |
 | 手动压缩或取回 | [CLI 参考](cli-reference.md) |
 | 了解压缩何时触发、阈值多大 | [本页 · 压缩的触发条件与阈值](#压缩的触发条件与阈值) |

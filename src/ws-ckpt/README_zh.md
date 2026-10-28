@@ -17,6 +17,11 @@
 - **TOML 配置热重载** — 以 `/etc/ws-ckpt/config.toml` 为唯一入口，`ws-ckpt reload` 即时生效
 - **容量与数量阈值告警** — 任一工作区快照数超 1000 或文件系统使用率超 90% 时统一告警
 
+通过 OpenClaw 或 Hermes 插件成功回滚后，仅跳过被恢复工作区在本轮结束时的自动检查点，
+无论回滚使用工作区 ID 还是注册路径。
+其他工作区仍正常创建自动检查点；预览和失败的回滚不会抑制检查点。
+OpenClaw 将跳过记录限定在发起回滚的会话内，其他会话先结束也不会消费该记录。
+
 ## 项目结构
 
 ```
@@ -55,7 +60,7 @@ cd src
 cargo build --release
 ```
 
-[维护者说明：Raw 打包与 GitHub 构建](../../docs/developer-guide/zh/ws-ckpt/packaging.md)
+[维护者说明：Raw 打包与 GitHub 构建](../../contribute/zh/ws-ckpt/packaging.md)
 
 ### 安装（RPM）
 
@@ -93,6 +98,10 @@ ws-ckpt delete --workspace ~/my-workspace -s feature
 ```
 
 ### 快照管理
+
+Hermes 的 `ws-ckpt-list` 工具也支持用 `{"limit":20}` 获取一页，再用
+`{"limit":20,"cursor":"<next_cursor>"}` 继续。仅在 `next_cursor:null` 时结束；
+`{}` 仍返回完整表格。详见[用户指南](../../docs/user-guide/zh/ws-ckpt/index.md#hermes-快照列表分页)。
 
 ```bash
 # 列出工作区所有快照
@@ -188,6 +197,8 @@ ws-ckpt reload
 | `plugin` | 安装/卸载 ws-ckpt Agent runtime（openclaw/hermes）插件 |
 
 OpenClaw adapter 要求 OpenClaw >= 2026.2.13。若检测到的版本或配置能力无法安全更新工具 allowlist，安装会中止，避免留下不完整的集成。
+
+Hermes 插件启用和禁用调用设有超时，避免运行时无响应导致本地安装或清理一直阻塞；恢复步骤见[插件安装](../../docs/user-guide/zh/ws-ckpt/index.md#插件安装)。
 
 ## 组件
 

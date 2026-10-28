@@ -6,8 +6,43 @@
 mod support;
 use aw_service::{Binding, Capabilities, Operation};
 use serde_json::{json, Value};
-use std::{collections::BTreeMap, fs, os::unix::fs::PermissionsExt, time::Instant};
+use std::{collections::BTreeMap, fs, os::unix::fs::PermissionsExt, path::Path, time::Instant};
 use support::{Fixture, Service, TIMEOUT};
+
+#[test]
+fn managed_response_iterators_close_before_native_teardown() {
+    let fixture = Fixture::new();
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut command = std::process::Command::new(&fixture.python);
+    command
+        .arg("-B")
+        .arg(root.join("tests/fixtures/claude-sdk/receive_contract.py"))
+        .arg(root.join("../aw-adapter/native/claude-sdk"));
+    let output = fixture.run(command);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success() && stderr.contains("Ran 13 tests") && stderr.contains("\nOK\n"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn managed_mcp_freezes_registered_tools_and_checked_results() {
+    let fixture = Fixture::new();
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut command = std::process::Command::new(&fixture.python);
+    command
+        .args(["-B"])
+        .arg(root.join("tests/fixtures/claude-sdk/mcp_contract.py"))
+        .arg(root.join("../aw-adapter/native/claude-sdk/aw_mcp.py"));
+    let output = fixture.run(command);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stderr).contains("Ran 7 tests"));
+}
 
 #[test]
 fn claude_hook_cli_preserves_deny_success_failure_identity_and_audit() {
@@ -24,6 +59,7 @@ fn claude_hook_cli_preserves_deny_success_failure_identity_and_audit() {
                 Operation::Bind {
                     target: "claude".into(),
                     capabilities: Capabilities {
+                        failure_actions: Default::default(),
                         adapter: "claude-sdk".into(),
                         version: "0.2.88".into(),
                         entrypoint: "sdk-worker".into(),
@@ -135,4 +171,21 @@ fn claude_hook_cli_preserves_deny_success_failure_identity_and_audit() {
         )
         .unwrap();
     service.released(&fixture);
+}
+
+#[test]
+fn model_producer_identity_and_callback_drain_contracts() {
+    let fixture = Fixture::new();
+    let mut command = std::process::Command::new(&fixture.python);
+    command.arg("-I").arg(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/identity_contract.py"),
+    );
+    let output = fixture.run(command);
+    assert!(
+        output.status.success()
+            && String::from_utf8_lossy(&output.stderr).contains("Ran 19 tests")
+            && String::from_utf8_lossy(&output.stderr).contains("\nOK\n"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }

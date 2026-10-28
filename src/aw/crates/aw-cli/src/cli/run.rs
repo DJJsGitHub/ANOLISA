@@ -71,6 +71,12 @@ pub(super) fn launch(args: &Arguments) -> Result<Exit> {
     let config = aw_config::Validator::new()?.parse(&bytes)?;
     let target = args.required("--agent")?;
     let agent = &config.as_value()["spec"]["agents"][target];
+    // JSON Schema integers also accept decimal and exponent spellings.
+    let shutdown_grace = Duration::from_millis(
+        agent["shutdown_grace_ms"]
+            .as_f64()
+            .map_or(2000, |value| value as u64),
+    );
     let name = agent["adapter"]
         .as_str()
         .ok_or("configured Agent target not found")?;
@@ -133,8 +139,25 @@ pub(super) fn launch(args: &Arguments) -> Result<Exit> {
     if args.flags.contains_key("--reloadable") {
         aw_adapter::reload::supported(&prepared.capabilities())?;
     }
+    let resident_policy_reload =
+        !args.flags.contains_key("--reloadable") && matches!(name, "qoder-sdk" | "qwenpaw");
+    if resident_policy_reload {
+        aw_adapter::reload::resident_supported(&prepared.capabilities())?;
+    }
     let steps = aw_provider::admission::preflight(&config, target, &capabilities.clone().into())?;
     prepared.validate_steps(&steps)?;
+    let configuration = Path::new(args.required("--config")?);
+    let remember_connection = args.flags.contains_key("--reloadable")
+        || resident_policy_reload
+        || super::connection::recorded(configuration)?;
+    if let Some((client, _)) =
+        super::connection::selected(configuration, Instant::now() + Duration::from_secs(5), true)?
+    {
+        use sha2::{Digest, Sha256};
+        if client.identity().config_revision != format!("{:x}", Sha256::digest(&bytes)) {
+            return Err("configuration path already selects another service; use aw update for its active instances or stop it before launching the edited configuration".into());
+        }
+    }
     let service = launch_service::ensure_service(
         &bytes,
         &executable,
@@ -142,6 +165,9 @@ pub(super) fn launch(args: &Arguments) -> Result<Exit> {
     )?;
     if let Some(exit) = interrupted() {
         return Ok(exit);
+    }
+    if remember_connection {
+        super::connection::remember(configuration, &service.paths.socket, &service.client)?;
     }
     let artifacts = Artifacts::create(&service.paths.state_dir)?;
     let binding_path = artifacts.0.join("binding.json");
@@ -172,7 +198,18 @@ pub(super) fn launch(args: &Arguments) -> Result<Exit> {
         };
         instance = Some(binding.instance_id.clone());
         let reloadable = args.flags.contains_key("--reloadable");
-        if reloadable {
+        if matches!(name, "pi" | "claude-sdk")
+            || (matches!(name, "qoder-sdk" | "qwenpaw") && !reloadable)
+        {
+            service.client.call(
+                Operation::OwnInstance {
+                    instance_id: binding.instance_id.clone(),
+                    pid: std::process::id(),
+                },
+                Instant::now() + Duration::from_secs(2),
+            )?;
+        }
+        if reloadable || resident_policy_reload {
             service.client.call(
                 Operation::EnableReload {
                     instance_id: binding.instance_id.clone(),
@@ -200,6 +237,7 @@ pub(super) fn launch(args: &Arguments) -> Result<Exit> {
         let hook_binding = HookBinding {
             adapter: name.into(),
             reloadable,
+            resident_policy_reload,
             binding,
             socket: service.paths.socket.clone(),
             cwd,
@@ -216,51 +254,50 @@ pub(super) fn launch(args: &Arguments) -> Result<Exit> {
             service.pid
         );
         let mut reported: Result<()> = Ok(());
-        let status = readiness::run(&plan.command, &SIGNAL, plan.readiness, |pid| {
-            if reloadable {
-                reported = service
-                    .client
-                    .call(
-                        Operation::AssociateProcess {
-                            instance_id: hook_binding.binding.instance_id.clone(),
-                            pid,
-                        },
-                        Instant::now() + Duration::from_secs(2),
-                    )
-                    .map(|_| ())
-                    .map_err(Into::into);
-                if reported.is_err() {
-                    let _ = SIGNAL.compare_exchange(
-                        0,
-                        libc::SIGTERM,
-                        std::sync::atomic::Ordering::AcqRel,
-                        std::sync::atomic::Ordering::Acquire,
-                    );
+        let failed = AtomicBool::new(false);
+        let status = readiness::run(
+            &plan.command,
+            &SIGNAL,
+            &failed,
+            shutdown_grace,
+            name == "qoder-sdk",
+            plan.readiness,
+            |pid| {
+                if reloadable || resident_policy_reload {
+                    reported = service
+                        .client
+                        .call(
+                            Operation::AssociateProcess {
+                                instance_id: hook_binding.binding.instance_id.clone(),
+                                pid,
+                            },
+                            Instant::now() + Duration::from_secs(2),
+                        )
+                        .map(|_| ())
+                        .map_err(Into::into);
+                    if reported.is_err() {
+                        failed.store(true, std::sync::atomic::Ordering::Release);
+                    }
                 }
-            }
-            if observing && reported.is_ok() {
-                reported = service
-                    .client
-                    .call(
-                        Operation::ReportRun {
-                            instance_id: hook_binding.binding.instance_id.clone(),
-                            outcome: RunOutcome::Started { pid },
-                        },
-                        Instant::now() + Duration::from_secs(2),
-                    )
-                    .map(|_| ())
-                    .map_err(Into::into);
-                if reported.is_err() {
-                    let _ = SIGNAL.compare_exchange(
-                        0,
-                        libc::SIGTERM,
-                        std::sync::atomic::Ordering::AcqRel,
-                        std::sync::atomic::Ordering::Acquire,
-                    );
+                if observing && reported.is_ok() {
+                    reported = service
+                        .client
+                        .call(
+                            Operation::ReportRun {
+                                instance_id: hook_binding.binding.instance_id.clone(),
+                                outcome: RunOutcome::Started { pid },
+                            },
+                            Instant::now() + Duration::from_secs(2),
+                        )
+                        .map(|_| ())
+                        .map_err(Into::into);
+                    if reported.is_err() {
+                        failed.store(true, std::sync::atomic::Ordering::Release);
+                    }
                 }
-            }
-            started = true;
-        });
+                started = true;
+            },
+        );
         reported?;
         let status = status?;
         Ok(match status.code() {

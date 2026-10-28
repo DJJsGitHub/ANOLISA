@@ -41,6 +41,14 @@ cat response.json | tokenless compress-response
 - The per-call input limit is 64 MiB.
 - JSON commands require valid JSON.
 - If compression does not reduce the estimated token count, the CLI explains this on stderr and returns the original.
+- `compress-schema`, `compress-response`, `compress-toon`, and `retrieve` write their payload to stdout
+  byte-for-byte: no trailing newline is added or stripped. Passthrough and no-savings runs therefore
+  reproduce the input exactly, so comparing stdout with the input payload is a reliable encoding check.
+  For the compression commands the emitted bytes equal the `after` text the statistics recorder
+  measures in active mode; in dry-run mode (`TOKENLESS_COMPRESSION_ENABLED=0`) the two differ, because
+  stdout keeps the original input while the record stores the smaller predicted candidate as
+  `after_text`. A dry-run record's `after_chars` and `after_tokens` therefore describe a predicted
+  saving, not the bytes emitted (see [Minimum useful payload](#minimum-useful-payload)).
 
 ### Minimum useful payload
 
@@ -112,7 +120,12 @@ Operations:
 
 `post_tool` is the only operation that enters `PostToolPipeline`. Current production routing is:
 
-- Retrieve results, interrupted or denied calls, and RTK-optimized output bypass compression.
+- Retrieve results and interrupted or denied calls bypass compression.
+- RTK output bypasses compression unless complete execution receipts confirm unchanged bytes and
+  the call succeeded. PostTool must supply the exact registered execution command in `command`;
+  a missing or modified command retains the bypass. Core restores the original command before routing. Changed or unconfirmed
+  output retains the bypass; a tied token estimate does not authorize fallback. Receipt-state
+  failures warn and retain the bypass without failing the PostTool operation.
 - Tool errors pass through unchanged and may include bounded `additional_context` diagnostics.
 - Successful JSON uses `JsonCompressor`; compact JSON or TOON may be selected.
 - Recognized successful build/test command output uses `BuildLogCompressor`; terminal cleanup and
@@ -342,7 +355,17 @@ echo '{"name":"test","value":42}' \
   | tokenless decompress-toon
 ```
 
-`compress-toon` supports `--agent-id`, `--session-id`, `--tool-use-id`, and `--min-toon-chars`. When a payload is below the minimum length or encoding provides no savings, it returns the original JSON and does not record that operation. The exit code is still `0` in these passthrough cases, and the note on stderr is informational only: when scripting, detect whether encoding happened by comparing stdout with the input payload instead of relying on stderr. Passthrough and no-savings runs reproduce the input byte-for-byte on stdout (no trailing newline is added or stripped), so any byte difference means the payload was encoded; checking whether stdout is still valid JSON works as a fallback.
+Both commands accept the input as a file instead of standard input:
+
+```bash
+tokenless compress-toon --file payload.json
+tokenless decompress-toon --file payload.toon
+```
+
+`-f` is the short form of `--file`. Without it, the input is read from standard
+input, which is what the examples above use.
+
+`compress-toon` supports `--agent-id`, `--session-id`, `--tool-use-id`, and `--min-toon-chars`. When a payload is below the minimum length, holds a number TOON cannot carry exactly (`1e-400`, `-0.0`, `1e3`, or a decimal longer than an `f64`), or encoding provides no savings, it returns the original JSON and does not record that operation. The exit code is still `0` in these passthrough cases, and the note on stderr is informational only: when scripting, detect whether encoding happened by comparing stdout with the input payload instead of relying on stderr. Passthrough and no-savings runs reproduce the input byte-for-byte on stdout (no trailing newline is added or stripped), so any byte difference means the payload was encoded; checking whether stdout is still valid JSON works as a fallback.
 
 ## `retrieve`
 
