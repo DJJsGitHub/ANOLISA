@@ -145,8 +145,6 @@ class ResponseHookContract(unittest.TestCase):
         output_text = mock_applied_output(self.content)
         if agent == "cosh-ng":
             value_key, value = "updatedToolResponse", output_text
-        elif agent == "qoder-cli":
-            value_key, value = "updatedToolOutput", output_text
         else:
             value_key, value = "updatedToolOutput", json.loads(output_text)
         return {

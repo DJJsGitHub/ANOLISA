@@ -21,9 +21,9 @@ Output contract per agent:
     diagnostics (environment attribution). Older Claude Code versions fail
     open: compression is disabled instead of injecting a duplicate payload
     (issue #1645).
-  - qoder-cli: the compressed payload replaces the response via the string
-    field ``hookSpecificOutput.updatedToolOutput``. Structured responses are
-    serialized as compact JSON because Qoder rejects object and array values.
+  - qoder-cli: ``hookSpecificOutput.updatedToolOutput`` preserves structured
+    results. Qoder renders a shell object's ``stdout`` for the model while
+    retaining its other fields; serializing the object exposes the envelope.
   - qwenwork: ``updatedToolOutput`` preserves structured response types.
   - opencode: the adapter translates ``updatedToolOutput`` to OpenCode's
     mutable ``tool.execute.after`` output.
@@ -520,15 +520,6 @@ def main() -> None:
         if updated_output is None:
             warn("tokenless compress returned non-JSON for a structured slot.")
             _emit_attribution_or_skip(env_attribution)
-
-    # Qoder validates updatedToolOutput as a string even when the original
-    # tool response is structured. The entry point's compact serialization
-    # is exactly that string; a rewrapped shell envelope serializes here.
-    if agent_id == _QODER_AGENT_ID and not isinstance(updated_output, str):
-        if rewrapped is not None:
-            updated_output = json.dumps(rewrapped, separators=(",", ":"), ensure_ascii=False)
-        else:
-            updated_output = output_text
 
     hook_output = {
         "hookEventName": "PostToolUse",

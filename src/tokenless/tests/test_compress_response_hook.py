@@ -656,10 +656,10 @@ class TestReplacementProtocol(unittest.TestCase):
         updated_output = hso["updatedToolOutput"]
         self.assertIsInstance(
             updated_output,
-            str,
-            "Qoder CLI requires updatedToolOutput to be a string",
+            dict,
+            "Qoder CLI must retain the structured tool result",
         )
-        compressed_data = json.loads(updated_output)
+        compressed_data = updated_output
         self.assertEqual(compressed_data["stdout"], "x" * 20)
         self.assertEqual(compressed_data["stderr"], "")
         self.assertEqual(compressed_data["exit_code"], 0)
@@ -1158,7 +1158,7 @@ class TestShellEnvelopeUnwrap(unittest.TestCase):
         updated = result["hookSpecificOutput"]["updatedToolOutput"]
         self.assertEqual(updated, self._bash_envelope(stdout[:40], stderr))
 
-    def test_qoder_rewrapped_envelope_is_a_compact_json_string(self):
+    def test_qoder_rewrapped_envelope_preserves_the_object(self):
         log = "npm ERR! code ELIFECYCLE\n" + "npm verbose stack line\n" * 150
         result = _run_hook(
             {
@@ -1174,9 +1174,8 @@ class TestShellEnvelopeUnwrap(unittest.TestCase):
         self.assertNotIn("_subprocess_error", result,
                          f"Hook subprocess failed: {result}")
         updated = result["hookSpecificOutput"]["updatedToolOutput"]
-        self.assertIsInstance(updated, str,
-                              "Qoder requires a string updatedToolOutput")
-        self.assertEqual(json.loads(updated), self._bash_envelope(log[:40], ""))
+        self.assertIsInstance(updated, dict, "Qoder must retain the structured tool result")
+        self.assertEqual(updated, self._bash_envelope(log[:40], ""))
 
     def test_qoder_uses_text_slot_at_200_chars(self) -> None:
         binary = _create_mock_tokenless(self.tmpdir, "no-savings")
@@ -1211,7 +1210,7 @@ class TestShellEnvelopeUnwrap(unittest.TestCase):
         with open(os.path.join(self.tmpdir, "request.json")) as captured:
             self.assertEqual(json.load(captured)["content"], stdout)
         updated = result["hookSpecificOutput"]["updatedToolOutput"]
-        self.assertEqual(json.loads(updated), self._bash_envelope(stdout[:40], stderr))
+        self.assertEqual(updated, self._bash_envelope(stdout[:40], stderr))
         self.assertEqual(_spawn_log_lines(self.mock_bin), ["compress"])
 
     def test_qwenwork_rewrapped_envelope_preserves_metadata(self):

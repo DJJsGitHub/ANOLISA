@@ -115,11 +115,7 @@ class PathListHooks(unittest.TestCase):
         }
         for agent in ("qwenwork", "qoder-cli"):
             output = self.replacement(self.run_response(source, agent=agent))
-            if agent == "qoder-cli":
-                self.assertIsInstance(output, str)
-                output = json.loads(output)
-            else:
-                self.assertIsInstance(output, dict)
+            self.assertIsInstance(output, dict)
             self.assertEqual(self.restore(output["stdout"]), source["stdout"])
             self.assertEqual({**output, "stdout": source["stdout"]}, source)
 
