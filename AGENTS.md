@@ -17,7 +17,7 @@ and existing build and test entry points.
 | **cosh-ng** | `src/cosh-ng/` | Rust | Linux (full); macOS (limited functionality) |
 | **agent-sec-core** | `src/agent-sec-core/` | Rust + Python | Linux only |
 | **agentsight** | `src/agentsight/` | Rust (eBPF) | Linux (full); macOS (trajectory/serve only) |
-| **tokenless** | `src/tokenless/` | Rust | Linux (full); macOS x64/arm64 (CLI binaries + adapters, via npm) |
+| **tokenless** | `src/tokenless/` | Rust | Linux (full); macOS x64/arm64 (CLI binaries + adapters, via npm); Windows x64 (native CLI + QwenWork adapter) |
 | **agent-memory** (`memory`) | `src/agent-memory/` | Rust | Linux only |
 | **os-skills** | `src/os-skills/` | Python / Shell | All |
 | **anolisa** | `distribution/anolisa/` | Rust | Linux + macOS (arm64) |
@@ -275,6 +275,9 @@ Components with complex architectures maintain their own AGENTS.md for module-sp
 | **skillfs** | [`src/skillfs/AGENTS.md`](src/skillfs/AGENTS.md) | Three-crate layout, dependency exceptions, FUSE e2e testing |
 | **aw** | [`src/aw/AGENTS.md`](src/aw/AGENTS.md) | Framework crates and native Hook gates |
 | **AW Providers** | [`providers/AGENTS.md`](providers/AGENTS.md) | Independent collaboration workspaces and Provider contracts |
+
+AW documentation under `docs/` and `contribute/` also follows the audience and
+writing rules in [`src/aw/AGENTS.md`](src/aw/AGENTS.md#documentation-audiences-and-writing).
 
 ## 11.1 File Placement & Documentation Structure
 

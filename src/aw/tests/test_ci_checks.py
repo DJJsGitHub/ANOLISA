@@ -36,7 +36,7 @@ class PackageWorkflowTests(GateFixture):
         step = workflow.split(
             "      - name: Verify Tokenless PreTool and PostTool contracts\n", 1
         )[1]
-        step = step.split("      - name: Verify installed packages", 1)[0]
+        step = step.split("      - name:", 1)[0]
         script = textwrap.dedent(step.split("        run: |\n", 1)[1])
         workspace = self.root / "container workspace"
         expected = [
@@ -114,7 +114,7 @@ class ScopeTests(GateFixture):
         self.git("checkout", "-qb", "workflow-only", advanced)
         workflow_head = self.commit(".github/workflows/aw-ci.yml", "workflow only")
         event["pull_request"] = {"base": {"sha": advanced}, "head": {"sha": workflow_head}}
-        self.assertFalse(gate.scope("pull_request", event, workflow_head, self.root))
+        self.assertTrue(gate.scope("pull_request", event, workflow_head, self.root))
 
     def test_scope_handles_removal_noop_and_event_errors(self) -> None:
         base = self.init_git()
@@ -170,6 +170,8 @@ class ScopeTests(GateFixture):
         sha = "a" * 40
         valid = {
             "GITHUB_SHA": sha,
+            "TOKENLESS_SELECTED": "false",
+            "TOKENLESS_RESULT": "skipped",
             "SCOPE_RESULT": "success",
             "CHECKS_RESULT": "success",
             "SELECTED": "true",
@@ -239,12 +241,12 @@ class GateTests(GateFixture):
                 ["aw-exec", "aw-provider", "serde", "serde_json", "thiserror", "tempfile", "libc", "shlex", "aw-provider-sec-core"],
             ),
             ("aw-adapter", self.root / "crates/aw-adapter",
-             ["aw-config", "aw-contracts", "aw-exec", "aw-provider", "serde_json"]),
+             ["aw-config", "aw-contracts", "aw-exec", "aw-provider", "serde_json", "reqwest"]),
             (
                 "aw-cli", self.root / "crates/aw-cli",
                 ["aw-adapter", "aw-config", "aw-contracts", "aw-exec", "aw-host", "aw-package",
                  "aw-provider", "aw-service", "clap", "clap_complete", "libc", "serde", "serde_json",
-                 "serde_yaml_ng", "sha2", "tempfile"],
+                 "serde_yaml_ng", "sha2", "tempfile", "reqwest"],
             ),
         ):
             (directory / "src").mkdir(parents=True)

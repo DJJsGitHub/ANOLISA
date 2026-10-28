@@ -320,6 +320,7 @@ impl Profile {
             tool_name,
             "memory_search"
                 | "memory_observe"
+                | "memory_capture"
                 | "memory_get_context"
                 | "mem_consolidate"
                 | "memory_forget"
@@ -386,6 +387,23 @@ fn env_bool(name: &str, current: bool) -> bool {
         },
         Err(_) => current,
     }
+}
+
+/// Whether `n` may override `[memory.index].time_decay_lambda` from the
+/// environment.
+///
+/// `n >= 0.0` on its own is not the whole rule: `f64::INFINITY` satisfies it,
+/// and `AppConfig::load` validates *after* `apply_env_overrides`, so an
+/// infinite lambda from the environment used to escape this function's
+/// warn-and-ignore contract and hard-fail startup instead — the only override
+/// in `apply_env_overrides` that could. `MEMORY_INDEX_TIME_DECAY_ALPHA`
+/// already turns `inf` away through its `0.0..=1.0` range check, so rejecting
+/// it here also makes the two decay overrides agree on the same input.
+///
+/// The rule is `AppConfig::validate`'s lambda rule, kept in step with it: a
+/// value the override accepts must be a value `validate` accepts.
+fn lambda_override_is_usable(n: f64) -> bool {
+    n.is_finite() && n >= 0.0
 }
 
 /// Read an env var that ought to be a valid `user_id`, validate it, and
@@ -505,8 +523,10 @@ impl AppConfig {
         self.memory.index.enabled = env_bool("MEMORY_INDEX_ENABLED", self.memory.index.enabled);
         if let Ok(v) = std::env::var("MEMORY_INDEX_TIME_DECAY_LAMBDA") {
             match v.parse::<f64>() {
-                Ok(n) if n >= 0.0 => self.memory.index.time_decay_lambda = n,
-                Ok(_) => tracing::warn!("MEMORY_INDEX_TIME_DECAY_LAMBDA must be >= 0; ignoring"),
+                Ok(n) if lambda_override_is_usable(n) => self.memory.index.time_decay_lambda = n,
+                Ok(_) => tracing::warn!(
+                    "MEMORY_INDEX_TIME_DECAY_LAMBDA must be a finite value >= 0; ignoring"
+                ),
                 Err(e) => {
                     tracing::warn!("MEMORY_INDEX_TIME_DECAY_LAMBDA={v:?} not a f64: {e}; ignoring")
                 }
@@ -834,5 +854,55 @@ mod tests {
         cfg = AppConfig::default();
         cfg.memory.index.time_decay_lambda = f64::NAN;
         assert!(cfg.validate().is_err(), "NaN lambda must be rejected");
+    }
+
+    #[test]
+    fn lambda_override_refuses_what_validate_refuses() {
+        // `load` applies the env overrides and only then validates, so the
+        // override has to turn away every value `validate` would: anything it
+        // lets through becomes a startup failure instead of the
+        // warn-and-keep-the-file-value contract the rest of
+        // `apply_env_overrides` follows. `inf` is the value that used to slip
+        // past a bare `n >= 0.0`.
+        for rejected in [f64::INFINITY, f64::NEG_INFINITY, f64::NAN, -0.01] {
+            assert!(
+                !lambda_override_is_usable(rejected),
+                "{rejected} must be ignored, not applied"
+            );
+        }
+        // 0.0 is the documented "decay disabled" setting, so the floor stays
+        // inclusive; a large finite lambda is an aggressive half-life, not a
+        // range violation.
+        for accepted in [0.0, 0.01, 1.0e6] {
+            assert!(
+                lambda_override_is_usable(accepted),
+                "{accepted} is a usable decay rate and must apply"
+            );
+        }
+    }
+
+    #[test]
+    fn lambda_override_and_validate_agree() {
+        // The two guards are one rule seen from two sides: whatever the env
+        // override is willing to write into the config must survive the
+        // `validate` that `load` runs immediately afterwards.
+        let mut cfg = AppConfig::default();
+        for candidate in [
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::NAN,
+            -0.01,
+            0.0,
+            0.01,
+            1.0e6,
+        ] {
+            cfg.memory.index.time_decay_lambda = candidate;
+            let validated = cfg.validate().is_ok();
+            assert!(
+                !lambda_override_is_usable(candidate) || validated,
+                "the override accepts {candidate} but validate() rejects it, \
+                 so MEMORY_INDEX_TIME_DECAY_LAMBDA={candidate} would fail startup"
+            );
+        }
     }
 }

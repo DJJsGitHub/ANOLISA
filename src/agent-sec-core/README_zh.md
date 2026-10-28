@@ -43,7 +43,10 @@ CLI 命令与集成 capability surface。
 
 ## V2 SkillSec 与 Policy CLI
 
-Rust V2 核心通过现有 `skill-ledger` 命令提供 **SkillSec**：本地扫描、系统密钥签名、版本历史、
+使用 `agent-sec-cli skillsec status` 查看状态，或运行 `agent-sec-cli skillsec --help`。
+旧命令 `skill-ledger` 保留为行为一致的兼容别名；现有 Hook 能力 ID、环境变量及存储数据保持不变。
+
+Rust V2 核心通过 `agent-sec-cli skillsec` 命令提供 **SkillSec**：本地扫描、系统密钥签名、版本历史、
 人工决策、回滚及 SkillFS 激活由一个 root daemon 统一处理。所有本地用户均可管理已启用的默认目录、
 管理员配置范围或已认证 SkillFS 挂载内的 Skill。daemon 启动后自动授权并在后台扫描系统默认目录
 及所有本地账户 HOME 下的标准 Skill 目录，这些位置无需用户配置。`enableDefaultSkillDirs: false`
@@ -76,6 +79,9 @@ daemon 自己拥有的叶目录权限会先修复为 `0700`。
 PolicyTemplate 是包含通用规则的可复用策略；AgentSight Adapter 当前仅执行文件删除 block 规则。
 Scope 保存不可变策略快照，拥有自动 Binding 创建、下发和清理生命周期。
 可通过 daemon 的 `--policy-admin-uid <UID>` 授权非 root Policy CLI 调用者；默认仍只授权 root。
+
+**兼容性变更（Breaking change）**：移除 `scope create --cgroup-id`，此前不支持 cgroup
+assignment。请更新脚本，使用 `--pid`、`--process-name` 或 `--executable` 选择目标进程。
 
 V2 原生 OTel 目前仅用于本地日志关联，不提供公开 OTLP exporter。
 现有 `--trace-context` JSON 传入 Agent 归属；`--otel-context`（version 1）传入上游

@@ -12,7 +12,7 @@
 
 | 组件 | 测试和质量门禁 |
 | ------ | ---------------- |
-| [AW](../../../developer-guide/zh/aw/building.md) | `python3 src/aw/scripts/check.py`；仅 Linux，使用固定 Rust 工具链、Python 3 和 Node.js。 |
+| [AW](../../../../contribute/zh/aw/building.md) | `python3 src/aw/scripts/check.py`；仅 Linux，使用固定 Rust 工具链、Python 3 和 Node.js。 |
 | [os-skills](../../../../src/os-skills/README_zh.md) | 没有编译目标。检查变更过的 `SKILL.md`，并按文件说明的解释器运行变更脚本。 |
 | [agent-sec-core](../../../../src/agent-sec-core/README_zh.md) | `cd src/agent-sec-core && make test` 会运行 Python、Rust sandbox 和 OpenClaw plugin 测试。Python 使用 uv 与 Python 3.11.6。 |
 | [agentsight](../../../../src/agentsight/README_zh.md) | Linux 使用 `cd src/agentsight && make lint && make test`；macOS 运行 local viewer 和 trajectory collector 相关测试。 |
@@ -23,6 +23,14 @@
 | [anolisa](../../../../distribution/anolisa/README_zh.md) | `cd distribution/anolisa && cargo fmt --all --check && cargo clippy --all-targets --locked -- -D warnings && cargo test --locked` |
 | [SkillFS](../../../../src/skillfs/README_zh.md) | `cd src/skillfs && cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace`；Linux 上再运行 `cd src/skillfs && scripts/test.sh` 执行 FUSE smoke test。 |
 | [ktuner](../../../../src/ktuner/README.md) | `cd src/ktuner && cargo fmt --all --check && cargo clippy --all-targets -- -D warnings && cargo test` |
+
+Agent Memory 的 `make smoke` 需要 Python 3.8+，在临时 userland 命名空间中检查
+release 二进制。它校验 MCP 响应和回读数据，在服务出错或超过协议检查期限时失败，
+并在停止子进程后清理临时数据。它不验证特权挂载隔离。
+运行 `python3 src/agent-memory/tests/test_smoke.py -v` 可以在不构建组件的情况下
+验证 smoke 入口的故障检测。
+
+Agent Memory 可使用 `make smoke SMOKE_TIMEOUT=10` 将协议检查期限设为 10 秒（默认 30 秒）；强制清理进程另有 2 秒上限。沙箱检查会尝试读取临时命名空间外已存在的文件，必须被拒绝。
 
 修改公共 API 或 rustdoc 时，在受影响的 Rust 组件门禁中追加
 `cargo doc --workspace --no-deps`。`ktuner tune`、FUSE 挂载、
@@ -62,4 +70,4 @@ PR 应根据变更文件选择组件矩阵中的对应行，运行相应的构�
 - [从源码构建](building.md)
 - [故障排查](troubleshooting.md)
 - [贡献指南](../../../../CONTRIBUTING_zh.md)
-- [开发指南索引](../../../developer-guide/zh/README.md)
+- [开发指南索引](../../../developer-guide/zh/index.md)

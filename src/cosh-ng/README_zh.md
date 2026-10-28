@@ -11,7 +11,9 @@ JSONL 接口。
 默认情况下，登录 shell（例如 `cosh --login`）会在 Bash 4+ 上以真实 login 身份
 启动 Bash；设 `shell.login_identity = false` 可保留旧的非 login（`--rcfile`）启动。
 有界的真实 login 身份能力探测失败、使用 Bash 3.2（如 macOS 系统 bash），或父会话导出了 POSIX
-启动无法导入的函数名时，cosh 会自动回退。
+启动无法导入的函数名时，cosh 会自动回退。Enhanced Bash login 会在首个 prompt 前一次性
+记录最终 PATH，并仅传给 Provider 子进程。设置 `COSH_SHELL_BOOTSTRAP_PATH=0`
+可关闭该启动 PATH 交接。
 
 ## 为什么使用 cosh-ng
 
@@ -71,7 +73,7 @@ sudo yum install cosh-ng
 当前发布的 Linux raw 契约无法覆盖所有已路由的发行版，因此不作为推荐的
 Linux 安装路径。raw 包支持 macOS 11+ (arm64 / x86_64)，但依赖 Linux 的软件包和服务操作
 不可用。源码构建仅供贡献者使用，请参阅
-[开发者入门指南](../../docs/developer-guide/zh/cosh-ng/getting-started.md)。
+[开发者入门指南](../../contribute/zh/cosh-ng/getting-started.md)。
 
 发版构建矩阵也会生成 macOS x86_64（Intel）raw 包，与 arm64 一样要求 macOS 11.0
 或更新版本。包含此构建支持的版本发布后，Intel 产物可从 GitHub Releases 获取；
@@ -339,8 +341,8 @@ catalog 的两个条目都声明拥有本地用户权限，即使 token 位于�
 - [配置](../../docs/user-guide/zh/cosh-ng/configuration.md)
 - [管理系统操作](../../docs/user-guide/zh/cosh-ng/cli/overview.md)
 - [Headless 集成](../../docs/user-guide/zh/cosh-ng/core/headless-mode.md)
-- [开发者入门](../../docs/developer-guide/zh/cosh-ng/getting-started.md)
-- [架构](../../docs/developer-guide/zh/cosh-ng/architecture.md)
+- [开发者入门](../../contribute/zh/cosh-ng/getting-started.md)
+- [架构](docs/design/zh/architecture.md)
 - [贡献指南](CONTRIBUTING_zh.md)
 
 ## 数据采集
@@ -365,7 +367,7 @@ sudo touch /etc/anolisa/.telemetry_disabled
 
 ## 参与贡献
 
-源码构建主要面向贡献者，请从[开发者指南](../../docs/developer-guide/zh/cosh-ng/getting-started.md)
+源码构建主要面向贡献者，请从[开发者指南](../../contribute/zh/cosh-ng/getting-started.md)
 开始。
 
 ## 许可证

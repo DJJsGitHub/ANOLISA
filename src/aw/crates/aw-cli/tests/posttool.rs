@@ -12,6 +12,15 @@ use serde_json::{json, Value};
 use std::fs;
 use support::{Fixture, Service};
 
+#[path = "posttool/openclaw_scope.rs"]
+mod openclaw_scope;
+#[allow(dead_code)]
+#[path = "regression/tool_scope.rs"]
+mod scope;
+
+#[path = "posttool/tool_scope.rs"]
+mod tool_scope;
+
 #[test]
 fn optional_projection_does_not_remove_large_results_from_the_journal() {
     for bytes in [340_000, 400_000] {
@@ -210,6 +219,30 @@ fn adapters_keep_observers_and_user_hooks_before_one_final_replacement() {
             {"id":"compress","provider":"tokenless","operation":"record","effects":["replace_result"],"on_error":"report"}]}});
         let service = Service::start(&fixture, &document);
         let deadline = || Instant::now() + support::TIMEOUT;
+        // An observation-only adapter must reject compression during admission.
+        if adapter == "qoder-sdk" {
+            let rejected = service.client.call(
+                Operation::Bind {
+                    target: "agent".into(),
+                    capabilities: Capabilities {
+                        failure_actions: Default::default(),
+                        adapter: adapter.into(),
+                        version: "1.0.56".into(),
+                        entrypoint: "sdk-worker".into(),
+                        events: BTreeMap::from([("tool.after".into(), vec!["observe".into()])]),
+                    },
+                    cwd: fixture.root.to_str().unwrap().into(),
+                    environment: BTreeMap::new(),
+                },
+                deadline(),
+            );
+            assert!(
+                rejected.is_err(),
+                "unsupported replacement must fail admission"
+            );
+            service.released(&fixture);
+            continue;
+        }
         let binding: Binding = serde_json::from_value(
             service
                 .client
@@ -217,6 +250,7 @@ fn adapters_keep_observers_and_user_hooks_before_one_final_replacement() {
                     Operation::Bind {
                         target: "agent".into(),
                         capabilities: Capabilities {
+                            failure_actions: Default::default(),
                             adapter: adapter.into(),
                             version: "fixture".into(),
                             entrypoint: "fixture".into(),

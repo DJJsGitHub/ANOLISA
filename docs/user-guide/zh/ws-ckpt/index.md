@@ -62,6 +62,8 @@ ws-ckpt plugin uninstall --runtime openclaw
 
 `plugin install` 会先执行 detect 脚本检查前置条件（exit 2 = 缺前置依赖，中止；exit 1 = 未安装但可安装，继续），通过后再执行 install 脚本。脚本位于 `/usr/share/anolisa/adapters/ws-ckpt/<runtime>/`。
 
+对于 Hermes，每次 `plugins enable` 或 `plugins disable` 调用的超时为 30 秒，随后最多再等待 5 秒便强制终止。启用失败或超时时，安装会保留插件链接并告警，待 Hermes 恢复响应后可手动执行 `hermes plugins enable ws-ckpt`。禁用失败或超时时，卸载会告警并继续删除本地插件、配置项及 skill。运行中的 gateway 可能仍需执行 `hermes gateway restart` 才能应用变更。这些时限仅适用于 Hermes CLI 调用，不是整个安装或卸载过程的时限。
+
 OpenClaw 插件要求 OpenClaw >= 2026.2.13；这是 config 写入路径首次避免固化 runtime defaults，并在写盘前恢复未修改 `${VAR}` 引用的版本。OpenClaw >= 2026.9.1 使用条件配置写入；2026.2.13 到 <2026.9.1 的版本仅在根配置不含 `$include` 时使用普通 JSON 写入，否则安装会在安装插件前中止，并要求升级 OpenClaw。版本无法解析、缺少写入能力或 allowlist 更新失败时，安装同样会中止，避免留下不完整的集成。卸载仍采用 best-effort：本地插件文件会被删除；若不存在安全的配置写入路径，则跳过 plugin unregister 和 allowlist 清理并输出告警。
 
 ---
@@ -105,13 +107,14 @@ ws-ckpt status -w /home/user/projects/my-project --format json
 
 显式分页的 JSON 是包含 `snapshots` 和 `next_cursor` 的对象。分页按
 `(created_at, workspace_id, snapshot_id)` 升序排列。游标是不透明且带版本的，并绑定
-原始工作区范围和第一页的上界（首次索引扫描观察到的最大键，而非当前时间）。上界之后
+原始工作区范围和第一页的上界（第一页观察到的最大键，而非当前时间）。上界之后
 的新快照不会混入，位于上界内的并发插入以及
 删除仍可能影响后续页。如需无变更的时点列表，应在遍历期间暂停 checkpoint 和 cleanup。
 
-Daemon 从内存中的快照索引读取每一页，不扫描快照文件内容。每页仍重新扫描查询范围：
-N 条快照、P 页需要 O(N * P) 次索引访问，另加候选维护和渲染。只有入选候选键会被复制，
-但重复扫描仍然存在；不承诺固定延迟。页面目标约为 1 MiB，且不会超过
+Daemon 在各查询工作区的内存有序索引中直接定位到游标之后，不再每页重新扫描全部快照。
+该顺序在启动时重建，并随快照变化维护；额外内存与快照数量成正比。
+仅查询 orphan 时，仍可能检查剩余范围内的非 orphan 键。列表不读取快照文件内容，
+也不承诺固定延迟。页面目标约为 1 MiB，且不会超过
 16 MiB IPC 帧上限。如果单条记录的可选 `message` 或 `metadata` 会导致超限，该记录会以
 `detail: "summary"` 和 `omitted_fields` 返回。保留的 `created_at`、`pinned`、`missing`
 仍位于 `meta` 下，与完整记录一致；省略字段缺席，不返回 null。快照仍可通过 ID 操作。
@@ -264,6 +267,66 @@ daemon 配置文件位于 `/etc/ws-ckpt/config.toml`，为系统级 daemon 进�
 ```bash
 hermes config set plugins.ws-ckpt.workspace /home/user/projects/my-project
 ```
+
+### 回滚后的自动检查点
+
+插件成功执行非预览回滚后，仅跳过被恢复工作区在下一次轮次结束时的自动检查点。
+例如，显式回滚工作区 B 后，配置中的工作区 A 仍会正常创建自动检查点。
+如果在 hook 执行前切换工作区，仅当 hook 实际操作的是本轮已恢复的工作区时才会跳过。
+待消费的跳过记录随后清除，即使自动检查点已关闭或插件不可用，后续轮次仍正常创建检查点。
+预览和失败的回滚不会设置跳过记录。没有待消费的回滚跳过记录时，这项检查不会解析注册路径。
+
+OpenClaw 将回滚工具绑定到宿主提供的 `sessionKey`；工具工厂还提供 `sessionId` 时，
+会同时绑定该标识。其他会话的 `agent_end` 不会消费这份状态。OpenClaw 2026.2.13 的
+工具工厂不提供 `sessionId`，因此兼容路径仅使用 `sessionKey`，无法区分复用该 key 的重置。
+新版上下文带有 `sessionId` 时可区分这些会话实例。宿主没有提供 `sessionKey` 时，回滚仍可执行，
+但不会设置跳过记录；缺少会话身份的 hook 也不会清除其他会话的记录。工具工厂不提供 `runId`，
+所以本机制不区分同一会话内的并发运行。待消费状态保留在内存中，直到匹配的轮次结束或插件进程退出。
+Hermes 保留按工作区区分的状态；本次修改没有为其 hook 添加会话所有权。
+
+回滚可以使用工作区 ID 或注册路径。没有路径分隔符的参数（`.` 和 `..` 除外）会在非预览回滚前
+通过 `ws-ckpt status -w <selector> --format json` 解析。查询失败时不会执行回滚；
+请检查 daemon 状态，或改用注册的绝对路径。配置中的工作区如果也是这种参数，
+轮次结束时有待消费记录才会查询。此时查询失败会记录日志、消费待处理状态，并尝试正常创建检查点。
+使用路径的操作和没有待消费记录的轮次不会增加 status 查询。这些查询是独立的 daemon 请求，
+不与并发注销、重新注册工作区构成原子事务。
+
+使用路径时，请使用工作区的注册路径，包括路径末尾的符号链接，而不是链接所指向的当前快照目录。
+父目录别名和等价路径写法仍表示同一个注册路径。
+
+### Hermes 快照列表分页
+
+快照历史较大时，使用现有 `ws-ckpt-list` 工具请求有数量上限的第一页，
+之后按需读取下一页：
+
+```json
+{"limit":20}
+```
+
+成功响应为 JSON 字符串，内容是
+`{"success":true,"snapshots":[...],"next_cursor":"..."}`。将返回的游标原样传入下一次调用：
+
+```json
+{"limit":20,"cursor":"<next_cursor>"}
+```
+
+只有 `next_cursor:null` 表示遍历结束。短页或空页仍可能带有续页游标。
+续页期间保持配置的工作区不变。`limit` 必须是 1 至 10000 的整数；布尔值、
+小数、字符串和显式 null 均无效。`cursor` 必须是非空字符串，显式 null 无效。
+仅传游标时沿用 CLI 的默认页大小 1000。
+
+两个键都不传时，`{}` 保留完整表格及原有
+`{"success":true,"output":"..."}` 响应。显式分页只执行一次 CLI 调用，
+返回 `snapshots` 和 `next_cursor`，不添加 `output` 包装，也不自动遍历。
+分页需要支持该功能的 CLI 和匹配的 daemon；这里不指定未经验证的最低发行版本。
+CLI 缺失、不支持参数、游标无效或跨工作区、daemon 故障、超时及分页输出格式异常，
+均返回 `{"success":false,"error":"..."}`，不会重试完整列表。
+
+每个快照对象均原样保留，包括嵌套 `meta`、未知字段、`detail:"summary"`
+和 `omitted_fields`；省略的字段保持不存在。`elapsed_secs` 等 CLI 顶层附加字段
+会被忽略。条目数量上限不取代 daemon 的字节预算，因此仍可能出现摘要条目和短页。
+分页沿用快照列表的升序及弱一致性：创建或删除快照期间，列表不是固定时间点的视图。
+此选项不修改 checkpoint/rollback 状态或插件配置。OpenClaw 的列表工具保持原行为。
 
 ### CLI 配置
 

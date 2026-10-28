@@ -3,8 +3,10 @@
 [中文版](../../zh/aw/security.md)
 
 sec-core checks commands before tool execution. AW can block a call when it finds a risk or a
-required check fails. Generated configuration checks Qoder `Bash` and OpenClaw `exec`;
-other tools need explicit mappings. This uses native Hooks and does not provide an OS sandbox.
+required check fails. The generated `scan-code` step selects Qoder `Bash` and
+OpenClaw `exec` with `native:qoder:Bash` and `native:openclaw:exec`, including only
+the Agents chosen during generation. Scanning other tools requires explicit
+selectors and input mappings. This uses native Hooks and does not provide an OS sandbox.
 
 ## Prepare programs and backend
 
@@ -77,17 +79,7 @@ or changing configuration, but its TLS-verification disabling option should matc
 produce an AW policy denial. A model declining or never calling the tool is not a successful AW
 check; inspect native prompts when the check did not run.
 
-The generated safety configuration blocks calls when the backend connection fails.
-You can explicitly check backend connectivity.
-
-```bash
-export AW_SEC_PROVIDER="$AW_PREFIX/libexec/aw/providers/sec-core"
-"$AW_SEC_PROVIDER/aw-provider-sec-core" --health \
-  --helper "$AW_SEC_PROVIDER/agent-sec-daemon-health" --socket "$AW_SEC_SOCKET"
-```
-
-`backend: authenticated_reachable` means the backend can be reached; it does not replace the
-result of checking an actual tool call.
+If checks fail, verify the sec-core backend and socket. Generated configuration blocks selected tools on input or scan errors; unselected tools skip scanning.
 
 ## Stop and extend
 
@@ -95,6 +87,4 @@ After exiting the Agent, run `aw stop --config "$AW_HOME/security.yaml"`.
 Stop the foreground trial backend with Ctrl-C; shared system services remain managed by their owner.
 Uninstalling AW preserves external backend configuration and data.
 
-For other tools or observation without blocking, see
-[tool mappings and scan modes](../../../developer-guide/en/aw/sec-core.md#configure-a-provider).
-Unmapped tools produce observation records without being scanned.
+To scan other tools, update both the [step selector](configuration.md#select-tools-for-a-hook-step) and [Provider input mapping](../../../developer-guide/en/aw/providers/sec-core.md#configure-a-provider).

@@ -4,6 +4,48 @@ Read the repository AGENTS.md and [CONTRIBUTING.md](CONTRIBUTING.md) first.
 AW is a Linux component. The checkout directory name does not select another
 component's skills or validation workflow.
 
+## Documentation audiences and writing
+
+These rules also apply to AW pages under `docs/`, `contribute/` and the paired
+Provider integration guides. Read the repository documentation standard first.
+
+| Reader and task | Canonical location | Content |
+| --- | --- | --- |
+| Evaluate AW and start using it | README, `docs/user-guide/{en,zh}/aw/` | Core benefits, visible support matrix, installation, configuration, useful tool result, routine maintenance |
+| Integrate or deploy an application | `docs/developer-guide/{en,zh}/aw/` | Agent factories, Provider integration, worker deployment, persistence, updates, failure recovery |
+| Change or release AW | CONTRIBUTING, `contribute/{en,zh}/aw/` | Build dependencies, targeted checks, native acceptance, evidence and cleanup |
+| Change a protocol or implementation boundary | `src/aw/docs/design/{en,zh}/` | Ownership, invariants, ordering and design rationale |
+
+User chapters must let a reader complete one task: give prerequisites, commands,
+the expected visible result and necessary stop or rollback steps. Explain the
+capability and its practical support range before configuration details. Link
+to developer references for SDK wiring, deployment controls, field limits,
+protocol envelopes, package transactions and test fixtures. Do not make users
+assemble service RPCs or read implementation history to run an example.
+
+Developer chapters add only details needed to integrate, deploy or diagnose.
+Split Agent instructions under `agents/`, deployment under `deployment/`, and
+command references under `reference/`. Keep user chapter paths flat as required
+by the repository standard; express reading order through indexes and website
+navigation. Build and test commands belong in contribution documentation.
+Keep current behavior separate from explicitly labelled design proposals.
+
+Maintain one canonical explanation per contract and link from other chapters.
+Rewrite the relevant section when behavior changes; do not append a release
+narrative, review history, repeated non-goals or boilerplate assurances. Replace
+long prose comparisons with a short table when readers need to choose a mode.
+Use concrete conditions and actions for errors and limitations.
+
+Keep the generated Hook matrix expanded near the top of both READMEs and
+capability pages, never inside `details`. Generate all copies from the same
+regression manifest. Put MCP and update summaries in the capability page and
+exact versions, wiring and recovery in the corresponding developer chapter.
+
+Update both languages, links, moved-section anchors and website navigation in
+the same PR. Keep command blocks identical, define variables before use and
+state the working directory for source examples. Check documentation links and
+navigation; run gate behavior tests when changing generators or doc assertions.
+
 ## Integrated user experience
 
 The preferred entrypoint is `aw run --config aw.yaml --agent <target>`.
@@ -101,12 +143,44 @@ remove a contract merely because its version is older. New Core capability
 profiles require explicit schemas, Registry entries and cross-record validation;
 Provider-private data belongs to its Provider. Schema moves must preserve active
 bytes, IDs, registered names and digest vectors. Update the
-[architecture overview](../../docs/developer-guide/en/aw/architecture.md) and
+[architecture overview](docs/design/en/architecture.md) and
 [design index](docs/design/en/README.md) when ownership or call paths change.
 Show runtime flow in the overview; keep compilation dependencies in separate
 framework and Provider tables, with test-only dependencies identified.
 
 ## Adding an Agent or Hook
+
+### Shared capabilities and support evidence
+
+Unified Hooks, managed MCP and policy updates are shared AW capabilities.
+Keep configuration, admission, revision handling, lifecycle ownership and audit
+in the common framework; Adapters supply native boundaries and effect adoption.
+Frameworks may deliver these capabilities in different orders. A missing native
+boundary must produce an explicit unsupported capability at admission.
+
+Maintain the paired [capability support reference](../../docs/user-guide/en/aw/capabilities.md)
+in the same PR as any support change. Record the Adapter, supported version and
+launch mode, execution boundary, limitations and runnable acceptance evidence.
+Keep implemented, experimental, vocabulary-only and planned states distinct.
+The README and support reference expose the generated event/effect grid.
+The reference adds MCP and update summaries; Agent pages own integration details.
+Recognition of any of the 16 event names, an internal lifecycle notification,
+or a model-response identity tap does not establish a public Provider Hook.
+
+Policy updates must reuse candidate preparation, revision checks, durable audit
+and atomic activation. Native request/scope admission and activation must share
+a gate; preparation, unacknowledged handoffs and unfinished cleanup count as
+occupancy. Retain one policy revision through a task's before/after and MCP
+checks. Confirm native route adoption before dispatch, preserve old policy on
+rejected updates, and keep uncertain cleanup fail-closed. Describe each Adapter's
+verified readiness, launch mode and switching boundary; never infer reload
+support from a PID or native settings watcher. Keep external PID attachment,
+internal process identity and update target selection distinct. Prewarmed workers
+need readiness before their first task. The control plane may pause dispatch for
+updates; retain the runtime busy gate and avoid adding active-task switching
+without an explicit contract. Post-activation audit failure must stop dispatch
+rather than report an unchanged old policy. Document current support in the
+capability reference; keep proposed development order in design documents.
 
 Update these together in the same change:
 
@@ -121,9 +195,9 @@ Update these together in the same change:
    `crates/aw-cli/tests/regression/native.rs` for new native payloads. The
    shared PreTool and PostTool tests iterate the matrix without a fallback
    dialect, so an unimplemented fixture fails.
-4. Run `python3 scripts/check_matrix.py --write-readmes` from this directory and
-   document native adoption limits in both READMEs. Maintain the roadmap
-   separately from supported capabilities.
+4. Run `python3 scripts/check_matrix.py --write-docs` from this directory and
+   document native adoption limits in both capability references. Regenerate
+   both README grids in the same operation.
 5. Add pinned native commands, required reports, an owner and the exact acceptance
    boundary to `tests/native-matrix.json`. Unit suites declare counts; custom
    suites declare JSON result files with exact case names or observed counts.
@@ -131,7 +205,7 @@ Update these together in the same change:
    Agent must be accounted for; new integrations cannot silently opt out of nightly.
 6. Run `python3 scripts/check.py`. The gate compares the compiled catalog with
    the matrix and schema, resolves case names against real libtest executables,
-   rejects missing or ignored cases and checks both README grids.
+   rejects missing or ignored cases and checks README and user-guide grids.
 
 Use deterministic service/CLI/Provider fixtures on every relevant push. Keep
 real SDK/CLI adoption checks explicit and pinned; describe which native seam
@@ -153,8 +227,13 @@ named sibling modules, preserve test entrypoints and assertions, and avoid
 compressing code or adding size exemptions. Never add `mod.rs` except the
 repository-approved `tests/common/mod.rs` convention.
 
-Only PRs changing `src/aw/**` or `providers/**` automatically run AW CI. Component internals belong
-in component CI; explicitly validate public contract changes consumed by AW.
+AW/Provider and AW workflow changes run the full AW gate. Tokenless public
+CLI/protocol/runtime/statistics source, Provider protocol/executor source, RTK
+and package-builder inputs, dependency locks and toolchains also select real
+consumer compatibility through scripts/check.py. Ordinary AW runtime, installer,
+documentation and shared-crate test changes retain fixture coverage without a
+real backend build. Preserve Tokenless's independent component CI. Other
+component internals remain in component CI; validate newly consumed contracts explicitly.
 Keep daily checks credential-free. The nightly integration workflow builds all
 Preview packages once and reuses checksummed candidate-SHA binaries for pinned
 native acceptance. Preserve exact version evidence, bounded processes, complete
@@ -163,7 +242,10 @@ integration result. Prepare private native tool environments; do not weaken
 admission to accommodate runner loader overrides or writable shared caches.
 Rerun on the exact release SHA before release.
 
-CI checks belong to the existing `AW / required` workflow and local entrypoint.
+The existing `AW / required` check joins parallel AW and Tokenless jobs after
+scope selection. Keep independent build caches, whole-job results and tested
+SHAs; a late artifact failure or cancellation must still block the result.
+Local entrypoints retain the same checks without requiring Actions orchestration.
 Scope selection must use the complete change and preserve candidate/tested SHA
 identity. Compile test harnesses once, enumerate them directly and reuse the
 build for the workspace run. Do not save CI time by skipping shared security,

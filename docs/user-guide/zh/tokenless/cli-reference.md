@@ -41,6 +41,12 @@ cat response.json | tokenless compress-response
 - 单次输入上限为 64 MiB。
 - JSON 相关命令要求输入为合法 JSON。
 - 压缩后没有 Token 收益时，CLI 向 stderr 说明原因，并输出原文。
+- `compress-schema`、`compress-response`、`compress-toon` 和 `retrieve` 按字节原样写出 Payload：
+  不添加也不去除末尾换行符。因此透传和无收益场景会逐字节复现输入，比较 stdout 与输入负载
+  即可可靠判断是否发生了压缩或编码。对压缩类命令而言，Active 模式下写出的字节等于统计记录的
+  `after` 文本；Dry-run 模式（`TOKENLESS_COMPRESSION_ENABLED=0`）下两者并不相同，因为 stdout 保留
+  原文，而统计把更小的预测候选记为 `after_text`。所以 Dry-run 记录的 `after_chars` 与
+  `after_tokens` 描述的是预测节省，而不是实际写出的字节（见[最小有效 Payload](#最小有效-payload)）。
 
 ### 最小有效 Payload
 
@@ -108,7 +114,11 @@ jq -n \
 
 只有 `post_tool` 会进入 `PostToolPipeline`。当前生产路由为：
 
-- Retrieve Result、Interrupted/Denied 调用和 RTK 已优化输出绕过压缩。
+- Retrieve Result 和 Interrupted/Denied 调用绕过压缩。
+- RTK 输出默认绕过压缩；只有完整执行回执确认字节未变且调用成功，Core 才恢复原命令并继续路由。
+  PostTool 必须在 `command` 中传入注册的完整执行命令；命令缺失或被修改时保留旁路。
+  输出已改变或无法确认时保留旁路；Token 估算持平不能授权回退。回执状态失败会发出警告并保留
+  旁路，不会使 PostTool 操作失败。
 - Tool Error 原样透传，并可携带限长 `additional_context` 诊断。
 - 成功 JSON 使用 `JsonCompressor`，并可能选择 Compact JSON 或 TOON。
 - 已识别的成功构建/测试命令输出使用 `BuildLogCompressor`，可选择 Terminal Cleanup 和可恢复的
@@ -326,7 +336,16 @@ echo '{"name":"test","value":42}' \
   | tokenless decompress-toon
 ```
 
-`compress-toon` 支持 `--agent-id`、`--session-id`、`--tool-use-id` 和 `--min-toon-chars`。当负载低于最小长度或编码后无收益时会输出原 JSON，且不记录该次统计。这类透传场景退出码仍为 `0`，stderr 上的提示仅供参考：在脚本等自动化场景中，请通过比较 stdout 与输入负载来判断是否发生了编码，不要依赖 stderr。透传和无收益场景会在 stdout 上逐字节原样复现输入（不添加、不去除末尾换行符），任何字节差异都说明负载已被编码；作为兜底，也可以检查 stdout 是否仍为合法 JSON。
+两个命令都支持从文件读取输入，而不必使用标准输入：
+
+```bash
+tokenless compress-toon --file payload.json
+tokenless decompress-toon --file payload.toon
+```
+
+`-f` 是 `--file` 的简写形式。不指定时从标准输入读取，这正是上面示例的用法。
+
+`compress-toon` 支持 `--agent-id`、`--session-id`、`--tool-use-id` 和 `--min-toon-chars`。当负载低于最小长度、含有 TOON 无法精确承载的数值（`1e-400`、`-0.0`、`1e3`，或超出 `f64` 精度的小数），或编码后无收益时会输出原 JSON，且不记录该次统计。这类透传场景退出码仍为 `0`，stderr 上的提示仅供参考：在脚本等自动化场景中，请通过比较 stdout 与输入负载来判断是否发生了编码，不要依赖 stderr。透传和无收益场景会在 stdout 上逐字节原样复现输入（不添加、不去除末尾换行符），任何字节差异都说明负载已被编码；作为兜底，也可以检查 stdout 是否仍为合法 JSON。
 
 ## `retrieve`
 

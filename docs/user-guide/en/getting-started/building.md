@@ -30,7 +30,7 @@ The following table lists component locations in the repository:
 | cosh-ng | [`src/cosh-ng`](../../../../src/cosh-ng/README.md) | Rust Agent OS CLI and shell; full Linux build, limited macOS source build |
 | agent-sec-core | [`src/agent-sec-core`](../../../../src/agent-sec-core/README.md) | Rust sandbox plus Python security CLI; Linux |
 | agentsight | [`src/agentsight`](../../../../src/agentsight/README.md) | Rust/eBPF observability; full tracing on Linux, `trace` and `serve` on macOS |
-| tokenless | [`src/tokenless`](../../../../src/tokenless/README.md) | Rust token and command-output optimization; Linux source build, with cross-compiled npm artifacts for macOS |
+| tokenless | [`src/tokenless`](../../../../src/tokenless/README.md) | Rust token and command-output optimization; Linux and Windows x64 source builds, with cross-compiled npm artifacts for macOS |
 | agent-memory (`memory`) | [`src/agent-memory`](../../../../src/agent-memory/README.md) | Rust MCP memory server; Linux |
 | os-skills (`skills`) | [`src/os-skills`](../../../../src/os-skills/README.md) | Static skill definitions and scripts; all platforms supported by each skill |
 | anolisa | [`distribution/anolisa`](../../../../distribution/anolisa/README.md) | Rust component lifecycle CLI; Linux and macOS arm64 |
@@ -142,11 +142,11 @@ linked README and scoped developer guide for component-specific build details.
 
 | Component | Build |
 | ----------- | ------- |
-| [AW](../../../developer-guide/en/aw/building.md) | `cd src/aw && cargo build --locked -p aw-cli -p aw-service -p aw-package -p aw-provider -p aw-host --bins --examples` |
+| [AW](../../../../contribute/en/aw/building.md) | `cd src/aw && cargo build --locked -p aw-cli -p aw-service -p aw-package -p aw-provider -p aw-host --bins --examples` |
 | [os-skills](../../../../src/os-skills/README.md) | `cd src/os-skills && make build` |
 | [agent-sec-core](../../../../src/agent-sec-core/README.md) | `cd src/agent-sec-core && make build-all` |
 | [agentsight](../../../../src/agentsight/README.md) | Linux: `cd src/agentsight && make build-all`; macOS local viewer: `cd src/agentsight && make build-mac` |
-| [tokenless](../../../../src/tokenless/README.md) | `cd src/tokenless && make build` |
+| [tokenless](../../../../src/tokenless/README.md) | Linux: `cd src/tokenless && make build`; [Windows x64](../../../developer-guide/en/tokenless/windows.md#build-and-test-on-windows) |
 | [agent-memory](../../../../src/agent-memory/README.md) | `cd src/agent-memory && make build` |
 | [ws-ckpt](../../../../src/ws-ckpt/README.md) | `cd src/ws-ckpt && make build` |
 | [cosh-ng](../../../../src/cosh-ng/README.md) | `cd src/cosh-ng && cargo build --workspace` |
@@ -161,7 +161,7 @@ your changes.
 
 - [Testing](testing.md)
 - [User installation guide](installation.md)
-- [Developer guide index](../../../developer-guide/en/README.md)
+- [Developer guide index](../../../developer-guide/en/index.md)
 - [Component onboarding specification](../../../../specs/component-onboarding.md)
 - [Documentation standard](../../../../specs/documentation-standard.md)
 - [Commit message standard](../../../../specs/commit-message-standard.md)

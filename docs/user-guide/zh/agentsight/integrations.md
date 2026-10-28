@@ -31,6 +31,10 @@ AgentSight 观测 Agent 时不需要被嵌进 Agent 里；同样，当机器上�
   确实连上了 gateway。
 - **Codex CLI** 静态链接 TLS 库，AgentSight 会退化到字节模式匹配加逐版本 offset 表。刚发布的 Codex
   版本可能需要更新 `codex_offsets` 条目。
+- **Gemini CLI** 轨迹直接从 `~/.gemini/tmp/<project>/chats/session-*.jsonl` 会话文件采集，无需配置。
+  项目名取自各项目目录下的 `.project_root` 标记文件。采集器在转换前会重放 CLI 的修正记录
+  （`$rewindTo`、`$patch`、`$set`），因此采集到的轨迹与 CLI 恢复会话时看到的对话一致；嵌套在父
+  会话 ID 下的子 Agent 转录会作为子 Agent 轨迹采集。
 - **Hermes** 无需 eBPF 也能采集轨迹。轨迹采集器以只读方式打开 `$HERMES_HOME/state.db`，把有效消息、
   推理内容、工具调用、工具结果和会话 Token 汇总转换为 ATIF v1.7，并持续读取 SQLite WAL 中已提交的
   更新。设置 `scan_dirs` 后，需显式包含 Hermes home 目录或 `state.db` 路径。
@@ -118,6 +122,10 @@ BPF LSM（`/sys/kernel/security/lsm` 中包含 `bpf`）时，`block` 规则才�
 hook 并未挂载——引擎仍会以 `effect=block` 且 `blocked=false` 的 violation 落账。遇到这类降级
 报告，说明该策略实际无法拒绝；请检查引擎 profile（`ACTPLANE_HOOK_PROFILE` /
 `ACTPLANE_PINNED_PROFILE`）与内核 LSM 配置。
+
+协议 v5 新增带版本的 `file_protection_policy` 载荷，与 `policy_dsl` 互斥。当前后端会拒绝
+结构化策略且不改变已有绑定，新增文件保护能力保持 false。旧 DSL 语义不变，但协议 v4 帧会
+被拒绝，因此客户端需与 enforcer 一起升级。
 
 ## cosh：用自然语言提问
 

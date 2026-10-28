@@ -273,26 +273,26 @@ def _entries_to_atif(entries: Iterable[dict], filepath: Path) -> Optional[dict]:
             # cumulatively advance) the same usage, so counting each record
             # doubles the cost input.
             usage = msg.get("usage")
-            if isinstance(usage, dict):
+            metrics = usage_to_metrics(usage)
+            if metrics:
                 message_id = msg.get("id")
                 if not isinstance(message_id, str) or not message_id:
                     message_id = None
-                usage_records.append((step, message_id, usage))
+                usage_records.append((step, message_id, metrics))
 
             steps.append(step)
 
     # One message id may span several records; the last snapshot is the most
-    # complete. Records without an id keep their own usage, as before.
+    # complete usable measurement. Empty/invalid tails must not erase it.
+    # Records without an id keep their own usage, as before.
     last_usage_index = {}
     for index, (_, message_id, _) in enumerate(usage_records):
         if message_id is not None:
             last_usage_index[message_id] = index
-    for index, (step, message_id, usage) in enumerate(usage_records):
+    for index, (step, message_id, metrics) in enumerate(usage_records):
         if message_id is not None and last_usage_index[message_id] != index:
             continue
-        metrics = usage_to_metrics(usage)
-        if metrics:
-            step["metrics"] = metrics
+        step["metrics"] = metrics
 
     if not steps:
         return None
@@ -546,7 +546,14 @@ def main():
         default=None,
         help="Path to analyze binary (default: cargo run -p agentsight-opt --bin analyze)",
     )
+    parser.add_argument(
+        "--stats-only",
+        action="store_true",
+        help="Compute local perf/cost statistics without LLM requests or credentials",
+    )
     args = parser.parse_args()
+    if args.stats_only and args.dim == "accuracy":
+        parser.error("--stats-only supports perf and cost; accuracy requires LLM analysis")
 
     if args.export_atif is not None:
         if args.binary:
@@ -559,6 +566,8 @@ def main():
         analyze_cmd = [args.binary]
     else:
         analyze_cmd = ["cargo", "run", "-q", "-p", "agentsight-opt", "--bin", "analyze", "--"]
+    if args.stats_only:
+        analyze_cmd.append("--stats-only")
 
     # Collect files
     if args.file:
