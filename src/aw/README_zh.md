@@ -2,58 +2,26 @@
 
 [English](README.md)
 
-AW 让不同 Agent 共用安全检查、工具输出压缩和自定义规则。
-它通过一份配置启动原生 Agent，并在工具调用前后运行所选 Provider。
-Agent 继续管理自己的模型、界面和权限；AW 保存本地执行记录，便于检查运行情况。
-当前为 Linux Preview。
+AW 为 Agent 和 SDK 应用提供统一 Hook 编排、受管 MCP 接入和策略热更新。
+通过一份配置组合工具执行前的安全检查、执行后的输出压缩和自定义规则。
+支持的常驻入口可在任务排空后更新策略，保留宿主进程。
+Agent 继续管理自己的模型、界面和权限。当前提供 Linux Preview。
 
-## 安装与使用
+## 通用能力
 
-AW 使用 Preview 包分发，尚未接入 `anolisa install` 或 RPM。
-从[安装指南](../../docs/user-guide/zh/user-entrypoint/aw/installation.md)下载并安装 core
-或 all-in-one，用 `aw-package configure` 生成配置后运行。
-
-```bash
-aw validate --config "$HOME/aw/aw.yaml"
-aw run --config "$HOME/aw/aw.yaml" --agent qoder
-```
-
-用 `aw validate --config next.yaml --against current.yaml` 离线检查仅涉及策略的修改，
-详见[配置](../../docs/user-guide/zh/user-entrypoint/aw/configuration.md#比较策略修改)；
-此命令不更新运行中的实例。
-
-退出 Agent 后，本地服务仍可查询，使用结束后显式停止。
-
-```bash
-aw status --config "$HOME/aw/aw.yaml"
-aw stop --config "$HOME/aw/aw.yaml"
-```
-
-core 可独立使用。Tokenless 包自带 RTK 和 TOON 编码，安全检查需要启动 sec-core
-后端；这些能力都要通过配置启用。AW 不安装 Agent，也不配置模型凭据。
-
-## 文档导航
-
-| 任务 | 文档 |
+| 能力 | 用户能做什么 |
 | --- | --- |
-| 选择能力和开始使用 | [AW 用户指南](../../docs/user-guide/zh/user-entrypoint/aw/README.md) |
-| 安装包、生成配置和首次运行 | [安装 AW](../../docs/user-guide/zh/user-entrypoint/aw/installation.md) |
-| 选择 Agent、启用 Provider 和修改配置 | [配置 AW](../../docs/user-guide/zh/user-entrypoint/aw/configuration.md) |
-| 压缩工具输出 | [Tokenless](../../docs/user-guide/zh/user-entrypoint/aw/tokenless.md) |
-| 启用命令安全检查 | [安全检查](../../docs/user-guide/zh/user-entrypoint/aw/security.md) |
-| 查看 Agent 运行记录 | [接入 AgentSight](../../docs/user-guide/zh/user-entrypoint/aw/observability.md) |
-| 查询状态、升级、卸载和排错 | [运行维护](../../docs/user-guide/zh/user-entrypoint/aw/operations.md) |
-| 客户本地编译和打包 | [从源码构建 AW](../../docs/developer-guide/zh/aw/building.md) |
-| 编写规则、集成 Provider 或 SDK | [AW 开发指南](../../docs/developer-guide/zh/aw/README.md) |
+| Hook 编排 | 按目标和工具选择规则，组合 sec-core、Tokenless 与自定义 Hook，统一步骤顺序、执行期限和审计。 |
+| 受管 MCP | 在支持的实际工具调用处执行同一套策略，检查调用身份及获准参数。 |
+| 策略更新 | 向支持的空闲实例显式应用新策略，让后续任务使用新版本。 |
 
-用户手册集中在 `docs/user-guide/{en,zh}/user-entrypoint/aw/`，接入参考在
-`docs/developer-guide/{en,zh}/aw/`。组件协议设计保留在本目录的 `docs/design/`。
+Adapter 接通原生事件并采纳支持的效果，Provider 实现具体策略。
+core 可独立使用；安全检查与压缩需安装对应 Provider 并通过配置启用。
+工具结果替换限于获准的位置，Agent 的原生权限检查始终保留。
 
-## Hook 支持
+## Hook 支持矩阵
 
-下表由[回归矩阵](tests/regression-matrix.json)生成，表示运行时声明并由 CI 契约测试
-覆盖的能力。支持版本、工具类型和文本替换范围见
-[原生 Agent 接入参考](../../docs/developer-guide/zh/aw/native-agents.md)。
+✓ 已声明且有契约测试覆盖，× 尚不支持。矩阵从[回归清单](tests/regression-matrix.json)生成。结果替换的原生限制与 MCP、更新范围见[完整能力表](../../docs/user-guide/zh/aw/capabilities.md)。
 
 <!-- aw-regression-matrix:start -->
 | Agent | `tool.before` / `observe` | `tool.before` / `block` | `tool.after` / `observe` | `tool.after` / `replace_result` |
@@ -64,35 +32,64 @@ core 可独立使用。Tokenless 包自带 RTK 和 TOON 编码，安全检查需
 | `openclaw` | ✓ | ✓ | ✓ | ✓ |
 | `pi` | ✓ | ✓ | ✓ | ✓ |
 | `qoder` | ✓ | ✓ | ✓ | ✓ |
+| `qoder-sdk` | ✓ | ✓ | ✓ | × |
 | `qwenpaw` | ✓ | ✓ | ✓ | ✓ |
 <!-- aw-regression-matrix:end -->
 
-Tokenless 重试建议会阻止原调用，Agent 需发起新调用并重新经过安全和原生权限检查。
-结果替换仅适用于受支持的文本位置；AW 不提供 OS 沙箱或跨 Agent 审批。
-真实 SDK 和模型会话的验收范围见[贡献指南](CONTRIBUTING_zh.md)。
+<a id="安装与使用"></a>
 
-## 代码架构
+## 安装与首次运行
 
-![AW 用户流程与组件架构](../../docs/images/aw/architecture_zh.png)
+从[安装指南](../../docs/user-guide/zh/aw/installation.md)获取 Preview 包并安装。
+当前使用独立安装包；`anolisa install aw` 和 RPM 安装入口尚未提供。
+先安装并登录所选 Agent，再用 `aw config init` 生成配置。
 
-根目录是纯 workspace。`crates/` 保存 9 个框架 crate，仓库根 `providers/` 收录可独立协作的
-具体实现。Provider 也可以在外部仓库开发、单独分发，见[协作入口](../../providers/README_zh.md)。
-Hook 请求由 `aw-service` 交给 `aw-host`，通过 `aw-exec` 调用 Provider；
-`aw-core` 提供独立的计划执行接口，服务只复用它的 Journal。
-
-[架构总览](../../docs/developer-guide/zh/aw/architecture.md)说明各包职责与运行顺序，
-[设计索引](docs/design/README_zh.md)按调用流程组织详细协议。
-
-## 开发与验证
-
-从仓库根目录运行 AW 的 CI 检查。
+下面以已安装、登录的 Qoder 为例。`AW_PREFIX` 是安装指南中选定的安装目录，
+`qodercli` 和 `aw` 应已加入 `PATH`。
 
 ```bash
-python3 src/aw/scripts/check.py
+export AW_HOME="$HOME/aw"
+install -d -m 700 "$AW_HOME" "$AW_HOME/workspace"
+aw config init --prefix "$AW_PREFIX" \
+  --config "$AW_HOME/aw.yaml" --state-dir "$AW_HOME/state" \
+  --qoder "$(command -v qodercli)"
+aw validate --config "$AW_HOME/aw.yaml"
+cd "$AW_HOME/workspace"
+aw run --config "$AW_HOME/aw.yaml" --agent qoder
 ```
 
-Qoder CLI 和 QwenPaw App/API 各自通过临时容器中的真实 sec-core 验证正常放行、
-扫描拒绝、后端异常和超时阻断。Qoder 使用 nightly 账号 Secret，QwenPaw 使用
-本地确定性模型。完整验收边界见 [CI 看护](CONTRIBUTING_zh.md#日常-ci-与-nightly-集成)。
+进入 Qoder 后，请它用工具读取当前目录，并按原生提示处理权限确认。
+退出 Agent 后，本地服务仍可复用。使用结束后查询并停止它。
 
-- [开发环境和测试](CONTRIBUTING_zh.md)
+```bash
+aw status --config "$AW_HOME/aw.yaml"
+aw stop --config "$AW_HOME/aw.yaml"
+```
+
+<a id="hook-支持"></a>
+<a id="adapter-能力覆盖"></a>
+
+## 支持范围
+
+当前接入 Qoder CLI、Qoder SDK、OpenClaw、Hermes、QwenPaw、Pi SDK、
+Claude SDK 和 AgentScope SDK。CLI 使用原生 Hook 或插件，SDK 应用需要显式接入受管工厂。
+[Qoder SDK 接入](../../docs/developer-guide/zh/aw/agents/qoder-sdk.md)还支持固定摘要的 Bash 消费者、Worker import 和声明式角色资产。
+[能力支持矩阵](../../docs/user-guide/zh/aw/capabilities.md)按 Adapter 和启动模式说明
+结果处理、MCP 与策略更新的差异，并链接支持版本与接线步骤。
+
+## 文档导航
+
+| 任务 | 文档 |
+| --- | --- |
+| 安装并完成首次运行 | [AW 用户手册](../../docs/user-guide/zh/aw/index.md) |
+| 选择 Agent、配置规则和更新策略 | [配置与启动](../../docs/user-guide/zh/aw/configuration.md) |
+| 启用输出压缩或安全检查 | [Tokenless](../../docs/user-guide/zh/aw/tokenless.md)、[sec-core](../../docs/user-guide/zh/aw/security.md) |
+| 查看运行记录 | [AgentSight](../../docs/user-guide/zh/aw/observability.md) |
+| 查询状态、升级卸载与排错 | [运行维护](../../docs/user-guide/zh/aw/operations.md) |
+| 编写 Provider、接入 SDK 或理解架构 | [开发指南](../../docs/developer-guide/zh/aw/index.md) |
+
+<a id="代码架构"></a>
+<a id="开发与验证"></a>
+
+[架构总览](docs/design/zh/architecture.md)说明框架与 Provider 的职责和调用流程。
+源码构建、测试与 CI 入口见[贡献指南](CONTRIBUTING_zh.md)。

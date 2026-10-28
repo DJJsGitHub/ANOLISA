@@ -158,7 +158,7 @@ class NativeTests(GateFixture):
     def test_missing_entrypoint_and_empty_suites_fail(self) -> None:
         from unittest.mock import patch
 
-        for mode in ("missing", "empty", "manual", "unpinned", "deadline"):
+        for mode in ("missing", "empty", "manual", "unpinned", "deadline", "excessive-timeout"):
             manifest = copy.deepcopy(self.manifest)
             row = manifest["agents"]["agentscope"]
             if mode == "missing":
@@ -170,7 +170,7 @@ class NativeTests(GateFixture):
             elif mode == "unpinned":
                 row["requirements"] = ["agentscope>=2"]
             else:
-                row["cases"][0]["timeout_seconds"] = 0
+                row["cases"][0]["timeout_seconds"] = 2401 if mode == "excessive-timeout" else 0
             original = Path.read_text
 
             def read(path: Path, *args: object, **kwargs: object) -> str:
@@ -181,6 +181,44 @@ class NativeTests(GateFixture):
             with self.subTest(mode=mode), patch.object(Path, "read_text", read):
                 with self.assertRaises(ValueError):
                     load(AW)
+
+    def test_qoder_reload_pin_entrypoint_and_cases_are_required(self) -> None:
+        original = Path.read_text
+        for mode in ("pin", "version", "suite", "entrypoint", "case"):
+            manifest = copy.deepcopy(self.manifest)
+            row = manifest["agents"]["qoder"]
+            case = next(item for item in row["cases"] if item["name"] == "runtime-reload")
+            if mode == "pin":
+                del row["qoder_reload_cli"]
+            elif mode == "version":
+                row["qoder_reload_cli"] = copy.deepcopy(row["qoder_cli"])
+            elif mode == "suite":
+                row["cases"].remove(case)
+            elif mode == "entrypoint":
+                case["argv"][1] = "tests/test_claude_sdk_native.py"
+            else:
+                case["results"][0]["cases"]["names"].remove("add-hook")
+
+            def read(path, *args, **kwargs):
+                if path == AW / "tests/native-matrix.json":
+                    return json.dumps(manifest)
+                return original(path, *args, **kwargs)
+
+            with self.subTest(mode=mode), patch.object(Path, "read_text", read):
+                with self.assertRaises(ValueError):
+                    load(AW)
+
+    def test_qoder_reload_rejects_missing_credential_before_launch(self) -> None:
+        import importlib.util
+
+        source = AW / "crates/aw-cli/tests/fixtures/qoder/reload.py"
+        spec = importlib.util.spec_from_file_location("aw_qoder_reload", source)
+        fixture = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(fixture)
+        with patch.dict(os.environ, {}, clear=True), patch.object(fixture, "install") as install:
+            with self.assertRaisesRegex(RuntimeError, "QODER_PERSONAL_ACCESS_TOKEN"):
+                fixture.exercise(self.root, self.root)
+            install.assert_not_called()
 
     def reports(self) -> None:
         for agent, row in self.manifest["agents"].items():
@@ -290,7 +328,8 @@ class NativeTests(GateFixture):
                         elif mode == "renamed":
                             rows[0][spec["key"]] = "unexpected-case"
                         elif mode == "duplicate":
-                            rows[0] = rows[1]
+                            # Single-case reports need an extra row to form a duplicate.
+                            rows[:] = [rows[0]] * max(2, len(rows))
                         elif spec.get("values"):
                             rows[0][next(iter(spec["values"]))] = False
                         else:
@@ -322,7 +361,7 @@ class NativeTests(GateFixture):
                     verify_case(case, output, directory)
 
     def test_real_pi_fixture_with_empty_cases_fails_acceptance(self) -> None:
-        fixture = AW / "crates/aw-service/tests/fixtures/pi"
+        fixture = AW / "crates/aw-cli/tests/fixtures/pi"
         source = (fixture / "public-smoke.py").read_text()
         assignment = next(
             node

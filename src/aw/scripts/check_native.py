@@ -2,12 +2,14 @@
 
 import argparse
 import json
+import math
 import re
 from pathlib import Path
 
 from check import AW, git, output, sha
 from native_reports import validate_case
 from native_qoder import validate_pin
+from resident_contract import shards
 
 
 def load(root: Path) -> dict:
@@ -36,6 +38,26 @@ def load(root: Path) -> dict:
             raise ValueError(f"{agent}: pin the native runtime")
         if "qoder_cli" in row:
             validate_pin(row["qoder_cli"])
+        if agent == "qoder":
+            validate_pin(row.get("qoder_reload_cli", {}))
+            reload = [case for case in row.get("cases", []) if case["name"] == "runtime-reload"]
+            expected = [
+                "{python}", "crates/aw-cli/tests/fixtures/qoder/reload.py",
+                "--bin", "{bin}", "--output", "{output}/runtime-reload",
+            ]
+            if (
+                row["qoder_reload_cli"]["version"] != "1.1.73"
+                or len(reload) != 1
+                or reload[0]["argv"] != expected
+            ):
+                raise ValueError("qoder: require pinned 1.1.73 TUI idle reload acceptance")
+            validate_case(reload[0])
+            if (
+                reload[0]["report"] != "json"
+                or set(reload[0]["results"][0].get("cases", {}).get("names", []))
+                != {"prewarm", "add-hook", "remove-hook"}
+            ):
+                raise ValueError("qoder: require prewarm/add/remove native reload reports")
         if agent in {"qoder", "qwenpaw"}:
             security = [case for case in row.get("cases", []) if case["name"] == "sec-core"]
             expected = {"allow", "scan-deny", "backend-error", "timeout-block"}
@@ -46,7 +68,7 @@ def load(root: Path) -> dict:
                 raise ValueError(f"{agent}: pin the sec-core runtime container digest")
             expected_argv = [
                 "{python}",
-                "crates/aw-service/tests/fixtures/sec_core/native.py",
+                "crates/aw-cli/tests/fixtures/sec_core/native.py",
                 "--agent",
                 agent,
                 "--bin",
@@ -76,7 +98,7 @@ def load(root: Path) -> dict:
         if not cases or len({case["name"] for case in cases}) != len(cases):
             raise ValueError(f"{agent}: missing or duplicate native cases")
         for case in cases:
-            if not 0 < case["timeout_seconds"] <= 1200:
+            if not 0 < case["timeout_seconds"] <= 2400:
                 raise ValueError(f"{agent}: native cases need bounded deadlines")
             validate_case(case)
             scripts = [arg for arg in case["argv"] if arg.endswith((".py", ".mjs"))]
@@ -85,14 +107,26 @@ def load(root: Path) -> dict:
     return manifest
 
 
-def plan(root: Path, expected: str) -> dict:
+def select(manifest: dict, credential_free: bool = False) -> dict:
+    """Keep hosted-model acceptance explicit when validating an unmerged fork."""
+    return {
+        **manifest,
+        "agents": {
+            agent: row for agent, row in manifest["agents"].items()
+            if not credential_free or agent not in {"qoder", "qoder-sdk"}
+        },
+    }
+
+
+def plan(root: Path, expected: str, credential_free: bool = False) -> dict:
     """Generate the job matrix from the tested checkout, never a second Agent list."""
     if git("rev-parse", "HEAD", repo=root.parents[1]) != sha(expected):
         raise ValueError("native plan checkout does not match candidate SHA")
-    manifest = load(root)
+    manifest = select(load(root), credential_free)
     return {
         "include": [
-            {"agent": agent, "python": row["python"]}
+            {"agent": agent, "python": row["python"],
+             "minutes": math.ceil((sum(c["timeout_seconds"] + 20 for c in row["cases"]) + 1800) / 60)}
             for agent, row in manifest["agents"].items()
             if row["mode"] == "automated"
         ]
@@ -102,8 +136,15 @@ def plan(root: Path, expected: str) -> dict:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--candidate-sha", required=True)
+    parser.add_argument("--credential-free", action="store_true")
     args = parser.parse_args()
-    output(matrix=json.dumps(plan(AW, args.candidate_sha), separators=(",", ":")))
+    matrix = plan(AW, args.candidate_sha, args.credential_free)
+    resident = {"include": [
+        {"shard": name, "minutes": row["job_minutes"]}
+        for name, row in shards(load(AW)).items()
+    ]}
+    output(matrix=json.dumps(matrix, separators=(",", ":")),
+           resident_matrix=json.dumps(resident, separators=(",", ":")))
 
 
 if __name__ == "__main__":

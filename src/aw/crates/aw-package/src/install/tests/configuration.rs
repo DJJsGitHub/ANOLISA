@@ -212,6 +212,19 @@ fn one_configuration_maps_both_agents_and_rejects_long_socket() {
     let value: serde_json::Value = serde_yaml_ng::from_slice(&fs::read(&config).unwrap()).unwrap();
     assert_eq!(value["spec"]["agents"].as_object().unwrap().len(), 2);
     assert_eq!(
+        value["spec"]["events"]["tool.before"]["steps"][0]["match"]["tools"],
+        serde_json::json!(["native:qoder:Bash", "native:openclaw:exec"])
+    );
+    assert_eq!(
+        value["spec"]["providers"]["security"]["config"]["unmapped_tool"],
+        "error"
+    );
+    assert_eq!(
+        value["spec"]["events"]["tool.before"]["steps"][0]["on_error"],
+        "block"
+    );
+
+    assert_eq!(
         value["spec"]["providers"]["security"]["config"]["tools"]
             .as_object()
             .unwrap()
@@ -237,7 +250,6 @@ fn configure_rejects_damaged_payloads_and_allows_retry() {
     for split in [false, true] {
         for name in [
             "bin/aw",
-            "bin/aw-package",
             "libexec/aw/providers/sec-core/aw-provider-sec-core",
             "libexec/aw/providers/sec-core/agent-sec-cli",
             "libexec/aw/providers/sec-core/agent-sec-daemon",
@@ -278,10 +290,23 @@ fn configure_rejects_damaged_payloads_and_allows_retry() {
                     node: Some(Path::new("/bin/true")),
                     openclaw: Some(Path::new("/bin/true")),
                 };
-                assert!(crate::configure(&settings)
-                    .unwrap_err()
-                    .to_string()
-                    .contains("modified or missing"));
+                let error = crate::configure(&settings).unwrap_err().to_string();
+                let reason = match damage {
+                    "bytes" => "checksum mismatch",
+                    "missing" => "modified or missing",
+                    _ => "mode mismatch",
+                };
+                let package = if name == "bin/aw" {
+                    "aw-core"
+                } else {
+                    "aw-provider-sec-core"
+                };
+                assert!(
+                    error.contains(reason)
+                        && error.contains(&path.display().to_string())
+                        && error.contains(&format!("package {package}")),
+                    "split={split} damage={damage} file={name}: {error}"
+                );
                 assert!(!config.exists());
                 assert_eq!(receipts(&f.prefix).unwrap(), before);
                 fs::write(&path, original).unwrap();

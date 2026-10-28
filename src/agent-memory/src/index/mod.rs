@@ -88,11 +88,13 @@ impl IndexHandle {
         store.search(query, top_k, self.exclude_cold)
     }
 
-    /// Search with agent scope filter.
+    /// Search with agent scope filter and optional fact-category filter.
     ///
-    /// `category` keeps only hits under `facts/<category>/`. The filter runs
-    /// inside the store and *before* search-access bookkeeping, so a hit the
-    /// caller never sees cannot refresh that file's warmth.
+    /// `category` keeps only hits under `facts/<category>/`. It is pushed into
+    /// SQL so it applies *before* the `top_k` limit (see
+    /// `BM25Store::search_scoped`), and it runs *before* search-access
+    /// bookkeeping, so a hit the caller never sees cannot refresh that file's
+    /// warmth.
     pub fn search_scoped(
         &self,
         query: &str,

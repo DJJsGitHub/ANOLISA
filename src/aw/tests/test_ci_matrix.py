@@ -9,24 +9,24 @@ from unittest.mock import patch
 from test_ci_checks import GateFixture, gate
 from check_inventory import check_inventory, collect, inventory
 from check_layout import source_sizes
-from check_matrix import END, START, table, validate
+from check_matrix import CAPABILITY_DOCS, END, START, main, table, validate
 
 
 class InventoryTests(GateFixture):
     def test_build_once_and_reject_missing_empty_ignored_or_failed_targets(self) -> None:
         metadata = {
-            "workspace_members": ["service"],
+            "workspace_members": ["cli"],
             "packages": [
                 {
-                    "id": "service",
-                    "name": "aw-service",
+                    "id": "cli",
+                    "name": "aw-cli",
                     "targets": [{"name": "new_agent", "kind": ["test"]}],
                 }
             ],
         }
         artifact = {
             "reason": "compiler-artifact",
-            "package_id": "service",
+            "package_id": "cli",
             "target": metadata["packages"][0]["targets"][0],
             "profile": {"test": True},
             "executable": "/fixture/new_agent",
@@ -62,7 +62,7 @@ class InventoryTests(GateFixture):
 
             with self.subTest(mode=mode):
                 opt_in = (
-                    frozenset({"aw-service/test/new_agent"})
+                    frozenset({"aw-cli/test/new_agent"})
                     if mode.startswith("opt-in")
                     else frozenset()
                 )
@@ -70,7 +70,7 @@ class InventoryTests(GateFixture):
                     self.assertEqual(
                         collect(self.root, metadata, run, opt_in),
                         {
-                            "aw-service/test/new_agent": (
+                            "aw-cli/test/new_agent": (
                                 {"regression"} if mode == "valid" else set()
                             ),
                         },
@@ -95,12 +95,16 @@ class InventoryTests(GateFixture):
 class MatrixTests(GateFixture):
     def setUp(self) -> None:
         super().setUp()
+        self.root = self.root / "src/aw"
+        self.root.mkdir(parents=True)
         self.matrix = json.loads((gate.AW / "tests/regression-matrix.json").read_text())
         self.runnable = {target: {"fixture"} for target in self.matrix["required_targets"]}
         for case in self.matrix["cases"].values():
             self.runnable.setdefault(case["target"], set()).add(case["test"])
-        for name in ("README.md", "README_zh.md"):
-            (self.root / name).write_text(f"{START}\n{table(self.matrix)}\n{END}\n")
+        for name in CAPABILITY_DOCS:
+            path = self.root / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(f"{START}\n{table(self.matrix)}\n{END}\n")
 
     def test_complete_manifest_is_accepted(self) -> None:
         validate(self.matrix, self.runnable, self.root)
@@ -185,14 +189,42 @@ class MatrixTests(GateFixture):
             with self.subTest(mode=mode), self.assertRaises(ValueError):
                 validate(matrix, self.runnable, self.root)
 
-    def test_empty_target_and_stale_readme_fail(self) -> None:
+    def test_empty_target_and_stale_or_missing_guide_grids_fail(self) -> None:
         runnable = copy.deepcopy(self.runnable)
         runnable[self.matrix["required_targets"][0]] = set()
         with self.assertRaisesRegex(ValueError, "target is missing or empty"):
             validate(self.matrix, runnable, self.root)
-        (self.root / "README_zh.md").write_text(f"{START}\nstale\n{END}\n")
-        with self.assertRaisesRegex(ValueError, "update the grid"):
-            validate(self.matrix, self.runnable, self.root)
+        for name in CAPABILITY_DOCS:
+            path = self.root / name
+            original = path.read_text()
+            for text, error in (
+                (f"{START}\nstale\n{END}\n", "update the grid"),
+                ("no generated table", "missing unique matrix markers"),
+                (original + original, "missing unique matrix markers"),
+                (f"<details>\n{original}</details>\n", "keep the Hook grid expanded"),
+            ):
+                with self.subTest(document=name, content=text), self.assertRaisesRegex(
+                    ValueError, error
+                ):
+                    path.write_text(text)
+                    validate(self.matrix, self.runnable, self.root)
+            path.write_text(original)
+
+    def test_regeneration_updates_all_grids_without_changing_surrounding_text(self) -> None:
+        (self.root / "tests").mkdir()
+        (self.root / "tests/regression-matrix.json").write_text(json.dumps(self.matrix))
+        for name in CAPABILITY_DOCS:
+            (self.root / name).write_text(f"intro\n{START}\nstale\n{END}\nfooter\n")
+        with patch("check_matrix.__file__", str(self.root / "scripts/check_matrix.py")), patch(
+            "sys.argv", ["check_matrix.py", "--write-docs"]
+        ):
+            main()
+        validate(self.matrix, self.runnable, self.root)
+        for name in CAPABILITY_DOCS:
+            self.assertEqual(
+                (self.root / name).read_text(),
+                f"intro\n{START}\n{table(self.matrix)}\n{END}\nfooter\n",
+            )
 
 
 class ScriptLayoutTests(GateFixture):

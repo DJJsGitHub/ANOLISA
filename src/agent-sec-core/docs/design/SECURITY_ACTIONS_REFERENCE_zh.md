@@ -321,6 +321,14 @@ failed item 导致 `success=false, exit_code=1`，但 `error_type` 为空，因�
 verdict 值域严格为 `pass/warn/deny/error`；finding severity 只为 `warn/deny`。built-in
 regex rules 当前可能只产生 pass/warn，但 deny 是 custom/LLM rule 的合法值，不能删除。
 
+regex 模式扫描 Python 时，除 Python 规则外，还从 `os.system`、`os.popen` 以及受支持的
+`subprocess` 执行 API 中提取在第一个参数位置通过位置参数或对应关键字参数传入的直接
+字符串命令，并复用 Bash 规则扫描该命令。关键字参数按 API 的 Python 签名匹配：`os.system` 使用
+`command`，`os.popen`、`subprocess.getoutput` 和 `subprocess.getstatusoutput` 使用 `cmd`，
+其余受支持的 `subprocess` API 使用 `args`。结果保留 Bash 规则原生的 `rule_id`、severity、
+描述和 evidence，顶层 `language` 仍为 `python`。变量、拼接字符串、带前缀字符串、argv
+列表、别名调用和其它动态表达式不执行 Shell 规则复用。
+
 ### 7.3 Success/error
 
 | 情况 | success | exit_code | error_type |
@@ -715,7 +723,7 @@ V2 使用 fancy-regex，回溯上限 1,000,000、循环预算 200 ms；不承诺
 接受结构正确的大整数/深层 JSON；身份证统一 decimal 校验并支持全角 X，银行卡排除全零。
 2.0.1 与保留的 Python 检测器同步要求完整卡号表达式、支持网络的前缀/长度组合及 Luhn；
 非常规分组及不合法表达式内部的局部匹配被拒绝。格式范围和边界见
-[PII 用户指南](../../../../docs/user-guide/zh/agent-security/agent-sec-core/pii-checker.md#支持的银行卡格式)。
+[PII 用户指南](../../../../docs/user-guide/zh/agent-sec-core/pii-checker.md#支持的银行卡格式)。
 其他检测类型、置信度和脱敏格式保留，变化由共享卡号语料及独立质量用例定义。
 
 差分和限制由 capability 的 `tests/compatibility.rs`、`tests/custom_rules.rs`、冻结 142 个

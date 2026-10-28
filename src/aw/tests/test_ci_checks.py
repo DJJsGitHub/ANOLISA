@@ -36,7 +36,7 @@ class PackageWorkflowTests(GateFixture):
         step = workflow.split(
             "      - name: Verify Tokenless PreTool and PostTool contracts\n", 1
         )[1]
-        step = step.split("      - name: Verify installed packages", 1)[0]
+        step = step.split("      - name:", 1)[0]
         script = textwrap.dedent(step.split("        run: |\n", 1)[1])
         workspace = self.root / "container workspace"
         expected = [
@@ -114,7 +114,7 @@ class ScopeTests(GateFixture):
         self.git("checkout", "-qb", "workflow-only", advanced)
         workflow_head = self.commit(".github/workflows/aw-ci.yml", "workflow only")
         event["pull_request"] = {"base": {"sha": advanced}, "head": {"sha": workflow_head}}
-        self.assertFalse(gate.scope("pull_request", event, workflow_head, self.root))
+        self.assertTrue(gate.scope("pull_request", event, workflow_head, self.root))
 
     def test_scope_handles_removal_noop_and_event_errors(self) -> None:
         base = self.init_git()
@@ -170,6 +170,8 @@ class ScopeTests(GateFixture):
         sha = "a" * 40
         valid = {
             "GITHUB_SHA": sha,
+            "TOKENLESS_SELECTED": "false",
+            "TOKENLESS_RESULT": "skipped",
             "SCOPE_RESULT": "success",
             "CHECKS_RESULT": "success",
             "SELECTED": "true",
@@ -239,16 +241,29 @@ class GateTests(GateFixture):
                 ["aw-exec", "aw-provider", "serde", "serde_json", "thiserror", "tempfile", "libc", "shlex", "aw-provider-sec-core"],
             ),
             ("aw-adapter", self.root / "crates/aw-adapter",
-             ["aw-config", "aw-contracts", "aw-exec", "aw-provider", "serde_json"]),
+             ["aw-config", "aw-contracts", "aw-exec", "aw-provider", "serde_json", "reqwest"]),
+            (
+                "aw-cli", self.root / "crates/aw-cli",
+                ["aw-adapter", "aw-config", "aw-contracts", "aw-exec", "aw-host", "aw-package",
+                 "aw-provider", "aw-service", "clap", "clap_complete", "libc", "serde", "serde_json",
+                 "serde_yaml_ng", "sha2", "tempfile", "reqwest"],
+            ),
         ):
             (directory / "src").mkdir(parents=True)
             (directory / "src/lib.rs").write_text("//! Fixture.\n", encoding="utf-8")
+            binary = {"aw-cli": "aw", "aw-package": "aw-build"}.get(name)
+            if name in provider_directories:
+                binary = name
+            targets = [{"src_path": str(directory / "src/lib.rs"), "kind": ["lib"]}]
+            if binary:
+                targets.append({"name": binary, "kind": ["bin"],
+                                "src_path": str(directory / "src/bin" / f"{binary}.rs")})
             packages.append(
                 {
                     "id": name,
                     "name": name,
                     "manifest_path": str(directory / "Cargo.toml"),
-                    "targets": [{"src_path": str(directory / "src/lib.rs")}],
+                    "targets": targets,
                     "dependencies": [
                         {
                             "name": dependency,
@@ -272,6 +287,19 @@ class GateTests(GateFixture):
             ],
         }
         gate.structure(metadata, self.root)
+        for name in ("aw-cli", "aw-package", "aw-core", "aw-provider-sec-core"):
+            invalid = deepcopy(metadata)
+            package = next(p for p in invalid["packages"] if p["name"] == name)
+            package["targets"].append({"name": "aw-package", "kind": ["bin"],
+                                       "src_path": str(Path(package["manifest_path"]).parent / "src/bin/aw-package.rs")})
+            with self.subTest(binary_owner=name), self.assertRaisesRegex(ValueError, "executable targets changed"):
+                gate.structure(invalid, self.root)
+        for name in ("aw-cli", "aw-package", "aw-provider-sec-core", "aw-provider-tokenless"):
+            invalid = deepcopy(metadata)
+            package = next(p for p in invalid["packages"] if p["name"] == name)
+            package["targets"] = [target for target in package["targets"] if "bin" not in target["kind"]]
+            with self.subTest(missing_binary=name), self.assertRaisesRegex(ValueError, "executable targets changed"):
+                gate.structure(invalid, self.root)
         for workspaces in ([], metadata["provider_workspaces"][:1],
                            metadata["provider_workspaces"][:1] * 2):
             with self.assertRaises(ValueError):
@@ -291,10 +319,22 @@ class GateTests(GateFixture):
             (6, "aw-contracts"), (6, "tokio"), (6, "aw-provider-tokenless"),
             (7, "asc-daemon-client"), (7, "aw-core"),
             (10, "aw-service"), (10, "aw-host"), (10, "aw-provider-tokenless"),
+            (11, "aw-provider-tokenless"), (11, "aw-provider-sec-core"),
+            (6, "clap_complete"), (10, "clap_complete"),
         ):
             invalid = deepcopy(metadata)
             invalid["packages"][package]["dependencies"].append({"name": dependency})
             with self.assertRaises(ValueError):
+                gate.structure(invalid, self.root)
+        for package in metadata["packages"]:
+            if package["name"] == "aw-cli":
+                continue
+            invalid = deepcopy(metadata)
+            library = next(p for p in invalid["packages"] if p["name"] == package["name"])
+            library["dependencies"].append({"name": "aw-cli"})
+            with self.subTest(library=package["name"]), self.assertRaisesRegex(
+                ValueError, "unreviewed dependency aw-cli"
+            ):
                 gate.structure(invalid, self.root)
         invalid = deepcopy(metadata)
         invalid["packages"][1]["dependencies"][0]["path"] = str(self.root / "other-contracts")

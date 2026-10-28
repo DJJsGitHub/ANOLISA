@@ -17,6 +17,7 @@ use std::{
 };
 
 pub(super) struct Qoder;
+mod reload;
 
 struct Prepared {
     input: LaunchInput,
@@ -46,7 +47,15 @@ impl Adapter for Qoder {
             .collect::<std::result::Result<Vec<_>, _>>()?;
         check_args(&native)?;
         let settings = settings(input.options.settings.as_ref())?;
-        check_sources(&input.command.cwd, &settings)?;
+        check_sources(&input.command.cwd, &settings, &input.command.environment)?;
+        if input.options.reloadable {
+            reload::check_sources(
+                &input.command.cwd,
+                &input.command.environment,
+                &settings,
+                input.document["spec"]["agents"][&input.target]["qoder"]["sequential"] == true,
+            )?;
+        }
         let version =
             adapter::Probe(cancelled).version_output(&input.command, &["--version".into()])?;
         if version.is_empty() || version.len() > 128 {
@@ -92,6 +101,13 @@ impl PreparedLaunch for Prepared {
     }
 
     fn validate_steps(&self, steps: &[AdmittedStep]) -> Result<()> {
+        if self.input.options.reloadable {
+            crate::reload::validate(
+                &self.input.document,
+                &self.input.target,
+                &self.capabilities(),
+            )?;
+        }
         generate(
             self.settings.clone(),
             &self.input.document,
@@ -103,15 +119,49 @@ impl PreparedLaunch for Prepared {
         Ok(())
     }
 
-    fn configure(&mut self, context: &LaunchContext<'_>) -> Result<LaunchPlan> {
-        let (settings, events) = generate(
-            self.settings.clone(),
-            &self.input.document,
-            &self.input.target,
-            context.steps,
+    fn attachment(
+        &mut self,
+        context: &LaunchContext<'_>,
+    ) -> Result<crate::attachment::Registration> {
+        crate::reload::supported(&self.capabilities())?;
+        let home = self
+            .input
+            .command
+            .environment
+            .get(std::ffi::OsStr::new("HOME"))
+            .ok_or("native HOME is required")?;
+        let settings = PathBuf::from(home).join(".qoder/settings.json");
+        let (groups, _) = reload::generate(
+            json!({}),
             context.executable,
             context.binding_path,
+            self.input.document["spec"]["agents"][&self.input.target]["qoder"]
+                .get("sequential")
+                .and_then(Value::as_bool),
         )?;
+        crate::attachment::Registration::qoder(settings, groups, context)
+    }
+
+    fn configure(&mut self, context: &LaunchContext<'_>) -> Result<LaunchPlan> {
+        let (settings, events) = if self.input.options.reloadable {
+            reload::generate(
+                self.settings.clone(),
+                context.executable,
+                context.binding_path,
+                self.input.document["spec"]["agents"][&self.input.target]["qoder"]
+                    .get("sequential")
+                    .and_then(Value::as_bool),
+            )?
+        } else {
+            generate(
+                self.settings.clone(),
+                &self.input.document,
+                &self.input.target,
+                context.steps,
+                context.executable,
+                context.binding_path,
+            )?
+        };
         let path = context
             .files
             .write("settings.json", &serde_json::to_vec(&settings)?)?;
@@ -197,14 +247,6 @@ pub(super) fn check_args(args: &[String]) -> Result<()> {
             return Err(format!("Qoder option {name} is not supported by this launcher; use --native-settings for flag settings").into());
         }
     }
-    if std::env::var("QODER_HEADLESS_FAST_HOOKS").is_ok_and(|v| {
-        matches!(
-            v.trim().to_ascii_lowercase().as_str(),
-            "1" | "true" | "yes" | "on"
-        )
-    }) {
-        return Err("QODER_HEADLESS_FAST_HOOKS disables native hooks".into());
-    }
     Ok(())
 }
 
@@ -230,17 +272,36 @@ pub(super) fn settings(path: Option<&String>) -> Result<Value> {
     Ok(value)
 }
 
-pub(super) fn check_sources(cwd: &Path, flags: &Value) -> Result<()> {
+pub(super) fn check_sources(
+    cwd: &Path,
+    flags: &Value,
+    environment: &BTreeMap<OsString, OsString>,
+) -> Result<()> {
+    if environment
+        .get(std::ffi::OsStr::new("QODER_HEADLESS_FAST_HOOKS"))
+        .is_some_and(|v| {
+            matches!(
+                v.to_string_lossy().trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+    {
+        return Err("QODER_HEADLESS_FAST_HOOKS disables native hooks".into());
+    }
     for name in ["QODER_CONFIG_DIR_NAME", "QODERCN_CONFIG_DIR_NAME"] {
-        if std::env::var_os(name).is_some() {
+        if environment.contains_key(std::ffi::OsStr::new(name)) {
             return Err(format!("custom {name} is not supported by this adapter").into());
         }
     }
-    if std::env::var("QODERCLI_SITE").is_ok_and(|v| v == "cn") {
+    if environment
+        .get(std::ffi::OsStr::new("QODERCLI_SITE"))
+        .is_some_and(|v| v == "cn")
+    {
         return Err("QODERCLI_SITE=cn requires a separately verified adapter".into());
     }
-    let home =
-        std::env::var_os("HOME").ok_or("HOME is required to inspect native Qoder settings")?;
+    let home = environment
+        .get(std::ffi::OsStr::new("HOME"))
+        .ok_or("HOME is required to inspect native Qoder settings")?;
     for path in [
         PathBuf::from(home).join(".qoder/settings.json"),
         cwd.join(".qoder/settings.json"),

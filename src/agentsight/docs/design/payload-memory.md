@@ -9,6 +9,10 @@ runtime, including the ring buffer, native decoding state and allocator retentio
 
 ## Ownership boundaries
 
+Executable SSL scans use vectorized substring searches in bounded 4 MiB windows with signature
+overlap. Every overlapping match and cross-window start is preserved; inode caching and symbol
+selection keep their existing behavior.
+
 ```mermaid
 flowchart LR
     Probe[Probe payload] --> Capture[Queue with slot and byte limits]
@@ -179,4 +183,4 @@ budgets, traffic-free hard timeouts, partial responses, fragmented compressed SS
 equivalence with and without raw export, and FFI reservation lifetimes. RSS and throughput benchmarks
 remain separate from these correctness checks. Byte budgets do not guarantee a process RSS ceiling.
 
-See the [runtime configuration reference](../../../../docs/user-guide/en/agent-observability/agentsight/configuration.md#runtime-limits).
+See the [runtime configuration reference](../../../../docs/user-guide/en/agentsight/configuration.md#runtime-limits).
