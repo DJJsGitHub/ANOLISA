@@ -112,13 +112,51 @@ def _wait_for(
     read: Callable[[float], dict[str, Any]], ready: Callable[[dict[str, Any]], bool]
 ) -> dict[str, Any]:
     deadline = time.monotonic() + 30
-    actual = None
+    last_observation = "no response"
     while (remaining := deadline - time.monotonic()) > 0:
-        actual = read(remaining)
-        if ready(actual) and time.monotonic() <= deadline:
-            return actual
+        try:
+            actual = read(remaining)
+        except subprocess.TimeoutExpired as exc:
+            last_observation = str(exc)
+        else:
+            if ready(actual) and time.monotonic() <= deadline:
+                return actual
+            last_observation = repr(actual)
         time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
-    pytest.fail(f"Policy lifecycle did not converge within 30s: last_state={actual}")
+    pytest.fail(
+        f"Policy lifecycle did not converge within 30s: last_state={last_observation}"
+    )
+
+
+def test_wait_for_retries_cli_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    attempts = 0
+
+    def read(timeout: float) -> dict[str, Any]:
+        nonlocal attempts
+        assert 0 < timeout <= 30
+        attempts += 1
+        if attempts == 1:
+            raise subprocess.TimeoutExpired(["agent-sec-cli", "binding", "list"], 2)
+        return {"total": 0}
+
+    monkeypatch.setattr(time, "sleep", lambda _: None)
+    assert _wait_for(read, lambda value: value["total"] == 0) == {"total": 0}
+    assert attempts == 2
+
+
+def test_wait_for_reports_persistent_cli_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = iter((0.0, 0.0, 30.0))
+    monkeypatch.setattr(time, "monotonic", lambda: next(clock, 30.0))
+
+    def read(_timeout: float) -> dict[str, Any]:
+        raise subprocess.TimeoutExpired(["agent-sec-cli", "binding", "list"], 2)
+
+    with pytest.raises(
+        pytest.fail.Exception, match="Policy lifecycle did not converge.*timed out"
+    ):
+        _wait_for(read, lambda _: True)
 
 
 def test_discovered_binding_delivers_saved_revision_and_cleans_up(
